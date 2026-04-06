@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "gho_token")
 SERVER_URL = os.getenv("MARL_SERVER_URL", "http://127.0.0.1:5000/v1")
 MODEL = os.getenv("MARL_RED_MODEL", "gpt-5-mini")
+PROMPT_PATH = "prompts/red"
 
 # Colors
 RED = "\033[91m"
@@ -66,105 +67,28 @@ MAX_TAG_RETRIES = 2     # Nudge LLM neu thieu tag
 MAX_MSG_CHARS = 6000    # Truncate message cu
 
 
+def load_prompt(task: str) -> str:
+    try:
+        with open(f"{PROMPT_PATH}/{task}.md", "r") as f:
+            prompt = f.read()
+            if len(prompt) == 0:
+                raise Exception
+            return prompt
+    except:
+        print(f"{task}.md not found or empty. Script will now halt.")
+        exit(0)
+
 # ═══════════════════════════════════════════════════════════════
 # SYSTEM PROMPT — Red = Chien luoc gia
 # ═══════════════════════════════════════════════════════════════
 
-RED_PROMPT = """\
-Ban la Junior Penetration Tester (Red Team) chuyen BAC va BLF.
-Ban co 1 Agent (culi) co browser, shell, fetch. Ban CHI viet chien luoc, Agent se thuc thi.
-
-=== TARGET ===
-{target_url}
-
-=== RECON DATA ===
-{recon_context}
-
-=== ATTACK PATTERN KNOWLEDGE BASE ===
-{playbook}
-
-=== CACH SUY NGHI ===
-Hay suy nghi nhu nguoi thuc su muon khai thac, khong phai scanner:
-- Muc tieu cuoi la gi? (mua re hon? truy cap tai khoan khac? leo quyen?)
-- Co field nao client-controlled co the thao tung? (price, quantity, userId, role...)
-- Thu cach don gian nhat truoc (giam gia, doi user), roi moi thu bien the.
-- Neu khong chac endpoint nao ton tai → hoi Agent verify bang [AGENT].
-- Ban duoc tu do suy nghi va sang tao, nhung phai dua tren DU LIEU THUC tu recon.
-
-=== FORMAT CHIEN LUOC (BAT BUOC — toi da 10 buoc) ===
-
-=== CHIEN LUOC ===
-Loai: <BAC hoac BLF>
-Pattern: <VD: BAC-01, BLF-03>
-Muc tieu: <1 cau ngan>
-
-Buoc 1: <MO TA hanh dong — KHONG viet curl/code>
-  Method: <GET/POST> URL: <url>
-  Params: <ten param va gia tri>
-  Expect: <ket qua mong doi>
-
-Buoc 2: ...
-...
-Buoc N (VERIFY): <cach xac nhan thanh cong>
-  Expect: <tieu chi cu the — phai la raw evidence>
-=== KET THUC CHIEN LUOC ===
-
-QUY TAC FORMAT:
-- Moi buoc: MO TA ngan (1-2 dong), Method, URL, Params, Expect.
-- KHONG viet curl commands, KHONG viet code. Agent se tu biet cach thuc thi.
-- PHAI tu login (khong hardcode cookie). PHAI tu lay CSRF token.
-- Buoc cuoi PHAI la VERIFY voi tieu chi ro rang.
-- Endpoint PHAI co trong recon data hoac da duoc Agent xac nhan.
-- Toi da 10 buoc. Neu can nhieu bien the, gom thanh 1 buoc "thu lan luot: a, b, c".
-
-=== TAG CUOI (bat buoc, dong cuoi cung) ===
-- [AGENT] — nho Agent kiem tra / lay thong tin
-- [BLUETEAM] — gui chien luoc cho Blue review
-- KHONG dung [DONE] o giai doan debate.
-
-Sau khi viet CHIEN LUOC → PHAI gui [BLUETEAM]. [AGENT] chi de hoi thong tin."""
-
+RED_PROMPT = load_prompt("red")
 
 # ═══════════════════════════════════════════════════════════════
 # EVAL PROMPT — Red dùng ở Phase 4 đánh giá kết quả
 # ═══════════════════════════════════════════════════════════════
 
-RED_EVAL_PROMPT = """\
-Ban la Penetration Tester (Red Team). Agent vua thuc thi xong chien luoc cua ban.
-Nhiem vu: DOC KY bao cao thuc thi ben duoi va ra VERDICT.
-
-=== TARGET ===
-{target_url}
-
-=== BAO CAO THUC THI TU AGENT ===
-{exec_report}
-
-=== NHIEM VU CUA BAN ===
-1. Doc KY tung buoc trong bao cao — tim raw HTTP response, status code, body content.
-2. Kiem tra: co evidence RO RANG la exploit THANH CONG khong?
-   Thanh cong = server DA CHAP NHAN thay doi (VD: order confirmation voi gia thap,
-   truy cap duoc data cua user khac, leo quyen thanh cong).
-3. Ra verdict:
-
-=== VERDICT ===
-Ket qua: <SUCCESS hoac FAIL hoac RETRY>
-Bang chung: <trich dan raw evidence tu bao cao — KHONG tu bia>
-Ly do: <1-2 cau giai thich>
-=== KET THUC VERDICT ===
-
-QUY TAC:
-- SUCCESS: co bang chung ro rang exploit hoat dong. Ghi [DONE].
-- FAIL: da thu het cach, khong khai thac duoc. Ghi [DONE].
-- RETRY: co y tuong moi chua thu. Viet CHIEN LUOC MOI ngan gon roi ghi [BLUETEAM].
-- KHONG duoc yeu cau Agent chay them lenh. KHONG duoc tu thuc thi.
-- KHONG duoc bia evidence. Chi dua tren bao cao o tren.
-- Neu bao cao co evidence thanh cong → PHAI noi SUCCESS, khong duoc bo qua.
-
-TAG CUOI (bat buoc):
-- [DONE] — da co verdict (SUCCESS hoac FAIL)
-- [BLUETEAM] — de xuat chien luoc moi de retry
-- [AGENT] — CHI de hoi Agent XAC NHAN thong tin (read-only), KHONG de chay exploit moi"""
-
+RED_EVAL_PROMPT = load_prompt("red_eval")
 
 # ═══════════════════════════════════════════════════════════════
 # RED TEAM AGENT CLASS

@@ -1,0 +1,242 @@
+[
+    {
+        "id": "BLF-01",
+        "name": "Client-Side Validation Bypass",
+        "severity": "High",
+        "indicators": [
+            "Giá sản phẩm / số lượng / discount nằm trong hidden field hoặc request body",
+            "JavaScript validate input trước khi gửi (client-side only)",
+            "Form có hidden input với value quan trọng (price, role, discount_code)",
+            "Request chứa tham số tính toán (total, subtotal, tax)",
+            "Dropdown/select chỉ cho chọn giá trị nhất định nhưng backend không validate lại"
+        ],
+        "technique": [
+            "1. Capture request khi thực hiện transaction (mua hàng, nạp tiền, etc.)",
+            "2. Tìm tham số price/quantity/amount trong request body",
+            "3. Sửa giá trị: price=0, price=-100, quantity=0, discount=100%",
+            "4. Gửi request đã sửa, kiểm tra server có validate lại không",
+            "5. Kiểm tra response + trạng thái đơn hàng / tài khoản"
+        ],
+        "variations": [
+            "Giá âm để tăng credit: price=-1000",
+            "Quantity cực lớn gây integer overflow: quantity=99999999",
+            "Sửa currency: USD → VND (tỷ giá khác)",
+            "Bỏ tham số validation (CSRF token, nonce) xem có skip check không"
+        ],
+        "success": "Server chấp nhận giá trị không hợp lệ từ client, thực hiện transaction sai logic"
+    },
+    {
+        "id": "BLF-02",
+        "name": "Unconventional Input Handling",
+        "severity": "High",
+        "indicators": [
+            "Input field có max length / min length trên client nhưng không rõ server-side",
+            "Số lượng / giá có thể nhập số thập phân, số âm",
+            "Form field có regex validation chỉ ở client",
+            "Application xử lý chuỗi dài (truncation issues)",
+            "Tham số numeric không rõ ràng về range"
+        ],
+        "technique": [
+            "1. Thử input quá dài: email dài 300 ký tự, name dài 10000 ký tự",
+            "2. Thử số âm: quantity=-1, amount=-500",
+            "3. Thử số thập phân: quantity=1.5, amount=0.001",
+            "4. Thử zero: quantity=0, price=0",
+            "5. Thử giá trị đặc biệt: null, undefined, NaN, Infinity, empty string",
+            "6. Thử data type mismatch: gửi string thay vì number, array thay vì string"
+        ],
+        "variations": [
+            "Integer overflow: 2147483647 + 1, MAX_INT",
+            "Precision issues: 0.1 + 0.2 ≠ 0.3",
+            "Encoding tricks: Unicode equivalents, fullwidth numbers",
+            "Null byte injection: param%00value"
+        ],
+        "success": "Server xử lý input bất thường → sai logic, gây lỗi business hoặc bypass validation"
+    },
+    {
+        "id": "BLF-03",
+        "name": "Workflow Sequence Manipulation",
+        "severity": "High",
+        "indicators": [
+            "Multi-step process: checkout, registration, password reset",
+            "Mỗi step có URL riêng: /checkout/step1, /checkout/step2",
+            "Server assume user đi theo thứ tự",
+            "Có thể skip step bằng truy cập URL trực tiếp"
+        ],
+        "technique": [
+            "1. Thực hiện workflow bình thường, capture tất cả requests",
+            "2. Bỏ qua bước validation: skip step 2, đến thẳng step 3",
+            "3. Lặp lại step nhất định: apply coupon 2 lần, verify email nhiều lần",
+            "4. Đảo thứ tự steps",
+            "5. Thay đổi data giữa các steps (VD: đổi sản phẩm sau khi nhập coupon)"
+        ],
+        "variations": [
+            "Race condition: gửi 2 request apply coupon đồng thời",
+            "State manipulation: sửa session state giữa các step",
+            "Remove required step: skip payment verification",
+            "Repeat step: apply discount code nhiều lần"
+        ],
+        "success": "Bypass bước quan trọng hoặc lặp lại bước có lợi, vi phạm business logic flow"
+    },
+    {
+        "id": "BLF-04",
+        "name": "Domain-Specific Business Logic Flaw",
+        "severity": "High",
+        "indicators": [
+            "Chức năng đặc thù: coupon/discount, loyalty points, transfer tiền",
+            "Quy tắc business phức tạp (VD: free shipping trên $X, discount khi mua Y sản phẩm)",
+            "Chức năng có điều kiện: giới hạn lần dùng, thời gian hiệu lực",
+            "Transfer/exchange giữa các account"
+        ],
+        "technique": [
+            "1. Hiểu rõ business rules: đọc Terms, FAQ, UI hints",
+            "2. Tìm edge cases trong rules: free shipping + return = profit? coupon + gift card stack?",
+            "3. Thử vượt quota/limit: apply coupon quá số lần cho phép",
+            "4. Manipulate conditions: đạt điều kiện discount rồi bỏ item → giữ discount",
+            "5. Self-transfer hoặc circular transactions"
+        ],
+        "variations": [
+            "Gift card + coupon stacking",
+            "Price rounding exploitation (mua 1.5 items, trả 1 item giá)",
+            "Referral self-loop: tự refer chính mình",
+            "Time-based: sửa timezone/date trong request"
+        ],
+        "success": "Lợi dụng logic business để đạt lợi thế không mong muốn (tiền, quyền, bypass quota)"
+    },
+    {
+        "id": "BLF-05",
+        "name": "Email & Verification Logic Bypass",
+        "severity": "High",
+        "indicators": [
+            "Email verification flow: register → verify email → access",
+            "Password reset qua email",
+            "2FA implementation",
+            "Email-based authentication (magic link)",
+            "Domain-based access control (chỉ @company.com mới được)"
+        ],
+        "technique": [
+            "1. Đăng ký → verify → đổi email sau verify (bypass domain check)",
+            "2. Password reset: tạo link reset cho user A, dùng cho user B (đổi username/email trong request)",
+            "3. 2FA bypass: skip step 2FA, truy cập thẳng authenticated page",
+            "4. Rate limit brute force: thử tất cả OTP (4 digit = 10000 combos)",
+            "5. Token reuse: dùng lại verification/reset token"
+        ],
+        "variations": [
+            "Đổi Host header trong password reset → link reset trỏ tới attacker",
+            "Email parameter pollution: email=victim@mail.com&email=attacker@mail.com",
+            "Subdomain bypass: user@evil.company.com vs user@company.com",
+            "Case manipulation: Admin@company.com vs admin@company.com"
+        ],
+        "success": "Bypass verification flow, chiếm quyền tài khoản khác, hoặc bypass email-based restrictions"
+    },
+    {
+        "id": "BLF-06",
+        "name": "Insufficient Workflow Validation (State Tampering)",
+        "severity": "Medium",
+        "indicators": [
+            "Form có nhiều submit button (approve/reject, buy/cancel)",
+            "Request gửi action type trong body: action=approve, status=confirmed",
+            "Workflow status lưu client-side hoặc trong URL",
+            "Có thể thay đổi trạng thái object trực tiếp"
+        ],
+        "technique": [
+            "1. Capture request khi thực hiện action hợp lệ",
+            "2. Thay đổi action/status param: action=reject → action=approve, status=pending → status=approved",
+            "3. Gửi request với role/permission thấp hơn yêu cầu",
+            "4. Thay đổi object ID để approve/reject object khác",
+            "5. Kiểm tra có audit trail ghi nhận thay đổi trái phép không"
+        ],
+        "variations": [
+            "Bulk action: thay đổi nhiều object cùng lúc",
+            "Race condition: approve + reject cùng lúc → xem xử lý nào thắng",
+            "Partial update: chỉ gửi 1 field thay vì full object"
+        ],
+        "success": "Thay đổi trạng thái workflow mà không có quyền, skip approval process"
+    },
+    {
+        "id": "BLF-07",
+        "name": "Numeric & Parameter Manipulation",
+        "severity": "High",
+        "indicators": [
+            "Form có field số: quantity, amount, price, discount, points",
+            "Giá trị số truyền qua hidden field hoặc POST body",
+            "Trang có chức năng tính toán: tổng tiền, balance, transfer",
+            "API nhận JSON với numeric fields"
+        ],
+        "technique": [
+            "1. Capture request bình thường, ghi nhận tất cả numeric params",
+            "2. Test từng param với bảng payload:",
+            "   - Số âm: quantity=-1, amount=-100 (đảo chiều logic?)",
+            "   - Zero: quantity=0, price=0 (bypass payment?)",
+            "   - Overflow 32-bit: 2147483647, 2147483648 (wrap thành âm?)",
+            "   - Overflow 64-bit: 9223372036854775807",
+            "   - Float precision: 0.1+0.2, 99999999999999.99",
+            "   - String thay number: quantity=\"abc\" (error leak?)",
+            "   - Leading zeros: 000100 (octal interpretation?)",
+            "   - Rất lớn: 99999999 (exceed stock/limit?)",
+            "3. Với mỗi payload: so sánh response vs baseline bình thường",
+            "4. Check server có validate không: total có recalculate từ server-side price?",
+            "5. Nếu có discount/coupon: thử áp dụng nhiều lần, discount > 100%"
+        ],
+        "variations": [
+            "JSON type confusion: {\"qty\": \"1\"} vs {\"qty\": 1} vs {\"qty\": [1]}",
+            "Unicode digits: １００ (fullwidth) thay vì 100",
+            "Scientific notation: 1e5 thay vì 100000",
+            "Negative discount stacking: 2 coupon cùng lúc → price < 0 → credit?"
+        ],
+        "success": "Server chấp nhận giá trị bất thường, dẫn đến thanh toán sai, balance manipulation, hoặc bypass business rules"
+    },
+    {
+        "id": "BLF-08",
+        "name": "Race Condition / Time-of-Check-Time-of-Use",
+        "severity": "Critical",
+        "indicators": [
+            "Chức năng transfer tiền, redeem coupon, apply discount, vote",
+            "Limit-based actions: 'use once', 'max 1 per user', quota",
+            "Balance check rồi mới trừ (2 bước riêng, không atomic)",
+            "Coupon/gift card chỉ dùng 1 lần"
+        ],
+        "technique": [
+            "1. Xác định endpoint target (VD: POST /transfer, POST /redeem)",
+            "2. Ghi nhận state trước: balance, coupon status, usage count",
+            "3. Gửi 20-50 request đồng thời (parallel) cùng 1 action:",
+            "   curl parallel hoặc Turbo Intruder style — tất cả cùng session",
+            "4. Check state sau: balance bị trừ bao nhiêu lần? Coupon used count?",
+            "5. So sánh: nếu balance trước=$100, transfer=$100, gửi 20 lần →",
+            "   balance sau = -$1900? = Race condition confirmed",
+            "6. Test cả limit bypass: action giới hạn 1 lần → gửi đồng thời → dùng >1?"
+        ],
+        "variations": [
+            "File upload race: upload file → process → delete (TOCTOU window)",
+            "Signup bonus: tạo nhiều account song song → bonus multiplied?",
+            "Inventory race: add to cart đồng thời khi stock=1 → cả 2 đều add được?",
+            "Session race: login đồng thời trên nhiều session → state inconsistency?"
+        ],
+        "success": "Action thực hiện nhiều hơn giới hạn cho phép, balance bị trừ sai, hoặc coupon/resource dùng nhiều lần"
+    },
+    {
+        "id": "BLF-09",
+        "name": "Multi-Step Process Bypass",
+        "severity": "High",
+        "indicators": [
+            "Quy trình nhiều bước: đăng ký, checkout, approval, KYC",
+            "URL/param chứa step number: step=1, phase=2, /checkout/step3",
+            "Redirect chain: page1 → page2 → page3 → confirm",
+            "Có bước xác minh giữa chừng: email verify, OTP, admin approval"
+        ],
+        "technique": [
+            "1. Đi qua flow bình thường (Burp/proxy ON), ghi lại TẤT CẢ request theo thứ tự",
+            "2. Thử skip bước: gửi thẳng request bước 3 mà không qua bước 1-2",
+            "3. Thử đảo thứ tự: bước 3 trước, bước 1 sau → server check thứ tự không?",
+            "4. Thử replay: hoàn thành flow → gửi lại request bước cuối → action lặp?",
+            "5. Thử thay đổi state trực tiếp: PATCH /user {\"status\":\"active\"} skip verify",
+            "6. Tìm API endpoint khác (mobile API, v2) có thể bypass step check"
+        ],
+        "variations": [
+            "Parameter pollution: gửi step=1&step=3 → server dùng giá trị nào?",
+            "Referer bypass: server check Referer từ bước trước → forge Referer header",
+            "Direct object access: biết URL bước cuối → truy cập trực tiếp",
+            "Parallel flow: bắt đầu 2 flow cùng lúc, hoàn thành flow A bước 1, dùng state cho flow B bước 2"
+        ],
+        "success": "Bypass bước xác minh/phê duyệt, hoàn thành flow mà không qua đủ các bước bắt buộc"
+    }
+]
