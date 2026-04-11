@@ -1,0 +1,17 @@
+tôi đang xây dựng đồ án chuyên ngành. Tôi sẽ sử dụng MARL để cho quá trình khai thác được thông minh và học 
+ hỏi nhiều hơn phục vụ cho việc xây dựng exploit để thực thi. Đầu vào của tôi sẽ là link kèm một chút ngữ     
+cảnh như kiểu tôi sẽ điều hướng là nên tập trung vào đâu, hoặc là cung cấp thêm một số credentials để Agent   
+Culi có thêm ngữ cảnh thực hiện crawll trang web một cách toàn diện hơn. Tôi muốn nó sẽ crawll bằng           
+playwright MCP đã được tích hợp sẵn trong công cụ mcp_client rồi. Sau đó sau việc crawll xong nó sẽ gửi các   
+request mà nó nghĩ là "quan trọng" hoặc là "đáng để pentest" về lỗi business logic/flaws cho một LLM có tên   
+là REDTEAM. READTEM sẽ nhận các request/respoonse đáng chú ý được AGENT kia trả ra. Sau đó nó sẽ phân tích để 
+ viết ra exploit gửi cho BLUETEAM + các request/response luôn để cho BLUEATEAM nhận về ngữ cảnh và đánh giá   
+nếu chưa ổn nó sẽ nói chuyện lại với REDTEAM bằng cách gọi [REDTEAM] ở cuối cùng, chúng nó sẽ duy trì lịch sử 
+ thoại này để có thể hiểu hơn về luồng và logic, ngữ cảnh thực thi. Trong quá trình 2 con này làm việc nếu có 
+ việc cần nhờ như là hỏi con Agent Culi là "request A lấy từ đâu" thì nó sẽ có nhiệm vụ trả lời nhét vào hội  
+thoại của 2 con này mặc định con nào hỏi culi thì culi sẽ dùng thêm [BLUETEAM/REDTEAM] ở cuối để kiểu trả lời 
+ lại câu hỏi của nó. Và cứ tiếp tục như thế đến khi BLUETEAM nhắn [APPROVED] khi đó exploit được gửi lại cho  
+Agent để viết vào shell và thực thi và trả về kết qủa RAW cho [REDTEAM]. Đấy quy trình cơ bản của tôi là như  
+thế nhưng ở đoạn code hiện tại nó hay bị gọi nhau loạn cả lên không theo thứ tự rồi trả lời tranh nhau hết.   
+Tôi đoán khoảng 60% do PROMPT và 40% còn lại là do lỗi code. Nhiệm vụ của bạn sẽ đọc lại code debate.py và    
+agent.py của tôi để xem thử coi nó sẽ hoạt động đúng với luồng logic của nó không? 

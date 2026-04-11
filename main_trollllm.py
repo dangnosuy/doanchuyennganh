@@ -1,5 +1,8 @@
 """
-MARL Orchestrator — Entry point duy nhat cho toan bo pipeline.
+MARL Orchestrator (TrollLLM Version) — Entry point dung TrollLLM API.
+
+Day la ban main.py su dung TrollLLM API (chat.trollllm.xyz) thay vi Copilot.
+Tat ca agents se goi den local proxy server_trollllm.py.
 
 Flow:
   Phase 1: RECON — CrawlAgent crawl target → recon.md
@@ -10,39 +13,61 @@ Flow:
   Phase 5: REPORT — Luu ket qua cuoi cung
 
 Usage:
-    python main.py
-    python main.py "Test https://target.com user:admin pass:secret"
+    # Truoc het, chay server:
+    export TROLLLLM_API_KEY="sk-trollllm-xxx"
+    python server/server_trollllm.py
+
+    # Sau do chay main:
+    python main_trollllm.py
+    python main_trollllm.py "Test https://target.com user:admin pass:secret"
+
+Environment variables:
+    TROLLLLM_API_KEY     - API key cho TrollLLM (bat buoc)
+    MARL_SERVER_URL      - URL cua proxy server (default: http://127.0.0.1:5001/v1)
+    MARL_CRAWL_MODEL     - Model cho CrawlAgent (default: gpt-5-mini)
+    MARL_EXECUTOR_MODEL  - Model cho ExecAgent (default: gpt-5-mini)
+    MARL_RED_MODEL       - Model cho RedTeamAgent (default: gpt-5-mini)
+    MARL_BLUE_MODEL      - Model cho BlueTeamAgent (default: gpt-5-mini)
 """
 
 import os
-import re
 import sys
-from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+
+# ═══════════════════════════════════════════════════════════════
+# SET DEFAULT ENV VARS FOR TROLLLLM
+# ═══════════════════════════════════════════════════════════════
+# Phai set TRUOC khi import agents vi chung doc env luc import
+
+# Default server URL cho TrollLLM proxy (port 5001)
+if "MARL_SERVER_URL" not in os.environ:
+    os.environ["MARL_SERVER_URL"] = "http://127.0.0.1:5001/v1"
+
+# Default models cho TrollLLM
+DEFAULT_MODEL = "gpt-5-mini"
+
+if "MARL_CRAWL_MODEL" not in os.environ:
+    os.environ["MARL_CRAWL_MODEL"] = DEFAULT_MODEL
+
+if "MARL_EXECUTOR_MODEL" not in os.environ:
+    os.environ["MARL_EXECUTOR_MODEL"] = DEFAULT_MODEL
+
+if "MARL_RED_MODEL" not in os.environ:
+    os.environ["MARL_RED_MODEL"] = DEFAULT_MODEL
+
+if "MARL_BLUE_MODEL" not in os.environ:
+    os.environ["MARL_BLUE_MODEL"] = DEFAULT_MODEL
+
+# ═══════════════════════════════════════════════════════════════
+# IMPORTS (sau khi set env vars)
+# ═══════════════════════════════════════════════════════════════
 
 from shared.utils import parse_prompt, extract_next_tag, extract_send_block
 
 WORKSPACE = "./workspace"
-
-
-def _make_run_dir(target_url: str) -> str:
-    """Create workspace/{domain}_{timestamp}/ for this run.
-
-    Returns absolute path to the run directory.
-    """
-    domain = urlparse(target_url).hostname or "unknown"
-    # Strip port-like suffixes and sanitize for filesystem
-    domain = re.sub(r"[^a-zA-Z0-9._-]", "_", domain)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(WORKSPACE) / f"{domain}_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return str(run_dir.resolve())
-
-
 MAX_DEBATE_STEPS = 30          # tong so turn toi da (Red + Blue + Agent)
 MAX_ROUNDS = 5                 # so round Red↔Blue reject/revise toi da
-MIN_DEBATE_ROUNDS = 2          # buoc phai co it nhat 2 round truoc khi approve
+MAX_AGENT_CONSECUTIVE = 3      # so lan lien tiep goi Agent truoc khi ep chuyen
 MAX_EXEC_RETRIES = 2           # so lan cho Red de xuat chien luoc moi sau exec fail
 
 # ── ANSI colors ──────────────────────────────────────────────
@@ -53,93 +78,6 @@ C = "\033[96m"
 B = "\033[1m"
 RST = "\033[0m"
 
-# Regex strip ANSI escape codes for log file
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-# ═════════════════════════════════════════════════════════════
-# TEE LOGGER — mirror stdout/stderr to log file
-# ═════════════════════════════════════════════════════════════
-
-class TeeLogger:
-    """Write to both original stream and a log file — realtime.
-
-    - Console gets full ANSI colors as normal
-    - Log file gets clean text (ANSI codes stripped) + timestamp per line
-    - Every write() is flushed IMMEDIATELY to disk (os.fsync)
-      so log is never lost even on Ctrl+C or crash
-    """
-
-    def __init__(self, log_path: str, stream):
-        self._stream = stream          # original sys.stdout or sys.stderr
-        # Open unbuffered (buffering=1 is line-buffered, but we flush manually)
-        self._log_file = open(log_path, "a", encoding="utf-8")
-        self._at_line_start = True     # track for timestamp insertion
-
-    def write(self, text: str):
-        # Console: pass through as-is (with colors)
-        self._stream.write(text)
-        self._stream.flush()
-
-        # Log file: strip ANSI, add timestamps, flush immediately
-        clean = _ANSI_RE.sub("", text)
-        if clean:
-            lines = clean.split("\n")
-            for i, line in enumerate(lines):
-                if i > 0:
-                    self._log_file.write("\n")
-                    self._at_line_start = True
-                if line:
-                    if self._at_line_start:
-                        ts = datetime.now().strftime("%H:%M:%S")
-                        self._log_file.write(f"[{ts}] {line}")
-                    else:
-                        self._log_file.write(line)
-                    self._at_line_start = False
-            # If text ended with \n, next write starts a new line
-            if clean.endswith("\n"):
-                self._at_line_start = True
-
-            # REALTIME: flush to disk immediately — survive Ctrl+C / crash
-            self._log_file.flush()
-            os.fsync(self._log_file.fileno())
-
-    def flush(self):
-        self._stream.flush()
-        self._log_file.flush()
-
-    def close(self):
-        self._log_file.close()
-
-    def fileno(self):
-        return self._stream.fileno()
-
-    def isatty(self):
-        return self._stream.isatty()
-
-    @property
-    def encoding(self):
-        return self._stream.encoding
-
-
-def setup_logging(run_dir: str) -> str:
-    """Setup TeeLogger to mirror all output to {run_dir}/marl.log.
-
-    Returns:
-        Path to the log file.
-    """
-    log_path = str(Path(run_dir) / "marl.log")
-
-    # Write header
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write(f"MARL Session Log — {datetime.now().isoformat()}\n")
-        f.write(f"{'=' * 60}\n\n")
-
-    sys.stdout = TeeLogger(log_path, sys.__stdout__)
-    sys.stderr = TeeLogger(log_path, sys.__stderr__)
-
-    return log_path
-
 
 # ═════════════════════════════════════════════════════════════
 # HELPERS
@@ -147,10 +85,13 @@ def setup_logging(run_dir: str) -> str:
 
 def banner():
     print(f"""{C}{B}
-    ╔══════════════════════════════════════════╗
-    ║   MARL — Multi-Agent Red-team LLM        ║
-    ║   Penetration Testing via Debate          ║
-    ╚══════════════════════════════════════════╝{RST}
+    ╔══════════════════════════════════════════════════════╗
+    ║   MARL — Multi-Agent Red-team LLM (TrollLLM)         ║
+    ║   Penetration Testing via Debate                      ║
+    ╠══════════════════════════════════════════════════════╣
+    ║   API: {os.environ.get('MARL_SERVER_URL', 'http://127.0.0.1:5001/v1'):<40} ║
+    ║   Model: {DEFAULT_MODEL:<38} ║
+    ╚══════════════════════════════════════════════════════╝{RST}
     """)
 
 
@@ -168,6 +109,7 @@ def get_user_prompt() -> str:
 
 def strip_tag(text: str) -> str:
     """Xoa tag [REDTEAM], [BLUETEAM], [AGENT], [APPROVED], [DONE] o cuoi text."""
+    import re
     return re.sub(
         r"\[(?:REDTEAM|BLUETEAM|AGENT(?::run)?|APPROVED|DONE)\]\s*$",
         "", text, flags=re.IGNORECASE,
@@ -178,7 +120,7 @@ def strip_tag(text: str) -> str:
 # PHASE 1: RECON
 # ═════════════════════════════════════════════════════════════
 
-def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
+def phase_recon(user_prompt: str) -> tuple[str, str, str]:
     """CrawlAgent crawl target → (target_url, recon_path, recon_content)."""
     print(f"\n{C}{B}{'='*60}")
     print(f"  PHASE 1: RECON")
@@ -190,7 +132,7 @@ def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
     if not target_url:
         raise ValueError("Khong tim thay URL trong prompt.")
 
-    crawl = CrawlAgent(working_dir=run_dir)
+    crawl = CrawlAgent(working_dir=WORKSPACE)
     try:
         recon_path = crawl.run(user_prompt)
         if not recon_path or not Path(recon_path).exists():
@@ -216,24 +158,12 @@ def phase_debate(
 ) -> tuple[str, list[dict], int]:
     """Red vs Blue debate loop.
 
-    [GIẢI THÍCH CÁC CƠ CHẾ KIỂM SOÁT DEBATE Ở ĐÂY - THEO ROADMAP]:
-    1. Max Steps (MAX_DEBATE_STEPS=30): "Cầu dao" chống AI rơi vào vòng lặp vô tận (infinite loop). 
-       Giới hạn số lượt thoại qua lại để không đốt API. Nết vượt quá mức này mà vẫn chưa có sự đồng thuận, 
-       hệ thống sẽ raise RuntimeError ép ngừng.
-    2. Max Rounds (MAX_ROUNDS=5): 1 Round là khi Red nộp bản thảo và Blue bắt lỗi. Quá 5 lần sửa nháp 
-       mà vẫn fail thì vứt chiến lược đó. Cùng lúc, MIN_DEBATE_ROUNDS=2 ép Blue phải review cẩn thận, 
-       chống bệnh duyệt bừa của LLM.
-    3. Conversation Memory (Quay lui dữ liệu - Backtracking): Đầu vào "conversation" không hề bị xóa đi.
-       Lý do: Nếu Phase 3 Execute gặp lỗi (VD. 403 Forbidden), kết quả thất bại được nối vào tail của list
-       và quăng ngược lại Phase 2 Retry. Khi đó 2 Agent đọc hiểu ngay "chiến lược 1 thất bại", tự giác 
-       chuyển hướng sang chiến lược 2, không lặp lại lỗi ngớ ngẩn (cắn vào ngõ cụt).
-
     Args:
         target_url: URL target.
         recon_content: Noi dung recon.md.
         exec_agent: ExecAgent instance (shared across phases).
         red: RedTeamAgent instance (shared across retries).
-        conversation: Conversation (co the co history/log loi tu retry truoc).
+        conversation: Conversation (co the co history tu retry truoc).
 
     Returns:
         (approved_workflow, conversation, round_num)
@@ -249,103 +179,112 @@ def phase_debate(
 
     blue = BlueTeamAgent(target_url=target_url, recon_context=recon_content)
 
-    # ── Simple state machine ──
-    # Flow: RED → BLUE → (cai nhau cho den khi APPROVED)
-    # Ca RED va BLUE deu co the goi [AGENT] bat ky luc nao.
-    # Agent tra ket qua ve → quyen noi tra lai cho nguoi da goi Agent.
-    # 1 round = RED da noi + BLUE da noi (Agent khong tinh).
+    step = 0
     round_num = 0
-    red_spoke = False
-    blue_spoke = False
-    next_turn = "REDTEAM"
-    last_caller = "REDTEAM"    # ai goi Agent → Agent tra ve cho nguoi do
+    agent_consecutive = 0   # dem so lan lien tiep goi Agent
+    next_turn = "REDTEAM"   # Red luon bat dau
 
-    for step in range(MAX_DEBATE_STEPS):
+    while step < MAX_DEBATE_STEPS:
+        step += 1
 
-        # ── RED TEAM ──
+        # ── RED TEAM turn ──
         if next_turn == "REDTEAM":
-            # Neu ca Red va Blue da noi → hoan thanh 1 round
-            if red_spoke and blue_spoke:
-                round_num += 1
-                red_spoke = False
-                blue_spoke = False
+            round_num += 1
+            agent_consecutive = 0
+            print(f"\n{R}{B}══ RED TEAM — Round {round_num}/{MAX_ROUNDS} ══{RST}")
 
-            if round_num >= MAX_ROUNDS:
+            if round_num > MAX_ROUNDS:
                 print(f"{R}[!] Het {MAX_ROUNDS} rounds — REJECTED.{RST}")
                 raise RuntimeError(
                     f"Debate het {MAX_ROUNDS} rounds ma khong duoc approve."
                 )
 
-            print(f"\n{R}{B}══ RED TEAM — Round {round_num + 1}/{MAX_ROUNDS} ══{RST}")
-
             response = red.respond(conversation)
             tag = extract_next_tag(response)
+
             conversation.append({
                 "speaker": "REDTEAM",
                 "content": f"[REDTEAM]: {response}",
             })
             print(f"{R}{strip_tag(response)}{RST}")
-            red_spoke = True
 
             if tag == "AGENT":
-                last_caller = "REDTEAM"
-                next_turn = "AGENT"
+                next_turn = "AGENT_FOR_RED"
+            elif tag == "BLUETEAM":
+                next_turn = "BLUETEAM"
+            elif tag == "DONE":
+                # Red tu ket thuc (hiem — thuong chi sau exec)
+                print(f"\n{G}[+] Red Team ket thuc.{RST}")
+                raise RuntimeError(
+                    "Red Team ket thuc truoc khi co workflow duoc approve."
+                )
             else:
+                # Khong co tag ro rang → ep gui Blue
                 next_turn = "BLUETEAM"
 
-        # ── BLUE TEAM ──
+        # ── BLUE TEAM turn ──
         elif next_turn == "BLUETEAM":
+            agent_consecutive = 0
             print(f"\n{C}{B}══ BLUE TEAM — Review ══{RST}")
 
             response = blue.respond(conversation)
             tag = extract_next_tag(response)
+
             conversation.append({
                 "speaker": "BLUETEAM",
                 "content": f"[BLUETEAM]: {response}",
             })
             print(f"{C}{strip_tag(response)}{RST}")
-            blue_spoke = True
 
             if tag == "APPROVED":
-                if round_num + 1 < MIN_DEBATE_ROUNDS:
-                    # Chua du round toi thieu — ep Blue phai review them
-                    print(f"\n{Y}{B}[GUARDRAIL] Round {round_num + 1}/{MIN_DEBATE_ROUNDS} "
-                          f"— chua du round toi thieu, ep tiep tuc debate.{RST}")
-                    conversation.append({
-                        "speaker": "SYSTEM",
-                        "content": (
-                            "[SYSTEM]: Chua du so round toi thieu. "
-                            "Ban can dat them cau hoi verify hoac yeu cau "
-                            "Red Team lam ro them truoc khi approve. "
-                            "Hay tiep tuc review."
-                        ),
-                    })
-                    next_turn = "BLUETEAM"
-                else:
-                    print(f"\n{G}{B}══ APPROVED ══{RST}")
-                    workflow = _extract_last_workflow(conversation)
-                    return workflow, conversation, round_num + 1
+                print(f"\n{G}{B}══ APPROVED ══{RST}")
+                workflow = _extract_last_workflow(conversation)
+                return workflow, conversation, round_num
             elif tag == "AGENT":
-                last_caller = "BLUETEAM"
-                next_turn = "AGENT"
+                next_turn = "AGENT_FOR_BLUE"
+            elif tag == "REDTEAM":
+                next_turn = "REDTEAM"
             else:
+                # Khong ro tag → mac dinh tra ve Red sua
                 next_turn = "REDTEAM"
 
-        # ── AGENT (culi) — ai goi thi tra ve nguoi do ──
-        elif next_turn == "AGENT":
-            caller_name = "Red Team" if last_caller == "REDTEAM" else "Blue Team"
-            print(f"\n{G}{B}[AGENT] Dang xu ly cho {caller_name}...{RST}")
+        # ── AGENT turn (goi boi Red) ──
+        elif next_turn == "AGENT_FOR_RED":
+            agent_consecutive += 1
+            print(f"\n{G}{B}[AGENT] Dang xu ly cho Red Team...{RST}")
 
-            raw = exec_agent.answer(conversation, caller=last_caller)
+            raw = exec_agent.answer(conversation, caller="REDTEAM")
             data = extract_send_block(raw) or raw
+
             conversation.append({
                 "speaker": "AGENT",
                 "content": f"[AGENT]: {data}",
             })
             print(f"{G}{strip_tag(raw)}{RST}")
 
-            # Tra quyen noi ve cho nguoi da goi Agent
-            next_turn = last_caller
+            if agent_consecutive >= MAX_AGENT_CONSECUTIVE:
+                print(f"{Y}[!] {MAX_AGENT_CONSECUTIVE} Agent calls lien tiep"
+                      f" — ep Red viet chien luoc.{RST}")
+            next_turn = "REDTEAM"
+
+        # ── AGENT turn (goi boi Blue) ──
+        elif next_turn == "AGENT_FOR_BLUE":
+            agent_consecutive += 1
+            print(f"\n{G}{B}[AGENT] Dang xu ly cho Blue Team...{RST}")
+
+            raw = exec_agent.answer(conversation, caller="BLUETEAM")
+            data = extract_send_block(raw) or raw
+
+            conversation.append({
+                "speaker": "AGENT",
+                "content": f"[AGENT]: {data}",
+            })
+            print(f"{G}{strip_tag(raw)}{RST}")
+
+            if agent_consecutive >= MAX_AGENT_CONSECUTIVE:
+                print(f"{Y}[!] {MAX_AGENT_CONSECUTIVE} Agent calls lien tiep"
+                      f" — ep Blue ra quyet dinh.{RST}")
+            next_turn = "BLUETEAM"
 
     # Het MAX_DEBATE_STEPS
     raise RuntimeError(
@@ -426,40 +365,25 @@ def phase_evaluate(
     exec_agent,
     exec_report: str,
     conversation: list[dict],
-) -> tuple[str, str, str]:
+) -> tuple[str, str]:
     """Red Team danh gia ket qua thuc thi.
 
     Red co the:
     - [DONE] → hai long, ket thuc
     - [BLUETEAM] → de xuat chien luoc moi → quay lai debate
-    - [AGENT] → hoi Agent verify (read_only mode) → roi danh gia lai
+    - [AGENT] → hoi Agent them → roi danh gia lai
 
     Returns:
-        (verdict, final_analysis, enriched_exec_report)
+        (verdict, final_analysis)
         - verdict: "SUCCESS" hoac "RETRY"
         - final_analysis: Red's evaluation text
-        - enriched_exec_report: exec_report goc + agent verification data (neu co)
     """
     print(f"\n{C}{B}{'='*60}")
     print(f"  PHASE 4: EVALUATION")
     print(f"{'='*60}{RST}\n")
 
-    # ── Switch Red sang eval mode: system prompt moi, buoc doc evidence ──
-    red.switch_to_eval_mode(exec_report)
-
-    # Inject exec_report vao conversation de Red THAY ket qua
-    conversation.append({
-        "speaker": "SYSTEM",
-        "content": (
-            "[SYSTEM — KET QUA THUC THI]\n"
-            "Day la ket qua thuc thi tu Agent. "
-            "Hay doc ky va danh gia dua tren evidence thuc te.\n\n"
-            f"{exec_report}"
-        ),
-    })
-
-    # Collect agent verification data de append vao exec_report
-    agent_verification_parts: list[str] = []
+    # Them exec_report vao conversation de Red thay
+    # (da append trong phase_execute roi — Red se thay tu conversation)
 
     max_eval_steps = 5
     for _ in range(max_eval_steps):
@@ -475,15 +399,12 @@ def phase_evaluate(
         print(f"{R}{strip_tag(response)}{RST}")
 
         if tag == "DONE":
-            enriched = _enrich_exec_report(exec_report, agent_verification_parts)
-            return "SUCCESS", strip_tag(response), enriched
+            return "SUCCESS", strip_tag(response)
         elif tag == "AGENT":
-            # Red hoi Agent verify — READ_ONLY mode (khong cho exploit lai)
-            print(f"\n{G}{B}[AGENT] Dang verify cho Red Team (read-only)...{RST}")
-            raw = exec_agent.answer(conversation, caller="REDTEAM",
-                                    read_only=True)
+            # Red hoi Agent them
+            print(f"\n{G}{B}[AGENT] Dang xu ly cho Red Team...{RST}")
+            raw = exec_agent.answer(conversation, caller="REDTEAM")
             data = extract_send_block(raw) or raw
-            agent_verification_parts.append(data)
             conversation.append({
                 "speaker": "AGENT",
                 "content": f"[AGENT]: {data}",
@@ -492,26 +413,12 @@ def phase_evaluate(
             continue
         elif tag == "BLUETEAM":
             # Red muon de xuat chien luoc moi → can debate lai
-            enriched = _enrich_exec_report(exec_report, agent_verification_parts)
-            return "RETRY", strip_tag(response), enriched
+            return "RETRY", strip_tag(response)
         else:
             # Khong ro → coi nhu DONE
-            enriched = _enrich_exec_report(exec_report, agent_verification_parts)
-            return "SUCCESS", strip_tag(response), enriched
+            return "SUCCESS", strip_tag(response)
 
-    enriched = _enrich_exec_report(exec_report, agent_verification_parts)
-    return "SUCCESS", strip_tag(response), enriched
-
-
-def _enrich_exec_report(
-    exec_report: str,
-    agent_parts: list[str],
-) -> str:
-    """Noi exec_report goc voi agent verification data."""
-    if not agent_parts:
-        return exec_report
-    separator = "\n\n--- AGENT VERIFICATION (Phase 4) ---\n\n"
-    return exec_report + separator + "\n\n".join(agent_parts)
+    return "SUCCESS", strip_tag(response)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -525,7 +432,6 @@ def phase_report(
     exec_report: str,
     red_evaluation: str,
     debate_rounds: int,
-    run_dir: str,
 ):
     """Luu report cuoi cung ra file."""
     print(f"\n{C}{B}{'='*60}")
@@ -542,12 +448,15 @@ def phase_report(
         print(exec_report[:3000])
 
     # ── Save file ──
-    report_path = Path(run_dir) / "report.md"
+    ws = Path(WORKSPACE)
+    ws.mkdir(parents=True, exist_ok=True)
+    report_path = ws / "report.md"
 
-    report_md = f"""# MARL Penetration Test Report
+    report_md = f"""# MARL Penetration Test Report (TrollLLM)
 **Target:** {target_url}
 **Verdict:** {icon} {verdict}
 **Debate rounds:** {debate_rounds}
+**Model:** {DEFAULT_MODEL}
 
 ## Approved Attack Workflow
 {workflow}
@@ -571,23 +480,22 @@ def phase_report(
 def main():
     banner()
 
+    # Check API key
+    api_key = os.environ.get("TROLLLLM_API_KEY", "")
+    if not api_key:
+        print(f"""{Y}
+╔══════════════════════════════════════════════════════════════╗
+║  WARNING: TROLLLLM_API_KEY not set!                          ║
+║  Set it via environment variable:                            ║
+║    export TROLLLLM_API_KEY="sk-trollllm-xxx"                 ║
+╚══════════════════════════════════════════════════════════════╝
+{RST}""")
+
     user_prompt = get_user_prompt()
-
-    # ── Parse target URL to create per-target workspace dir ──
-    target_url_early, _ = parse_prompt(user_prompt)
-    if not target_url_early:
-        print(f"{R}[!] Khong tim thay URL trong prompt.{RST}")
-        return
-    run_dir = _make_run_dir(target_url_early)
-
-    # ── Setup logging — mirror all console output to run_dir/marl.log ──
-    log_path = setup_logging(run_dir)
-    print(f"{G}[+] Run directory: {run_dir}{RST}")
-    print(f"{G}[+] Logging to: {log_path}{RST}\n")
 
     # ── Phase 1: Recon ──
     try:
-        target_url, recon_path, recon_content = phase_recon(user_prompt, run_dir)
+        target_url, recon_path, recon_content = phase_recon(user_prompt)
     except Exception as e:
         print(f"\n{R}[!] Recon failed: {e}{RST}")
         return
@@ -599,7 +507,7 @@ def main():
         from agents.red_team import RedTeamAgent
 
         exec_agent = ExecAgent(
-            working_dir=run_dir,
+            working_dir=WORKSPACE,
             target_url=target_url,
             recon_md=recon_path,
         )
@@ -630,7 +538,7 @@ def main():
             exec_report = phase_execute(exec_agent, workflow, conversation)
 
             # Phase 4: Evaluate
-            verdict, red_evaluation, exec_report = phase_evaluate(
+            verdict, red_evaluation = phase_evaluate(
                 red, exec_agent, exec_report, conversation,
             )
 
@@ -650,7 +558,6 @@ def main():
             exec_report=exec_report,
             red_evaluation=red_evaluation,
             debate_rounds=total_debate_rounds,
-            run_dir=run_dir,
         )
 
     except RuntimeError as e:
@@ -665,7 +572,6 @@ def main():
                 exec_agent.shutdown()
             except Exception:
                 pass
-        print(f"\n{G}[+] Full session log: {log_path}{RST}")
 
 
 if __name__ == "__main__":
