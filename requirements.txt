@@ -3,3 +3,7 @@ fastapi
 playwright
 uvicorn
 dotenv
+requests
+ddgs
+mcp
+readabilipy
