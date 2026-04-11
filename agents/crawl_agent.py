@@ -1,0 +1,847 @@
+"""
+CrawlAgent — Standalone recon agent for MARL.
+
+Crawls target website (anonymous + authenticated), collects HTTP traffic,
+then uses LLM to analyze and write a structured recon.md report.
+
+Usage:
+    python agents/crawl_agent.py "https://target.com/"
+    python agents/crawl_agent.py "https://target.com/ credentials: admin:password"
+"""
+
+import json
+import os
+import re
+import sys
+import subprocess
+from pathlib import Path
+from urllib.parse import urlparse, urljoin
+
+import httpx
+from openai import OpenAI
+
+# ── Ensure project root is on sys.path so we can import mcp_client ──
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+from mcp_client import MCPManager
+from shared.utils import (
+    extract_send_block, extract_next_tag, strip_tag,
+    truncate, parse_prompt,
+    SEND_BLOCK_PATTERN, TAG_PATTERN,
+)
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "gho_token")
+SERVER_URL = os.getenv("MARL_SERVER_URL", "http://127.0.0.1:5000/v1")
+MODEL = os.getenv("MARL_CRAWL_MODEL", os.getenv("MARL_EXECUTOR_MODEL", "gpt-4.1"))
+DEBUG = os.getenv("MARL_DEBUG", "").lower() in ("1", "true", "yes")
+
+# Colors
+YELLOW = "\033[93m"
+GREEN = "\033[92m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def _debug(msg: str):
+    """Print debug message only when MARL_DEBUG is enabled."""
+    if DEBUG:
+        print(f"{CYAN}[DEBUG] {msg}{RESET}")
+
+# Limits
+MAX_TOOL_ROUNDS = 30
+MAX_CONSECUTIVE_ERRORS = 3
+TRUNCATE_LIMIT = 15000
+
+# Path to crawler CLI
+_CRAWLER_CLI = str(Path(__file__).resolve().parent.parent / "tools" / "crawler.py")
+
+
+# ═══════════════════════════════════════════════════════════════
+# RECON SYSTEM PROMPT
+# ═══════════════════════════════════════════════════════════════
+
+RECON_SYSTEM_PROMPT = """You are a security reconnaissance analyst specialized in BAC (Broken Access Control) and BLF (Business Logic Flaw).
+
+You have raw HTTP traffic from 2 crawl sessions: ANONYMOUS (no login) and AUTHENTICATED (logged in as a normal user).
+
+Your job: analyze the traffic and write a recon.md report focused EXCLUSIVELY on BAC (Broken Access Control) and BLF (Business Logic Flaw) attack surface. Do NOT report other vulnerability classes.
+
+=== SCOPE ===
+
+1. BROKEN ACCESS CONTROL (BAC):
+   - IDOR: endpoints with user-controllable IDs (e.g. /api/user/123, ?id=wiener)
+   - Privilege escalation: admin panels, role-based endpoints accessible to normal users
+   - Horizontal access: can user A access user B's resources?
+   - Missing auth checks: endpoints that SHOULD require login but don't
+   - Forced browsing: hidden admin/management paths discovered in JS or redirects
+   - Referer/Origin-based access control (easy to bypass)
+
+2. BUSINESS LOGIC FLAWS (BLF):
+   - Price/quantity/amount manipulation: negative values, zero, overflow, float precision
+   - Coupon/discount/loyalty abuse: apply multiple times, race condition, invalid combinations
+   - Workflow skip: can steps be skipped? (jump to /checkout without /verify)
+   - State manipulation: change order status, role, approval via parameter tampering
+   - Numeric edge cases: MAX_INT, MIN_INT, scientific notation (1e9), NaN, Infinity
+   - Race conditions on sensitive ops: double-submit, parallel requests to same endpoint
+   - Parameter type confusion: string "1" vs integer 1, array vs scalar
+   - Missing server-side validation: fields validated only in JS/HTML (hidden fields, readonly)
+   - Insufficient process validation: skip steps in multi-step flow
+
+OUT OF SCOPE — do NOT report:
+   - XSS, CSRF tokens, cookie flags, SQL injection, SSRF, XXE
+   - Missing security headers (CSP, HSTS)
+   - Information disclosure UNLESS it reveals BAC/BLF attack surface
+   - Anything requiring injecting code/scripts
+
+=== REPORT STRUCTURE ===
+
+## Target Overview
+URL, auth mechanism, session management, user roles observed
+
+## Access Control Map
+Table comparing anonymous vs authenticated access to each endpoint:
+| Endpoint | Method | Anon Status | Auth Status | Notes |
+
+## High-Priority Endpoints (BAC/BLF attack surface)
+For each endpoint that is interesting for BAC or BLF:
+- Full HTTP request (method, URL, headers, body)
+- Full HTTP response (status, key headers, body snippet)
+- WHY it's interesting (what to test)
+
+## Forms & State-Changing Actions
+Action URL, method, fields — focus on:
+- Hidden fields (productId, price, role, userId) — server may trust client values
+- Numeric fields (quantity, amount, discount) — try edge cases
+- Workflow-related fields (status, step, action) — try skipping/reordering
+- Fields with client-side-only validation (JS/HTML constraints not enforced server-side)
+
+## Observations & Attack Hypotheses
+Concrete, actionable hypotheses specific to THIS target. Each = 1 bullet:
+- "GET /my-account?id=wiener → try ?id=administrator for horizontal access"
+- "POST /cart quantity=1 → try quantity=-1, 0, 99999999 for price manipulation"
+- "POST /cart has hidden field price=133700 → try price=1 (server may trust client)"
+- "Coupon NEWCUST5 applied once → try race condition: send 10 parallel requests"
+
+=== RULES ===
+- Include FULL request + response for high-priority endpoints.
+- Compare anonymous vs authenticated traffic to find access control gaps.
+- Be specific: use actual URLs, parameter names, and values from the crawl data.
+- Write standard Markdown.
+- Use the write_file tool to save the report to the workspace path given.
+- KHONG DUOC bia thong tin. Chi bao cao nhung gi THAT SU thay trong HTTP traffic.
+- When done, respond with [DONE]"""
+
+
+# ═══════════════════════════════════════════════════════════════
+# DONE TAG — simpler than debate tags
+# ═══════════════════════════════════════════════════════════════
+
+_DONE_PATTERN = re.compile(r"\[DONE\]\s*$", re.MULTILINE)
+
+
+def _has_done_tag(text: str) -> bool:
+    return bool(_DONE_PATTERN.search(text))
+
+
+# ═══════════════════════════════════════════════════════════════
+# CRAWL AGENT CLASS
+# ═══════════════════════════════════════════════════════════════
+
+class CrawlAgent:
+    """Standalone recon agent: crawl → login → crawl again → LLM analysis → recon.md."""
+
+    def __init__(self, working_dir: str = "./workspace"):
+        self.working_dir = os.path.abspath(working_dir)
+        os.makedirs(self.working_dir, exist_ok=True)
+        self.client = OpenAI(api_key=GITHUB_TOKEN, base_url=SERVER_URL)
+
+        print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Khoi tao MCP tools...{RESET}")
+        self.mcp = MCPManager()
+        self.mcp.add_shell_server()
+        self.mcp.add_fetch_server()
+        self.mcp.add_filesystem_server([self.working_dir])
+
+        self.tools = self.mcp.get_openai_tools()
+        print(f"{YELLOW}[CRAWL-AGENT] Da san sang — {len(self.tools)} tools{RESET}")
+        self.mcp.display_tools()
+        print()
+
+    # ─── Public API ──────────────────────────────────────────────
+
+    def run(self, user_prompt: str) -> str:
+        """Run full recon pipeline. Returns path to recon.md.
+
+        Flow:
+        1. Parse prompt → URL + credentials
+        2. Anonymous crawl via tools/crawler.py CLI
+        3. Login (if credentials) via httpx
+        4. Authenticated crawl (if login succeeded)
+        5. LLM analysis → write recon.md
+
+        Args:
+            user_prompt: User input containing URL and optionally credentials.
+
+        Returns:
+            Absolute path to the generated recon.md file.
+        """
+        url, credentials = parse_prompt(user_prompt)
+        if not url:
+            print(f"{RED}[CRAWL-AGENT] ERROR: Khong tim thay URL trong prompt.{RESET}")
+            return ""
+
+        print(f"{GREEN}{BOLD}[CRAWL-AGENT] Target: {url}{RESET}")
+        _debug(f"Parsed prompt: url={url}, credentials={credentials}")
+        _debug(f"Config: MODEL={MODEL}, SERVER_URL={SERVER_URL}")
+        _debug(f"Working dir: {self.working_dir}")
+
+        # ── Phase 1: Anonymous crawl ──
+        print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 1: Anonymous crawl...{RESET}")
+        anon_data = self._run_crawler(url)
+
+        # ── Phase 2: Login (if credentials) ──
+        login_cookies = None
+        if credentials:
+            print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 2: Login...{RESET}")
+            login_cookies = self._login(url, credentials)
+            if login_cookies:
+                print(f"{GREEN}[CRAWL-AGENT] Login OK — {len(login_cookies)} cookies{RESET}")
+            else:
+                print(f"{YELLOW}[CRAWL-AGENT] Login failed, skipping authenticated crawl{RESET}")
+        else:
+            print(f"\n{DIM}[CRAWL-AGENT] Phase 2: No credentials, skipping login{RESET}")
+
+        # ── Phase 3: Authenticated crawl (if login OK) ──
+        auth_data = None
+        if login_cookies:
+            print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 3: Authenticated crawl...{RESET}")
+            # Build cookie header string
+            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in login_cookies)
+            _debug(f"Injecting {len(login_cookies)} cookies into crawler: {cookie_str[:100]}...")
+            auth_data = self._run_crawler(url, cookie_header=cookie_str)
+            if auth_data:
+                _debug(f"Auth crawl done: {len(auth_data.get('http_traffic', []))} requests")
+            else:
+                _debug(f"Auth crawl returned no data!")
+
+        # ── Phase 4: LLM analysis → recon.md ──
+        print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 4: LLM analysis...{RESET}")
+        _debug(f"Sending to LLM: anon_data={'YES' if anon_data else 'NO'}, "
+               f"auth_data={'YES' if auth_data else 'NO'}")
+        recon_path = self._analyze(url, anon_data, auth_data)
+
+        return recon_path
+
+    def shutdown(self):
+        """Clean up MCP servers."""
+        print(f"{YELLOW}[CRAWL-AGENT] Shutting down MCP...{RESET}")
+        self.mcp.stop_all()
+        print(f"{YELLOW}[CRAWL-AGENT] Done.{RESET}")
+
+    # ─── Internal: Run crawler CLI ───────────────────────────────
+
+    def _run_crawler(
+        self,
+        url: str,
+        cookie_header: str | None = None,
+        max_pages: int = 50,
+        max_rounds: int = 2,
+        timeout: int = 300,
+    ) -> dict | None:
+        """Run tools/crawler.py as subprocess, return parsed JSON output."""
+        cmd = [
+            sys.executable, _CRAWLER_CLI,
+            "--url", url,
+            "--max-pages", str(max_pages),
+            "--max-rounds", str(max_rounds),
+            "--timeout", str(timeout),
+            "--headless",
+        ]
+        if cookie_header:
+            cmd.extend(["-H", f"Cookie: {cookie_header}"])
+
+        _debug(f"Full crawler command: {' '.join(cmd)}")
+        if cookie_header:
+            _debug(f"Cookie header: {cookie_header[:80]}...")
+        print(f"{DIM}[CRAWL-AGENT] Running: {' '.join(cmd[:6])}...{RESET}")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout + 30,  # extra buffer over crawler timeout
+                cwd=_PROJECT_ROOT,
+            )
+
+            # Show stderr logs
+            if result.stderr:
+                for line in result.stderr.strip().split("\n"):
+                    print(f"{DIM}  {line}{RESET}")
+
+            if result.returncode != 0:
+                print(f"{YELLOW}[CRAWL-AGENT] Crawler exited with code {result.returncode}{RESET}")
+
+            # Parse JSON stdout
+            if result.stdout.strip():
+                data = json.loads(result.stdout)
+                n_traffic = len(data.get("http_traffic", []))
+                n_cookies = len(data.get("cookies", []))
+                n_external = len(data.get("external_links", []))
+                print(f"{GREEN}[CRAWL-AGENT] Crawl result: {n_traffic} requests, "
+                      f"{n_cookies} cookies, {n_external} external links{RESET}")
+
+                # Debug: show sampled traffic
+                if DEBUG:
+                    traffic = data.get("http_traffic", [])
+                    _debug(f"Traffic breakdown:")
+                    by_type = {}
+                    for r in traffic:
+                        rt = r.get("resource_type", "unknown")
+                        by_type[rt] = by_type.get(rt, 0) + 1
+                    for rt, count in sorted(by_type.items()):
+                        _debug(f"  {rt}: {count}")
+                    # Show unique URLs
+                    urls = set()
+                    for r in traffic:
+                        if r.get("resource_type") in ("document", "xhr", "fetch", "form"):
+                            urls.add(f"{r.get('method', '?')} {r.get('url', '?')} -> {r.get('response_status', '?')}")
+                    _debug(f"Interesting requests ({len(urls)}):")
+                    for u in sorted(urls)[:30]:
+                        _debug(f"  {u}")
+                    # Show cookies
+                    for c in data.get("cookies", []):
+                        _debug(f"Cookie: {c.get('name')}={c.get('value', '')[:30]}... "
+                               f"(domain={c.get('domain')}, httpOnly={c.get('httpOnly')}, "
+                               f"secure={c.get('secure')})")
+
+                return data
+            else:
+                print(f"{YELLOW}[CRAWL-AGENT] No output from crawler{RESET}")
+                return None
+
+        except subprocess.TimeoutExpired:
+            print(f"{RED}[CRAWL-AGENT] Crawler timed out after {timeout + 30}s{RESET}")
+            return None
+        except json.JSONDecodeError as e:
+            print(f"{RED}[CRAWL-AGENT] Failed to parse crawler JSON: {e}{RESET}")
+            return None
+        except Exception as e:
+            print(f"{RED}[CRAWL-AGENT] Crawler error: {e}{RESET}")
+            return None
+
+    # ─── Internal: Login via httpx ───────────────────────────────
+
+    def _login(self, target_url: str, credentials: dict) -> list[dict] | None:
+        """Login via httpx. Returns list of cookie dicts or None."""
+        domain = urlparse(target_url).netloc
+        _debug(f"Login target: {target_url}, domain: {domain}")
+        _debug(f"Credentials: username={credentials.get('username')}, "
+               f"password={'*' * len(credentials.get('password', ''))}")
+
+        try:
+            with httpx.Client(follow_redirects=True, timeout=15, verify=False) as client:
+                # ── Step 1: Discover login URL from homepage links ──
+                login_paths = []
+                try:
+                    home_resp = client.get(target_url)
+                    if home_resp.status_code == 200:
+                        # Extract hrefs that look like login/signin/account pages
+                        hrefs = re.findall(
+                            r'href=["\']([^"\']*)["\']', home_resp.text, re.IGNORECASE,
+                        )
+                        login_keywords = re.compile(
+                            r'(?:log.?in|sign.?in|auth|account|session)',
+                            re.IGNORECASE,
+                        )
+                        for href in hrefs:
+                            if login_keywords.search(href):
+                                # Normalize relative → absolute
+                                full = urljoin(target_url, href)
+                                path = urlparse(full).path
+                                if path and path not in login_paths:
+                                    login_paths.append(path)
+                                    _debug(f"Discovered login path from homepage: {path}")
+                except Exception as e:
+                    _debug(f"Homepage scan failed: {e}")
+
+                # ── Step 2: Fallback to original hardcoded paths ──
+                common_paths = [
+                    "/login", "/my-account", "/account/login", "/signin",
+                ]
+                for p in common_paths:
+                    if p not in login_paths:
+                        login_paths.append(p)
+
+                _debug(f"Login paths to try ({len(login_paths)}): {login_paths}")
+
+                # Find login page
+                login_url = None
+                resp = None
+
+                for path in login_paths:
+                    try_url = urljoin(target_url, path)
+                    _debug(f"Trying login path: GET {try_url}")
+                    resp = client.get(try_url)
+                    _debug(f"  -> Status: {resp.status_code}, "
+                           f"URL after redirect: {resp.url}, "
+                           f"Has 'password' field: {'password' in resp.text.lower()}")
+                    if resp.status_code == 200 and ("password" in resp.text.lower()):
+                        login_url = try_url
+                        _debug(f"  -> MATCH! Using this as login page")
+                        break
+                    else:
+                        _debug(f"  -> SKIP (status={resp.status_code}, "
+                               f"has_password={'password' in resp.text.lower()})")
+
+                if not login_url or not resp:
+                    print(f"{YELLOW}[LOGIN] Khong tim thay trang login{RESET}")
+                    _debug(f"Tried paths: {login_paths} — none had status 200 + password field")
+                    return None
+
+                # Extract all forms for debug
+                if DEBUG:
+                    forms_found = re.findall(
+                        r'<form[^>]*>([\s\S]*?)</form>',
+                        resp.text, re.IGNORECASE,
+                    )
+                    _debug(f"Found {len(forms_found)} <form> on login page")
+                    for i, form_html in enumerate(forms_found):
+                        # Extract action
+                        action_m = re.search(r'action=["\']([^"\']*)["\']', form_html)
+                        method_m = re.search(r'method=["\']([^"\']*)["\']', form_html)
+                        _debug(f"  Form {i}: action={action_m.group(1) if action_m else 'NONE'}, "
+                               f"method={method_m.group(1) if method_m else 'NONE'}")
+                        # Extract all input fields
+                        inputs = re.findall(
+                            r'<input[^>]*?(?:name=["\']([^"\']*)["\'])?[^>]*?'
+                            r'(?:type=["\']([^"\']*)["\'])?[^>]*?>',
+                            form_html, re.IGNORECASE,
+                        )
+                        for name, ftype in inputs:
+                            if name:
+                                value_m = re.search(
+                                    rf'name=["\']{ re.escape(name) }["\'][^>]*?value=["\']([^"\']*)["\']',
+                                    form_html, re.IGNORECASE,
+                                )
+                                val = value_m.group(1) if value_m else ""
+                                _debug(f"    input: name={name}, type={ftype or '?'}, "
+                                       f"value={val[:50] if val else '(empty)'}")
+
+                # Extract CSRF token
+                csrf_token = None
+                csrf_patterns = [
+                    ("csrf", re.compile(r'name=["\']csrf["\'][\s\S]*?value=["\']([^"\']+)["\']')),
+                    ("csrf-reverse", re.compile(r'value=["\']([^"\']+)["\'][\s\S]*?name=["\']csrf["\']')),
+                    ("_token", re.compile(r'name=["\']_token["\'][\s\S]*?value=["\']([^"\']+)["\']')),
+                ]
+                for pat_name, pat in csrf_patterns:
+                    m = pat.search(resp.text)
+                    if m:
+                        csrf_token = m.group(1)
+                        _debug(f"CSRF token found via pattern '{pat_name}': {csrf_token[:30]}...")
+                        break
+                    else:
+                        _debug(f"CSRF pattern '{pat_name}': no match")
+
+                if not csrf_token:
+                    _debug("WARNING: No CSRF token found — POST may fail if server requires one")
+
+                # POST login
+                post_data = {
+                    "username": credentials["username"],
+                    "password": credentials["password"],
+                }
+                if csrf_token:
+                    post_data["csrf"] = csrf_token
+
+                _debug(f"POST {login_url}")
+                _debug(f"  Fields: {list(post_data.keys())}")
+                _debug(f"  Data: { {k: (v if k != 'password' else '***') for k, v in post_data.items()} }")
+
+                # Cookies before login
+                pre_cookies = list(client.cookies.jar)
+                _debug(f"  Cookies BEFORE POST: {[c.name for c in pre_cookies]}")
+
+                login_resp = client.post(login_url, data=post_data)
+
+                _debug(f"  -> Response status: {login_resp.status_code}")
+                _debug(f"  -> Final URL: {login_resp.url}")
+                _debug(f"  -> Response headers: { {k: v for k, v in login_resp.headers.items() if k.lower() in ('location', 'set-cookie', 'content-type')} }")
+
+                # Check for error indicators in response
+                if DEBUG:
+                    body_lower = login_resp.text.lower()
+                    error_keywords = ["invalid", "incorrect", "wrong", "error", "failed", "denied"]
+                    found_errors = [kw for kw in error_keywords if kw in body_lower]
+                    if found_errors:
+                        _debug(f"  -> WARNING: Response body contains error words: {found_errors}")
+                        _debug(f"  -> Body snippet: {login_resp.text[:500]}")
+                    else:
+                        _debug(f"  -> No obvious error keywords in response body")
+
+                # Extract cookies
+                all_cookies = []
+                for cookie in client.cookies.jar:
+                    all_cookies.append({
+                        "name": cookie.name,
+                        "value": cookie.value,
+                        "domain": domain,
+                        "path": cookie.path or "/",
+                    })
+
+                _debug(f"Cookies AFTER POST: {[(c['name'], c['value'][:20]+'...') for c in all_cookies]}")
+
+                # Check if session cookie actually changed (login success indicator)
+                if DEBUG and pre_cookies and all_cookies:
+                    pre_values = {c.name: c.value for c in pre_cookies}
+                    for c in all_cookies:
+                        if c["name"] in pre_values:
+                            changed = c["value"] != pre_values[c["name"]]
+                            _debug(f"  Cookie '{c['name']}' changed: {changed}")
+                        else:
+                            _debug(f"  Cookie '{c['name']}' is NEW (not present before login)")
+
+                if all_cookies:
+                    print(f"{GREEN}[LOGIN] Cookies: {[c['name'] for c in all_cookies]}{RESET}")
+                    return all_cookies
+                else:
+                    print(f"{YELLOW}[LOGIN] Khong co cookies sau login{RESET}")
+                    return None
+
+        except Exception as e:
+            print(f"{YELLOW}[LOGIN] Error: {e}{RESET}")
+            _debug(f"Exception type: {type(e).__name__}, details: {e}")
+            return None
+
+    # ─── Internal: LLM analysis ──────────────────────────────────
+
+    def _analyze(self, url: str, anon_data: dict | None, auth_data: dict | None) -> str:
+        """Send crawl data to LLM, let it write recon.md via tools.
+
+        Returns:
+            Absolute path to recon.md.
+        """
+        recon_path = os.path.join(self.working_dir, "recon.md")
+
+        # Build data summary for LLM
+        parts = []
+        parts.append(f"TARGET: {url}")
+        parts.append(f"WORKSPACE: {self.working_dir}")
+        parts.append(f"OUTPUT FILE: {recon_path}")
+        parts.append("")
+
+        if anon_data:
+            parts.append("=" * 60)
+            parts.append("ANONYMOUS CRAWL DATA")
+            parts.append("=" * 60)
+            parts.append(self._format_crawl_data(anon_data))
+            parts.append("")
+
+        if auth_data:
+            parts.append("=" * 60)
+            parts.append("AUTHENTICATED CRAWL DATA")
+            parts.append("=" * 60)
+            parts.append(self._format_crawl_data(auth_data))
+            parts.append("")
+
+        if not anon_data and not auth_data:
+            parts.append("WARNING: No crawl data available. Write a minimal report noting the failure.")
+
+        data_text = truncate("\n".join(parts))
+
+        messages = [
+            {"role": "system", "content": RECON_SYSTEM_PROMPT},
+            {"role": "user", "content": data_text},
+        ]
+
+        self._tool_loop(messages)
+
+        # Verify recon.md was created
+        if os.path.exists(recon_path):
+            size = os.path.getsize(recon_path)
+            print(f"{GREEN}{BOLD}[CRAWL-AGENT] recon.md written: {recon_path} ({size} bytes){RESET}")
+        else:
+            # Fallback: write a basic report ourselves
+            print(f"{YELLOW}[CRAWL-AGENT] LLM did not write recon.md, creating fallback...{RESET}")
+            with open(recon_path, "w") as f:
+                f.write(f"# Recon Report — {url}\n\n")
+                f.write("LLM analysis failed to produce output.\n\n")
+                f.write("## Raw Data\n\n")
+                f.write(data_text)
+            print(f"{GREEN}[CRAWL-AGENT] Fallback recon.md written: {recon_path}{RESET}")
+
+        return recon_path
+
+    def _format_crawl_data(self, data: dict) -> str:
+        """Format crawler JSON output into readable text for LLM."""
+        parts = []
+
+        # Cookies
+        cookies = data.get("cookies", [])
+        if cookies:
+            parts.append("## Cookies")
+            for c in cookies:
+                parts.append(f"  {c.get('name', '?')}={c.get('value', '')}"
+                             f"  (domain={c.get('domain', '?')}, path={c.get('path', '/')}"
+                             f", httpOnly={c.get('httpOnly', False)}, secure={c.get('secure', False)})")
+            parts.append("")
+
+        # HTTP Traffic
+        traffic = data.get("http_traffic", [])
+        if traffic:
+            # Filter out noise
+            keep_types = {"document", "xhr", "fetch", "form", "websocket", "other", "script"}
+            filtered = [r for r in traffic
+                        if r.get("resource_type", "other") in keep_types
+                        and r.get("method", "").upper() != "OPTIONS"]
+
+            # Pages
+            pages = [r for r in filtered if r.get("resource_type") == "document"]
+            if pages:
+                seen = set()
+                parts.append("## Pages Visited")
+                for r in pages:
+                    u = r.get("url", "?")
+                    if u not in seen:
+                        seen.add(u)
+                        parts.append(f"  [{r.get('response_status', '?')}] {u}")
+                parts.append("")
+
+            # API requests
+            api = [r for r in filtered if r.get("resource_type") in ("xhr", "fetch", "other")]
+            if api:
+                interesting_headers = {"content-type", "authorization", "cookie",
+                                       "set-cookie", "location", "x-csrf-token"}
+                parts.append("## API/XHR Requests")
+                for r in api:
+                    parts.append(f"REQUEST: {r.get('method', '?')} {r.get('url', '?')}")
+                    req_h = r.get("headers", {})
+                    shown = {k: v for k, v in req_h.items() if k.lower() in interesting_headers}
+                    if shown:
+                        parts.append(f"  Headers: {shown}")
+                    if r.get("postData"):
+                        parts.append(f"  Body: {r['postData'][:500]}")
+                    parts.append(f"RESPONSE: {r.get('response_status', '?')}")
+                    resp_h = r.get("response_headers", {})
+                    shown_resp = {k: v for k, v in resp_h.items() if k.lower() in interesting_headers}
+                    if shown_resp:
+                        parts.append(f"  Headers: {shown_resp}")
+                    if r.get("response_body"):
+                        parts.append(f"  Body: {r['response_body'][:500]}")
+                    parts.append("---")
+                parts.append("")
+
+            # Forms
+            forms = [r for r in traffic if r.get("resource_type") == "form"]
+            if forms:
+                parts.append("## Forms")
+                for r in forms:
+                    parts.append(f"  {r.get('method', '?')} {r.get('url', '?')} "
+                                 f"(on: {r.get('parent_url', '?')})")
+                    if r.get("form_fields"):
+                        for f in r["form_fields"]:
+                            parts.append(f"    - {f.get('name', '?')} "
+                                         f"(type={f.get('type', '?')}, value={f.get('value', '')})")
+                parts.append("")
+
+            parts.append(f"Summary: {len(traffic)} total, {len(filtered)} useful, "
+                         f"{len(pages)} pages, {len(api)} API, {len(forms)} forms")
+
+        # External links
+        external = data.get("external_links", [])
+        if external:
+            parts.append(f"\n## External Links ({len(external)})")
+            for u in external[:20]:
+                parts.append(f"  {u}")
+            if len(external) > 20:
+                parts.append(f"  ... and {len(external) - 20} more")
+
+        return "\n".join(parts)
+
+    # ─── Internal: Tool-calling loop (simplified) ────────────────
+
+    def _tool_loop(self, messages: list[dict]) -> str:
+        """Run tool calls until LLM produces text with [DONE] tag.
+
+        Simplified version of ExecutorAgent._tool_loop:
+        - Only handles shell + fetch + filesystem tools
+        - Max 30 rounds
+        - [DONE] tag signals completion
+        """
+        consecutive_errors = 0
+        tool_count = 0
+        nudge_count = 0
+        max_nudges = 3
+        consecutive_repeats = 0
+        last_tool_signature = None
+
+        for round_idx in range(MAX_TOOL_ROUNDS):
+            try:
+                tool_choice = "required" if round_idx == 0 and self.tools else "auto"
+
+                response = self.client.chat.completions.create(
+                    model=MODEL,
+                    messages=messages,
+                    tools=self.tools if self.tools else None,
+                    tool_choice=tool_choice if self.tools else None,
+                    temperature=0.3,
+                    max_tokens=8192,
+                )
+            except Exception as e:
+                consecutive_errors += 1
+                print(f"{DIM}[CRAWL-AGENT] API error ({consecutive_errors}): {e}{RESET}")
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    return f"[API Error after {consecutive_errors} retries: {e}]\n[DONE]"
+                continue
+
+            consecutive_errors = 0
+            choice = response.choices[0]
+            msg = choice.message
+
+            # ── Tool calls ──
+            if msg.tool_calls:
+                messages.append({
+                    "role": "assistant",
+                    "content": msg.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in msg.tool_calls
+                    ],
+                })
+
+                for tc in msg.tool_calls:
+                    tool_count += 1
+                    fn_name = tc.function.name
+                    try:
+                        fn_args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        fn_args = {}
+
+                    # Detect repeated calls
+                    tool_sig = (fn_name, tc.function.arguments)
+                    if tool_sig == last_tool_signature:
+                        consecutive_repeats += 1
+                    else:
+                        consecutive_repeats = 0
+                        last_tool_signature = tool_sig
+
+                    print(f"{DIM}[CRAWL-AGENT] Tool {tool_count}: "
+                          f"{fn_name}({json.dumps(fn_args, ensure_ascii=False)[:120]}){RESET}")
+
+                    try:
+                        result = self.mcp.execute_tool(fn_name, fn_args)
+                        result_text = truncate(str(result))
+                        consecutive_errors = 0
+                    except Exception as e:
+                        result_text = f"Error: {e}"
+                        consecutive_errors += 1
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result_text,
+                    })
+
+                # Break repeated loops
+                if consecutive_repeats >= 3:
+                    print(f"{YELLOW}[CRAWL-AGENT] Repeated tool call detected, forcing continue{RESET}")
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"STOP. You called {last_tool_signature[0]} with the same args "
+                            f"{consecutive_repeats + 1} times. Move on. "
+                            "If you have written the report, respond with [DONE]."
+                        ),
+                    })
+                    consecutive_repeats = 0
+
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"The last {MAX_CONSECUTIVE_ERRORS} tool calls FAILED. "
+                            "STOP retrying. Write what you have and respond with [DONE]."
+                        ),
+                    })
+                    consecutive_errors = 0
+
+                nudge_count = 0
+
+                # Approaching limit
+                if round_idx >= MAX_TOOL_ROUNDS - 3:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "IMPORTANT: Running out of tool rounds. "
+                            "Finalize recon.md NOW and respond with [DONE]."
+                        ),
+                    })
+
+                continue
+
+            # ── Text response ──
+            text = msg.content or ""
+
+            if _has_done_tag(text):
+                return text
+
+            nudge_count += 1
+            if nudge_count >= max_nudges:
+                return text + "\n[DONE]"
+
+            messages.append({"role": "assistant", "content": text})
+            messages.append({
+                "role": "user",
+                "content": "Continue. Use write_file to save the report. When done, respond with [DONE].",
+            })
+
+        return f"[CrawlAgent reached {MAX_TOOL_ROUNDS} tool rounds limit]\n[DONE]"
+
+
+# ═══════════════════════════════════════════════════════════════
+# CLI — standalone test
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: python {sys.argv[0]} \"<URL> [credentials: user:pass]\"")
+        print(f"Example: python {sys.argv[0]} \"http://testphp.vulnweb.com/\"")
+        print(f"Example: python {sys.argv[0]} \"https://target.com/ credentials: admin:password\"")
+        sys.exit(1)
+
+    user_prompt = sys.argv[1]
+    agent = CrawlAgent()
+
+    try:
+        recon_path = agent.run(user_prompt)
+        if recon_path:
+            print(f"\n{GREEN}{BOLD}{'=' * 60}{RESET}")
+            print(f"{GREEN}{BOLD}  RECON COMPLETE: {recon_path}{RESET}")
+            print(f"{GREEN}{BOLD}{'=' * 60}{RESET}")
+        else:
+            print(f"\n{RED}Recon failed — no output generated.{RESET}")
+            sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Interrupted.{RESET}")
+    finally:
+        agent.shutdown()
+
+
+if __name__ == "__main__":
+    main()

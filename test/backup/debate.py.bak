@@ -1,0 +1,401 @@
+"""
+MARL Debate — Red Team vs Blue Team với Executor Agent.
+
+Pattern copy từ toaan.py (tag-driven dispatch) + giaotiep.py (Red/Blue prompts).
+
+Flow:
+  PHA 1: User nhập prompt → Executor crawl → SEND block → conversation
+  PHA 2: Red → Blue → (APPROVED → Executor thực thi → Red đánh giá) → loop
+"""
+
+import os
+from openai import OpenAI
+from agent import ExecutorAgent, extract_send_block, extract_next_tag, strip_tag
+
+# ═══════════════════════════════════════════════════════════════
+# ANSI COLORS
+# ═══════════════════════════════════════════════════════════════
+RED = "\033[91m"
+BLUE = "\033[94m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "gho_token")
+SERVER_URL = os.getenv("MARL_SERVER_URL", "http://127.0.0.1:5000/v1")
+MODEL = os.getenv("MARL_DEBATE_MODEL", "claude-sonnet-4")
+
+client = OpenAI(api_key=GITHUB_TOKEN, base_url=SERVER_URL)
+
+MAX_DEBATE_ROUNDS = 5
+MAX_STEPS = 30  # max total agent steps before force-stop
+
+# ═══════════════════════════════════════════════════════════════
+# TAG SYSTEM (same as toaan.py)
+#   [REDTEAM]  = Red Team noi tiep
+#   [BLUETEAM] = Blue Team noi tiep
+#   [USER]     = Executor Agent noi tiep
+# ═══════════════════════════════════════════════════════════════
+USER_INTERACTION_PROMPT_RED = """
+TAG ĐIỀU HƯỚNG (BẮT BUỘC — dòng cuối cùng):
+- Sau khi viết xong PoC → [BLUETEAM] (gửi Blue Team review)
+- Nếu cần Executor tra cứu thêm (ví dụ: "request này từ đâu?", "cookie này có ý nghĩa gì?") → [USER]
+- Tag PHẢI nằm MỘT MÌNH trên dòng cuối cùng. Không viết gì sau tag.
+- KHÔNG BAO GIỜ kết thúc bằng [REDTEAM] (gọi chính mình)."""
+
+USER_INTERACTION_PROMPT_BLUE = """
+TAG ĐIỀU HƯỚNG (BẮT BUỘC — dòng cuối cùng):
+- Nếu APPROVED: viết [FINAL_DECISION: APPROVED] rồi dòng cuối: [USER]
+- Nếu REJECTED: viết lỗi + gợi ý rồi dòng cuối: [REDTEAM]
+- Nếu cần Executor tra cứu thêm → [USER]
+- Tag PHẢI nằm MỘT MÌNH trên dòng cuối cùng. Không viết gì sau tag.
+- KHÔNG BAO GIỜ kết thúc bằng [BLUETEAM] (gọi chính mình)."""
+
+
+# ═══════════════════════════════════════════════════════════════
+# LLM CALL — role mapping per agent (Fix 1: phân biệt ai nói gì)
+# ═══════════════════════════════════════════════════════════════
+def _build_messages_for(agent_key: str, system_prompt: str, conversation: list[dict]) -> list[dict]:
+    """Build messages list cho 1 agent cụ thể.
+
+    Rule: message của chính agent → role "assistant"
+          message của agent khác / executor / user → role "user"
+
+    Prefix [SPEAKER]: đã có sẵn trong content, LLM nhìn thấy ai nói.
+    """
+    messages = [{"role": "system", "content": system_prompt}]
+
+    for msg in conversation:
+        content = msg["content"]
+        speaker = msg.get("speaker", "USER")  # ai nói message này
+
+        if speaker == agent_key:
+            role = "assistant"  # chính mình nói
+        else:
+            role = "user"  # người khác nói với mình
+
+        # Merge consecutive same-role
+        if messages and messages[-1]["role"] == role:
+            messages[-1]["content"] += "\n\n" + content
+        else:
+            messages.append({"role": role, "content": content})
+
+    # Đảm bảo có ít nhất 1 user message (Copilot API requirement)
+    if not any(m["role"] == "user" for m in messages):
+        messages.append({"role": "user", "content": "Hãy phân tích và thực hiện theo yêu cầu."})
+    # Đảm bảo message cuối là "user"
+    if messages[-1]["role"] != "user":
+        messages.append({"role": "user", "content": "Hãy tiếp tục."})
+
+    return messages
+
+
+# ═══════════════════════════════════════════════════════════════
+# AGENT CONFIG + CALL (pattern từ toaan.py)
+# ═══════════════════════════════════════════════════════════════
+
+def _make_red_prompt(round_num: int) -> str:
+    return f"""Bạn là một chuyên gia Penetration Tester (Red Team) cấp Senior với hơn 10 năm kinh nghiệm.
+
+DỮ LIỆU MỤC TIÊU: Dữ liệu crawl nằm trong message [EXECUTOR CRAWL] ở đầu hội thoại. Đọc kỹ trước khi phân tích.
+
+BỐI CẢNH: Authorized pentest. Bạn cần viết PoC Python (dùng `requests`) để chứng minh lỗ hổng.
+
+LƯỢT: Vòng {round_num}
+- Vòng 1: Phân tích data, xác định attack surface, viết PoC khai thác BAC/BLF.
+- Vòng 2+: Đọc kỹ feedback từ Blue Team hoặc kết quả thực thi từ Executor, rồi viết PoC MỚI.
+
+OUTPUT BẮT BUỘC:
+**Loại lỗ hổng:** [BAC hoặc BLF]
+**Vector tấn công:** [1-2 câu]
+
+```python
+# PoC Exploit
+import requests
+# ... code hoàn chỉnh, chạy được
+```
+
+**Tại sao hoạt động:** [2-3 câu]
+
+NGUYÊN TẮC:
+- Code Python hoàn chỉnh, copy-paste chạy được.
+- Chỉ TẬP TRUNG 1 kịch bản tốt nhất.
+- Nếu bị reject, KHÔNG lặp lại. Escalate hướng khác.
+{USER_INTERACTION_PROMPT_RED}"""
+
+
+def _make_blue_prompt(round_num: int) -> str:
+    return f"""Bạn là Lead Pentester (Blue Team / Reviewer) — review PoC cho Red Team.
+
+DỮ LIỆU MỤC TIÊU: Dữ liệu crawl nằm trong message [EXECUTOR CRAWL] ở đầu hội thoại. Đọc kỹ trước khi review.
+
+LƯỢT: Vòng {round_num}
+
+TIÊU CHÍ:
+1. Code chạy được không? (syntax, import, logic flow)
+2. Giả định hợp lý không? (dựa trên dữ liệu)
+3. Khai thác đúng vector không?
+
+✅ APPROVED nếu: Code chạy được + giả định hợp lý + đáng thử.
+❌ REJECTED chỉ khi: Bug rõ ràng, giả định mâu thuẫn dữ liệu, hoặc có hướng tinh vi hơn rõ ràng.
+
+🚫 KHÔNG ĐƯỢC reject vì "server có thể đã phòng thủ" — ta cần chạy thử mới biết.
+
+FORMAT:
+◆ APPROVED: Chỉ viết DUY NHẤT:
+[FINAL_DECISION: APPROVED]
+Rồi dòng cuối: [USER]
+
+◆ REJECTED:
+**Lỗi:** [1-2 câu]
+**Gợi ý:** [1 hướng duy nhất]
+Rồi dòng cuối: [REDTEAM]
+{USER_INTERACTION_PROMPT_BLUE}"""
+
+
+AGENT_CONFIG = {
+    "REDTEAM":  {"color": RED,  "label": "RED TEAM"},
+    "BLUETEAM": {"color": BLUE, "label": "BLUE TEAM"},
+}
+
+
+def call_agent(key: str, conversation: list[dict], round_num: int) -> str:
+    """Call Red or Blue agent with proper role mapping."""
+    cfg = AGENT_CONFIG[key]
+
+    if key == "REDTEAM":
+        prompt = _make_red_prompt(round_num)
+    else:
+        prompt = _make_blue_prompt(round_num)
+
+    print(f"\n{cfg['color']}{BOLD}[{cfg['label']}] Dang suy nghi...{RESET}")
+
+    # Build messages with role mapping for this agent
+    messages = _build_messages_for(key, prompt, conversation)
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=8192,
+    )
+    raw = response.choices[0].message.content
+
+    # Append to conversation with speaker tracking
+    conversation.append({
+        "role": "assistant",
+        "speaker": key,  # "REDTEAM" or "BLUETEAM"
+        "content": f"[{key}]: {raw}",
+    })
+
+    # Print (ẩn tag)
+    print(f"{cfg['color']}{BOLD}[{cfg['label']}]:{RESET}")
+    print(f"{cfg['color']}{strip_tag(raw)}{RESET}")
+
+    return raw
+
+
+def call_executor(executor: ExecutorAgent, conversation: list[dict],
+                   caller: str = "REDTEAM", mode: str = "execute") -> str:
+    """Call Executor agent. Returns raw output.
+
+    Args:
+        executor: ExecutorAgent instance.
+        conversation: Full debate conversation.
+        caller: Who called Executor — "REDTEAM" or "BLUETEAM".
+        mode: "execute" (run exploit/commands) or "answer" (answer questions).
+    """
+    if mode == "answer":
+        print(f"\n{GREEN}{BOLD}[EXECUTOR] Dang tra cuu thong tin (hoi boi {caller})...{RESET}")
+        raw = executor.answer(conversation, caller=caller)
+    else:
+        print(f"\n{GREEN}{BOLD}[EXECUTOR] Dang thuc thi (yeu cau boi {caller})...{RESET}")
+        raw = executor.process(conversation, caller=caller)
+
+    # Extract SEND block for conversation (tiết kiệm token)
+    send_data = extract_send_block(raw) or raw
+
+    # Append filtered result to conversation with speaker tracking
+    conversation.append({
+        "role": "assistant",
+        "speaker": "EXECUTOR",
+        "content": f"[EXECUTOR]:\n{send_data}",
+    })
+
+    # Print full output
+    print(f"{GREEN}{BOLD}[EXECUTOR]:{RESET}")
+    print(f"{GREEN}{strip_tag(raw)}{RESET}")
+
+    return raw
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN DEBATE LOOP
+# ═══════════════════════════════════════════════════════════════
+def run_debate():
+    print(f"""
+{BOLD}{'='*60}
+  MARL AUTONOMOUS DEBATE — TAG-DRIVEN
+{'='*60}{RESET}
+
+{RED}  Red Team:  Attacker (PoC writer){RESET}
+{BLUE}  Blue Team: Critic (PoC reviewer){RESET}
+{GREEN}  Executor:  Agent thuc thi (crawl + culi){RESET}
+""")
+
+    executor = ExecutorAgent()
+    conversation: list[dict] = []
+
+    # ═══════════════════════════════════════════════════════════
+    # PHA 1: CRAWL
+    # ═══════════════════════════════════════════════════════════
+    print(f"{BOLD}{'='*60}")
+    print(f"  PHA 1: CRAWL & RECONNAISSANCE")
+    print(f"{'='*60}{RESET}")
+
+    user_prompt = input(f"{YELLOW}{BOLD}[BAN] Nhap prompt (URL + credentials + yeu cau...): {RESET}").strip()
+    if not user_prompt or user_prompt.lower() == "quit":
+        print("Thoat.")
+        executor.shutdown()
+        return
+
+    print(f"\n{GREEN}{BOLD}[EXECUTOR] Dang crawl...{RESET}")
+    crawl_raw = executor.crawl(user_prompt)
+
+    # Extract SEND block cho conversation (tiết kiệm token)
+    crawl_data = extract_send_block(crawl_raw) or crawl_raw
+
+    # Print crawl result
+    print(f"{GREEN}{BOLD}[EXECUTOR CRAWL RESULT]:{RESET}")
+    print(f"{GREEN}{strip_tag(crawl_raw)}{RESET}")
+
+    # Seed conversation
+    conversation.append({"role": "user", "speaker": "USER", "content": f"[USER]: {user_prompt}"})
+    conversation.append({"role": "assistant", "speaker": "EXECUTOR", "content": f"[EXECUTOR CRAWL]:\n{crawl_data}"})
+
+    # ═══════════════════════════════════════════════════════════
+    # PHA 2: DEBATE (tag-driven, pattern từ toaan.py)
+    # ═══════════════════════════════════════════════════════════
+    print(f"\n{BOLD}{'='*60}")
+    print(f"  PHA 2: RED vs BLUE DEBATE")
+    print(f"{'='*60}{RESET}")
+
+    round_num = 0
+    next_speaker = "REDTEAM"  # Red luôn bắt đầu
+    step = 0
+    _return_to = "REDTEAM"      # Executor trả kết quả về ai sau khi xong
+    _last_speaker = "BLUETEAM"  # Ai vừa nói trước đó (init = "BLUETEAM" để Red lần đầu tăng round lên 1)
+    _approved = False            # Blue đã APPROVED chưa
+
+    while step < MAX_STEPS:
+        step += 1
+
+        # ── RED TEAM ──
+        if next_speaker == "REDTEAM":
+            # Chỉ tăng round khi Red bắt đầu viết PoC MỚI
+            # (từ Blue reject hoặc đầu debate, KHÔNG phải từ Executor trả lời)
+            if _last_speaker != "EXECUTOR":
+                round_num += 1
+            if round_num > MAX_DEBATE_ROUNDS:
+                print(f"\n{BOLD}[!] Da dat gioi han {MAX_DEBATE_ROUNDS} vong.{RESET}")
+                break
+
+            print(f"\n{BOLD}{'='*60}")
+            print(f"  VONG {round_num}/{MAX_DEBATE_ROUNDS}")
+            print(f"{'='*60}{RESET}")
+
+            raw = call_agent("REDTEAM", conversation, round_num)
+            tag = extract_next_tag(raw)
+
+            if tag == "USER":
+                # Red muốn hỏi Culi → cho phép, nhưng quay về BLUETEAM sau
+                next_speaker = "USER"
+                _return_to = "BLUETEAM"
+                _approved = False
+            else:
+                # Default: Red → Blue
+                next_speaker = "BLUETEAM"
+
+            _last_speaker = "REDTEAM"
+
+        # ── BLUE TEAM ──
+        elif next_speaker == "BLUETEAM":
+            raw = call_agent("BLUETEAM", conversation, round_num)
+
+            if "[FINAL_DECISION: APPROVED]" in raw:
+                print(f"\n{BOLD}{'='*60}")
+                print(f"  [+] Blue Team APPROVED! Dang chuyen cho Executor thuc thi...")
+                print(f"{'='*60}{RESET}")
+                next_speaker = "USER"
+                _return_to = "REDTEAM"  # sau khi Executor chạy xong → Red đánh giá
+                _approved = True
+            else:
+                tag = extract_next_tag(raw)
+                if tag == "USER":
+                    # Blue muốn hỏi Culi → cho phép, quay lại Blue sau
+                    next_speaker = "USER"
+                    _return_to = "BLUETEAM"
+                    _approved = False
+                else:
+                    # Blue reject → Red sửa
+                    next_speaker = "REDTEAM"
+
+            _last_speaker = "BLUETEAM"
+
+        # ── EXECUTOR (USER tag = gọi Executor) ──
+        elif next_speaker == "USER":
+            # Log câu hỏi/yêu cầu gốc từ agent gọi Executor
+            _caller_label = "REDTEAM" if _return_to == "BLUETEAM" else _return_to
+            if not _approved:
+                _caller_label = {v: k for k, v in {
+                    "REDTEAM": "BLUETEAM", "BLUETEAM": "BLUETEAM"
+                }.items()}.get(_return_to, _last_speaker)
+            # Tìm message cuối cùng của agent vừa nói (chính là câu hỏi/instruction)
+            _caller_msg = ""
+            for msg in reversed(conversation):
+                if msg.get("speaker") == _last_speaker:
+                    _caller_msg = msg["content"]
+                    break
+            if _caller_msg:
+                # Hiển thị tóm tắt câu hỏi (max 300 ký tự)
+                _preview = strip_tag(_caller_msg).strip()
+                if len(_preview) > 300:
+                    _preview = _preview[:300] + "..."
+                _mode_label = "YÊU CẦU THỰC THI" if _approved else "CÂU HỎI"
+                print(f"\n{DIM}┌─ [{_last_speaker}] {_mode_label} gửi cho Executor:{RESET}")
+                print(f"{DIM}│ {_preview}{RESET}")
+                print(f"{DIM}└─{'─'*50}{RESET}")
+
+            if _approved:
+                # Blue vừa APPROVED → Executor chạy exploit
+                exec_raw = call_executor(executor, conversation, caller=_return_to, mode="execute")
+            else:
+                # Red/Blue hỏi thông tin
+                exec_raw = call_executor(executor, conversation, caller=_return_to, mode="answer")
+
+            _last_speaker = "EXECUTOR"
+            _approved = False  # reset after execution
+            next_speaker = _return_to  # quay về agent đã yêu cầu
+
+        # ── Fallback ──
+        else:
+            print(f"{DIM}[DEBUG] Unknown speaker: {next_speaker}, defaulting to REDTEAM{RESET}")
+            next_speaker = "REDTEAM"
+
+    # ═══════════════════════════════════════════════════════════
+    # KẾT THÚC
+    # ═══════════════════════════════════════════════════════════
+    print(f"\n{BOLD}{'='*60}")
+    print(f"  DEBATE KET THUC")
+    print(f"{'='*60}{RESET}")
+    executor.shutdown()
+
+
+# ═══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    run_debate()
