@@ -519,6 +519,13 @@ class MCPManager:
             except Exception as e:
                 return f"[Lỗi web_search] {e}"
 
+        # Dynamic tools — handle via custom handlers
+        if server_name == "dynamic" and hasattr(self, '_custom_handlers') and tool_name in self._custom_handlers:
+            try:
+                return self._custom_handlers[tool_name](arguments)
+            except Exception as e:
+                return f"[Lỗi dynamic tool] {e}"
+
         try:
             # Shell commands cần timeout dài hơn vì tool có thể chạy nmap, nuclei, etc.
             tool_timeout = 300 if server_name == "shell" else 120
@@ -586,6 +593,39 @@ class MCPManager:
                     desc = desc[:57] + "..."
                 print(f"    🔧 {name}")
                 print(f"       {desc}")
+
+    def add_dynamic_tool(self, tool_name: str, description: str, parameters: dict, handler_func):
+        """Dynamically add a custom tool to the tool map.
+
+        Args:
+            tool_name: Name of the tool
+            description: Description for the tool
+            parameters: OpenAI-style parameters schema
+            handler_func: Function to handle tool execution (should return str)
+        """
+        # Add to a virtual server for dynamic tools
+        if "dynamic" not in self.servers:
+            self.servers["dynamic"] = {
+                "serverInfo": {"name": "Dynamic Tools", "version": "1.0"},
+                "tools": [],
+                "session": None  # No MCP session for dynamic tools
+            }
+
+        # Create tool definition
+        tool_def = {
+            "name": tool_name,
+            "description": description,
+            "inputSchema": parameters
+        }
+
+        # Add to server's tools list
+        self.servers["dynamic"]["tools"].append(tool_def)
+        self.tool_map[tool_name] = "dynamic"
+
+        # Store handler function (extend the handle to include custom handlers)
+        if not hasattr(self, '_custom_handlers'):
+            self._custom_handlers = {}
+        self._custom_handlers[tool_name] = handler_func
 
     def stop_all(self):
         """Dừng tất cả MCP servers."""
