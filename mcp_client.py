@@ -307,10 +307,6 @@ class MCPManager:
 
         return results
 
-        if not results:
-            return [{"error": "No results found", "query": query}]
-
-        return results
 
     def add_playwright_server(self, headless: bool = True) -> bool:
         """Thêm Playwright MCP Server (tương tác trình duyệt).
