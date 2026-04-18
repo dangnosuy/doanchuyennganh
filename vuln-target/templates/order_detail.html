@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Đơn hàng #{{ order.id }} — TechShop{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div class="container">
+        <h1 class="fw-bold mb-0">Đơn hàng #{{ order.id }}</h1>
+        <nav aria-label="breadcrumb" class="mt-2">
+            <ol class="breadcrumb mb-0">
+                <li class="breadcrumb-item"><a href="{{ url_for('index') }}" class="text-white-50">Trang chủ</a></li>
+                <li class="breadcrumb-item"><a href="{{ url_for('orders') }}" class="text-white-50">Đơn hàng</a></li>
+                <li class="breadcrumb-item text-white active">#{{ order.id }}</li>
+            </ol>
+        </nav>
+    </div>
+</div>
+
+<div class="container pb-5">
+    <div class="row g-4">
+        <div class="col-lg-8">
+            <div class="card border-0 shadow-sm mb-3">
+                <div class="card-header bg-white fw-bold border-0 pt-3">
+                    <i class="bi bi-list-ul me-2 text-primary"></i>Sản phẩm đã đặt
+                </div>
+                <div class="card-body p-0">
+                    <table class="table mb-0 align-middle">
+                        <thead class="table-light">
+                            <tr>
+                                <th class="ps-4">Sản phẩm</th>
+                                <th class="text-center">Số lượng</th>
+                                <th class="text-end">Đơn giá</th>
+                                <th class="text-end pe-4">Thành tiền</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for item in items %}
+                            <tr>
+                                <td class="ps-4">
+                                    <a href="{{ url_for('product_detail', pid=item.product_id) }}" class="fw-semibold text-dark text-decoration-none">{{ item.name }}</a>
+                                </td>
+                                <td class="text-center">{{ item.qty }}</td>
+                                <td class="text-end text-muted">{{ "{:,.0f}".format(item.price) }}đ</td>
+                                <td class="text-end fw-bold pe-4">{{ "{:,.0f}".format(item.price * item.qty) }}đ</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                        <tfoot class="table-light">
+                            <tr>
+                                <td colspan="3" class="text-end fw-bold ps-4">Tổng cộng</td>
+                                <td class="text-end fw-bold text-danger pe-4 fs-5">{{ "{:,.0f}".format(order.total) }}đ</td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-lg-4">
+            <div class="card border-0 shadow-sm mb-3">
+                <div class="card-header bg-white fw-bold border-0 pt-3">Thông tin đơn hàng</div>
+                <div class="card-body">
+                    <dl class="row mb-0">
+                        <dt class="col-5 text-muted fw-normal">Mã đơn</dt>
+                        <dd class="col-7 fw-bold">#{{ order.id }}</dd>
+                        <dt class="col-5 text-muted fw-normal">Khách hàng</dt>
+                        <dd class="col-7">{{ owner.username if owner else 'N/A' }}</dd>
+                        <dt class="col-5 text-muted fw-normal">Ngày đặt</dt>
+                        <dd class="col-7 small">{{ order.created_at[:16] }}</dd>
+                        <dt class="col-5 text-muted fw-normal">Địa chỉ</dt>
+                        <dd class="col-7 small">{{ order.address or 'N/A' }}</dd>
+                        <dt class="col-5 text-muted fw-normal">Trạng thái</dt>
+                        <dd class="col-7">
+                            {% if order.status == 'delivered' %}
+                            <span class="badge bg-success">Đã giao</span>
+                            {% elif order.status == 'shipped' %}
+                            <span class="badge bg-info text-dark">Đang giao</span>
+                            {% elif order.status == 'pending' %}
+                            <span class="badge bg-warning text-dark">Chờ xử lý</span>
+                            {% else %}
+                            <span class="badge bg-secondary">{{ order.status }}</span>
+                            {% endif %}
+                        </dd>
+                    </dl>
+                </div>
+            </div>
+            <a href="{{ url_for('orders') }}" class="btn btn-outline-secondary w-100">
+                <i class="bi bi-arrow-left me-2"></i>Quay lại
+            </a>
+        </div>
+    </div>
+</div>
+
+{% endblock %}

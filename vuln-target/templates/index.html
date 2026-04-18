@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}TechShop — Điện tử chính hãng{% endblock %}
+{% block content %}
+
+<!-- Hero -->
+<section class="bg-dark text-white py-5">
+    <div class="container py-3">
+        <div class="row align-items-center">
+            <div class="col-lg-6">
+                <span class="badge bg-info text-dark mb-2">Mới nhất 2024</span>
+                <h1 class="display-5 fw-bold mb-3">Công nghệ đỉnh cao,<br>Giá tốt mỗi ngày</h1>
+                <p class="lead text-white-50 mb-4">Laptop, điện thoại, tablet và phụ kiện chính hãng — bảo hành toàn quốc.</p>
+                <a href="{{ url_for('products') }}" class="btn btn-primary btn-lg me-2 px-4">Mua ngay</a>
+                <a href="{{ url_for('products', category='laptop') }}" class="btn btn-outline-light btn-lg px-4">Xem Laptop</a>
+            </div>
+            <div class="col-lg-6 text-center d-none d-lg-block">
+                <img src="https://placehold.co/500x320?text=TechShop+2024" class="img-fluid rounded-3 shadow" alt="Hero">
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Categories -->
+<section class="py-4 bg-white border-bottom">
+    <div class="container">
+        <div class="row g-3 text-center">
+            {% set cats = [('laptop','bi-laptop','Laptop'),('phone','bi-phone','Điện thoại'),('tablet','bi-tablet','Máy tính bảng'),('accessories','bi-headphones','Phụ kiện')] %}
+            {% for slug, icon, label in cats %}
+            <div class="col-6 col-md-3">
+                <a href="{{ url_for('products', category=slug) }}" class="text-decoration-none d-flex flex-column align-items-center gap-2 p-3 rounded-3 hover-shadow" style="background:#f8f9fa; transition:.2s;">
+                    <i class="bi {{ icon }} fs-2 text-primary"></i>
+                    <span class="fw-semibold text-dark">{{ label }}</span>
+                </a>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</section>
+
+<!-- Featured Products -->
+<section class="py-5">
+    <div class="container">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2 class="fw-bold mb-0">Sản phẩm nổi bật</h2>
+            <a href="{{ url_for('products') }}" class="btn btn-outline-primary btn-sm">Xem tất cả <i class="bi bi-arrow-right"></i></a>
+        </div>
+        <div class="row g-4">
+            {% for p in featured %}
+            <div class="col-sm-6 col-lg-3">
+                <div class="card product-card h-100 shadow-sm">
+                    <a href="{{ url_for('product_detail', pid=p.id) }}">
+                        <img src="{{ p.image_url }}" class="card-img-top" alt="{{ p.name }}">
+                    </a>
+                    <div class="card-body d-flex flex-column">
+                        <span class="badge bg-secondary category-badge mb-2">{{ p.category }}</span>
+                        <h6 class="card-title fw-bold">
+                            <a href="{{ url_for('product_detail', pid=p.id) }}" class="text-dark text-decoration-none">{{ p.name }}</a>
+                        </h6>
+                        <p class="text-muted small flex-grow-1">{{ p.description[:80] }}...</p>
+                        <div class="d-flex justify-content-between align-items-center mt-2">
+                            <span class="price-tag">{{ "{:,.0f}".format(p.price) }}đ</span>
+                            {% if session.user_id %}
+                            <form action="{{ url_for('cart_add') }}" method="post" class="d-inline">
+                                <input type="hidden" name="product_id" value="{{ p.id }}">
+                                <input type="hidden" name="qty" value="1">
+                                <button class="btn btn-primary btn-sm"><i class="bi bi-cart-plus"></i></button>
+                            </form>
+                            {% else %}
+                            <a href="{{ url_for('login') }}" class="btn btn-outline-primary btn-sm">Mua</a>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</section>
+
+<!-- Promo Banner -->
+<section class="py-4 bg-primary text-white">
+    <div class="container text-center">
+        <h4 class="mb-1">🎉 Mã giảm giá hôm nay: <strong>SAVE20</strong></h4>
+        <p class="mb-0 opacity-75">Giảm 20% cho đơn hàng tiếp theo. Áp dụng tại trang thanh toán.</p>
+    </div>
+</section>
+
+<!-- Benefits -->
+<section class="py-5 bg-white">
+    <div class="container">
+        <div class="row g-4 text-center">
+            {% set benefits = [
+                ('bi-truck','Giao hàng toàn quốc','Miễn phí cho đơn từ 500K'),
+                ('bi-shield-check','Hàng chính hãng 100%','Cam kết xác thực nguồn gốc'),
+                ('bi-arrow-repeat','Đổi trả 30 ngày','Không cần lý do'),
+                ('bi-headset','Hỗ trợ 24/7','Hotline 1800 6767'),
+            ] %}
+            {% for icon, title, desc in benefits %}
+            <div class="col-sm-6 col-md-3">
+                <div class="p-3">
+                    <i class="bi {{ icon }} fs-1 text-primary mb-2 d-block"></i>
+                    <h6 class="fw-bold">{{ title }}</h6>
+                    <p class="text-muted small mb-0">{{ desc }}</p>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</section>
+
+{% endblock %}

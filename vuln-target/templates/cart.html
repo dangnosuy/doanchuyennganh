@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}Giỏ hàng — TechShop{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div class="container">
+        <h1 class="fw-bold mb-0"><i class="bi bi-cart3 me-2"></i>Giỏ hàng</h1>
+    </div>
+</div>
+
+<div class="container pb-5">
+    {% if items %}
+    <div class="row g-4">
+        <div class="col-lg-8">
+            <div class="card border-0 shadow-sm">
+                <div class="card-body p-0">
+                    <table class="table mb-0 align-middle">
+                        <thead class="table-light">
+                            <tr>
+                                <th class="ps-4">Sản phẩm</th>
+                                <th class="text-center">Số lượng</th>
+                                <th class="text-end">Đơn giá</th>
+                                <th class="text-end">Thành tiền</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for item in items %}
+                            <tr>
+                                <td class="ps-4">
+                                    <div class="d-flex align-items-center gap-3">
+                                        <img src="{{ item.product.image_url }}" alt="{{ item.product.name }}" class="rounded" style="width:64px; height:48px; object-fit:cover;">
+                                        <div>
+                                            <a href="{{ url_for('product_detail', pid=item.product.id) }}" class="fw-semibold text-dark text-decoration-none">{{ item.product.name }}</a>
+                                            <div class="text-muted small">{{ item.product.category }}</div>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td class="text-center">
+                                    <form action="{{ url_for('cart_add') }}" method="post" class="d-inline-flex align-items-center gap-1">
+                                        <input type="hidden" name="product_id" value="{{ item.product.id }}">
+                                        <input type="number" name="qty" value="{{ item.qty }}" class="form-control form-control-sm text-center" style="width:70px">
+                                        <button class="btn btn-outline-secondary btn-sm" title="Cập nhật"><i class="bi bi-arrow-clockwise"></i></button>
+                                    </form>
+                                </td>
+                                <td class="text-end text-muted">{{ "{:,.0f}".format(item.product.price) }}đ</td>
+                                <td class="text-end fw-bold">{{ "{:,.0f}".format(item.subtotal) }}đ</td>
+                                <td class="pe-3">
+                                    <form action="{{ url_for('cart_remove') }}" method="post">
+                                        <input type="hidden" name="product_id" value="{{ item.product.id }}">
+                                        <button class="btn btn-sm text-danger border-0"><i class="bi bi-trash3"></i></button>
+                                    </form>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Coupon -->
+            <div class="card border-0 shadow-sm mt-3">
+                <div class="card-body">
+                    <h6 class="fw-bold mb-3"><i class="bi bi-ticket-perforated me-2 text-primary"></i>Mã giảm giá</h6>
+                    <form action="{{ url_for('cart_coupon') }}" method="post" class="d-flex gap-2">
+                        <input type="text" name="coupon" class="form-control" placeholder="Nhập mã giảm giá..." style="max-width:260px">
+                        <button class="btn btn-outline-primary">Áp dụng</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-lg-4">
+            <div class="card border-0 shadow-sm sticky-top" style="top:80px">
+                <div class="card-header bg-white fw-bold border-0 pt-3">Tóm tắt đơn hàng</div>
+                <div class="card-body">
+                    <div class="d-flex justify-content-between mb-2">
+                        <span class="text-muted">Tạm tính</span>
+                        <span>{{ "{:,.0f}".format(total) }}đ</span>
+                    </div>
+                    {% if session.coupon %}
+                    <div class="d-flex justify-content-between mb-2 text-success">
+                        <span>Giảm giá ({{ session.coupon.code }})</span>
+                        <span>-{% if session.coupon.type == 'percent' %}{{ session.coupon.value }}%{% else %}{{ "{:,.0f}".format(session.coupon.value) }}đ{% endif %}</span>
+                    </div>
+                    {% endif %}
+                    <div class="d-flex justify-content-between mb-2 text-muted">
+                        <span>Phí vận chuyển</span>
+                        <span class="text-success">Miễn phí</span>
+                    </div>
+                    <hr>
+                    <div class="d-flex justify-content-between fw-bold fs-5 mb-4">
+                        <span>Tổng cộng</span>
+                        <span class="text-danger">{{ "{:,.0f}".format(total) }}đ</span>
+                    </div>
+                    <a href="{{ url_for('checkout') }}" class="btn btn-primary w-100 btn-lg">
+                        <i class="bi bi-credit-card me-2"></i>Thanh toán
+                    </a>
+                    <a href="{{ url_for('products') }}" class="btn btn-outline-secondary w-100 mt-2">
+                        <i class="bi bi-arrow-left me-2"></i>Tiếp tục mua sắm
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% else %}
+    <div class="text-center py-5">
+        <i class="bi bi-cart-x fs-1 text-muted mb-3 d-block"></i>
+        <h4 class="text-muted">Giỏ hàng trống</h4>
+        <p class="text-muted">Hãy thêm sản phẩm vào giỏ để tiếp tục mua sắm.</p>
+        <a href="{{ url_for('products') }}" class="btn btn-primary mt-2">Khám phá sản phẩm</a>
+    </div>
+    {% endif %}
+</div>
+
+{% endblock %}

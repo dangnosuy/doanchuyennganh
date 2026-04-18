@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Sản phẩm — TechShop{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div class="container">
+        <h1 class="fw-bold mb-0">Sản phẩm</h1>
+        <nav aria-label="breadcrumb" class="mt-2">
+            <ol class="breadcrumb mb-0">
+                <li class="breadcrumb-item"><a href="{{ url_for('index') }}" class="text-white-50">Trang chủ</a></li>
+                <li class="breadcrumb-item text-white active">Sản phẩm</li>
+            </ol>
+        </nav>
+    </div>
+</div>
+
+<div class="container pb-5">
+    <div class="row g-4">
+        <!-- Sidebar -->
+        <div class="col-md-3">
+            <div class="card border-0 shadow-sm">
+                <div class="card-header bg-white fw-bold border-0 pb-0 pt-3">Danh mục</div>
+                <div class="list-group list-group-flush sidebar-filter">
+                    <a href="{{ url_for('products') }}"
+                       class="list-group-item list-group-item-action {% if not current_cat %}active{% endif %}">
+                        <i class="bi bi-grid-3x3-gap me-2"></i>Tất cả
+                    </a>
+                    {% set cat_info = {'laptop': ('bi-laptop','Laptop'), 'phone': ('bi-phone','Điện thoại'), 'tablet': ('bi-tablet','Máy tính bảng'), 'accessories': ('bi-headphones','Phụ kiện')} %}
+                    {% for cat in categories %}
+                    {% set icon, label = cat_info.get(cat.category, ('bi-box', cat.category)) %}
+                    <a href="{{ url_for('products', category=cat.category) }}"
+                       class="list-group-item list-group-item-action {% if current_cat == cat.category %}active{% endif %}">
+                        <i class="bi {{ icon }} me-2"></i>{{ label }}
+                    </a>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Products grid -->
+        <div class="col-md-9">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <p class="text-muted mb-0">{{ products|length }} sản phẩm</p>
+            </div>
+            {% if products %}
+            <div class="row g-4">
+                {% for p in products %}
+                <div class="col-sm-6 col-lg-4">
+                    <div class="card product-card h-100 shadow-sm">
+                        <a href="{{ url_for('product_detail', pid=p.id) }}">
+                            <img src="{{ p.image_url }}" class="card-img-top" alt="{{ p.name }}">
+                        </a>
+                        <div class="card-body d-flex flex-column">
+                            <span class="badge bg-secondary category-badge mb-2">{{ p.category }}</span>
+                            <h6 class="card-title fw-bold">
+                                <a href="{{ url_for('product_detail', pid=p.id) }}" class="text-dark text-decoration-none">{{ p.name }}</a>
+                            </h6>
+                            <p class="text-muted small flex-grow-1">{{ p.description[:80] }}...</p>
+                            <div class="d-flex justify-content-between align-items-center mt-2">
+                                <span class="price-tag">{{ "{:,.0f}".format(p.price) }}đ</span>
+                                {% if p.stock > 0 %}
+                                <span class="badge bg-success-subtle text-success border border-success-subtle small">Còn hàng</span>
+                                {% else %}
+                                <span class="badge bg-danger-subtle text-danger small">Hết hàng</span>
+                                {% endif %}
+                            </div>
+                            <div class="mt-2">
+                                {% if session.user_id %}
+                                <form action="{{ url_for('cart_add') }}" method="post" class="d-flex gap-2">
+                                    <input type="hidden" name="product_id" value="{{ p.id }}">
+                                    <input type="number" name="qty" value="1" class="form-control form-control-sm" style="width:70px">
+                                    <button class="btn btn-primary btn-sm flex-grow-1"><i class="bi bi-cart-plus me-1"></i>Thêm vào giỏ</button>
+                                </form>
+                                {% else %}
+                                <a href="{{ url_for('login') }}" class="btn btn-outline-primary btn-sm w-100">Đăng nhập để mua</a>
+                                {% endif %}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+            {% else %}
+            <div class="text-center py-5">
+                <i class="bi bi-search fs-1 text-muted"></i>
+                <p class="text-muted mt-2">Không tìm thấy sản phẩm nào trong danh mục này.</p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+{% endblock %}

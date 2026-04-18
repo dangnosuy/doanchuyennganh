@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}Hồ sơ — {{ user.username }} — TechShop{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div class="container">
+        <h1 class="fw-bold mb-0"><i class="bi bi-person-circle me-2"></i>Hồ sơ cá nhân</h1>
+    </div>
+</div>
+
+<div class="container pb-5">
+    <div class="row g-4">
+        <!-- Left: stats -->
+        <div class="col-md-4">
+            <div class="card border-0 shadow-sm text-center p-4">
+                <div class="bg-primary rounded-circle d-inline-flex align-items-center justify-content-center mx-auto mb-3" style="width:88px; height:88px;">
+                    <span class="text-white fw-bold fs-2">{{ user.username[0].upper() }}</span>
+                </div>
+                <h5 class="fw-bold mb-0">{{ user.full_name or user.username }}</h5>
+                <p class="text-muted small mb-3">@{{ user.username }}</p>
+                <span class="badge {% if user.role == 'admin' %}bg-danger{% else %}bg-primary{% endif %} mb-3">
+                    {{ 'Administrator' if user.role == 'admin' else 'Thành viên' }}
+                </span>
+                <div class="row g-2 text-center mt-2">
+                    <div class="col-6">
+                        <div class="bg-light rounded p-2">
+                            <div class="fw-bold text-primary fs-5">{{ "{:,.0f}".format(user.balance) }}đ</div>
+                            <div class="text-muted small">Số dư</div>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div class="bg-light rounded p-2">
+                            <div class="fw-bold text-warning fs-5">{{ user.points }}</div>
+                            <div class="text-muted small">Điểm thưởng</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="mt-3">
+                    <a href="{{ url_for('transfer') }}" class="btn btn-outline-primary btn-sm w-100">
+                        <i class="bi bi-arrow-left-right me-1"></i>Chuyển điểm
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right: edit form -->
+        <div class="col-md-8">
+            <div class="card border-0 shadow-sm">
+                <div class="card-header bg-white fw-bold border-0 pt-3">
+                    <i class="bi bi-pencil me-2 text-primary"></i>Chỉnh sửa thông tin
+                </div>
+                <div class="card-body">
+                    {% if session.user_id == user.id %}
+                    <form action="{{ url_for('profile_edit') }}" method="post">
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">Họ và tên</label>
+                                <input type="text" name="full_name" class="form-control" value="{{ user.full_name or '' }}">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">Số điện thoại</label>
+                                <input type="text" name="phone" class="form-control" value="{{ user.phone or '' }}">
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label fw-semibold">Địa chỉ</label>
+                                <textarea name="address" class="form-control" rows="2">{{ user.address or '' }}</textarea>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">Email</label>
+                                <input type="text" class="form-control" value="{{ user.email }}" readonly>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">Tên đăng nhập</label>
+                                <input type="text" class="form-control" value="{{ user.username }}" readonly>
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label fw-semibold">Ngày tham gia</label>
+                                <input type="text" class="form-control" value="{{ user.created_at[:10] }}" readonly>
+                            </div>
+                            <div class="col-12 d-flex gap-2">
+                                <button type="submit" class="btn btn-primary px-4">
+                                    <i class="bi bi-save me-2"></i>Lưu thay đổi
+                                </button>
+                                <a href="{{ url_for('orders') }}" class="btn btn-outline-secondary px-4">Xem đơn hàng</a>
+                            </div>
+                        </div>
+                    </form>
+                    {% else %}
+                    <!-- Viewing another user's profile -->
+                    <dl class="row">
+                        <dt class="col-4 text-muted fw-normal">Họ tên</dt>
+                        <dd class="col-8">{{ user.full_name or 'Chưa cập nhật' }}</dd>
+                        <dt class="col-4 text-muted fw-normal">Username</dt>
+                        <dd class="col-8">{{ user.username }}</dd>
+                        <dt class="col-4 text-muted fw-normal">Email</dt>
+                        <dd class="col-8">{{ user.email }}</dd>
+                        <dt class="col-4 text-muted fw-normal">Điện thoại</dt>
+                        <dd class="col-8">{{ user.phone or 'Chưa cập nhật' }}</dd>
+                        <dt class="col-4 text-muted fw-normal">Địa chỉ</dt>
+                        <dd class="col-8">{{ user.address or 'Chưa cập nhật' }}</dd>
+                        <dt class="col-4 text-muted fw-normal">Tham gia</dt>
+                        <dd class="col-8">{{ user.created_at[:10] }}</dd>
+                    </dl>
+                    <a href="{{ url_for('profile_redirect') }}" class="btn btn-outline-secondary">
+                        <i class="bi bi-arrow-left me-2"></i>Hồ sơ của tôi
+                    </a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}

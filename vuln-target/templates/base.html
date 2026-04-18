@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}TechShop — Điện tử chính hãng{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --ts-primary: #0d6efd;
+            --ts-dark: #1a1a2e;
+        }
+        body { background: #f8f9fa; font-family: 'Segoe UI', sans-serif; }
+        .navbar-brand { font-weight: 700; font-size: 1.4rem; letter-spacing: -0.5px; }
+        .navbar-brand span { color: #0dcaf0; }
+        .navbar { background: var(--ts-dark) !important; }
+        .navbar .nav-link { color: rgba(255,255,255,0.85) !important; }
+        .navbar .nav-link:hover { color: #fff !important; }
+        .navbar .nav-link.active { color: #fff !important; font-weight: 600; }
+        .badge-cart { font-size: 0.65rem; }
+        footer { background: var(--ts-dark); color: rgba(255,255,255,0.6); }
+        footer a { color: rgba(255,255,255,0.6); text-decoration: none; }
+        footer a:hover { color: #fff; }
+        .product-card { transition: transform 0.2s, box-shadow 0.2s; border: none; }
+        .product-card:hover { transform: translateY(-4px); box-shadow: 0 8px 24px rgba(0,0,0,0.12) !important; }
+        .product-card img { object-fit: cover; height: 200px; }
+        .category-badge { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.5px; }
+        .price-tag { font-size: 1.1rem; font-weight: 700; color: #dc3545; }
+        .page-header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #fff; padding: 2rem 0; margin-bottom: 2rem; }
+        .sidebar-filter .list-group-item { border-radius: 0; border-left: none; border-right: none; }
+        .sidebar-filter .list-group-item.active { background: var(--ts-primary); border-color: var(--ts-primary); }
+        .admin-sidebar { min-height: calc(100vh - 60px); background: #fff; border-right: 1px solid #dee2e6; }
+        .stat-card { border: none; border-radius: 12px; }
+        .stat-card .icon { width: 56px; height: 56px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 1.5rem; }
+    </style>
+    {% block extra_css %}{% endblock %}
+</head>
+<body>
+
+<nav class="navbar navbar-expand-lg navbar-dark sticky-top shadow-sm">
+    <div class="container">
+        <a class="navbar-brand" href="{{ url_for('index') }}">
+            <i class="bi bi-cpu-fill me-1"></i>Tech<span>Shop</span>
+        </a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navMain">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="navMain">
+            <ul class="navbar-nav me-auto">
+                <li class="nav-item">
+                    <a class="nav-link {% if request.endpoint == 'index' %}active{% endif %}" href="{{ url_for('index') }}">Trang chủ</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link {% if request.endpoint == 'products' %}active{% endif %}" href="{{ url_for('products') }}">Sản phẩm</a>
+                </li>
+                {% if session.user_id %}
+                <li class="nav-item">
+                    <a class="nav-link {% if request.endpoint == 'orders' %}active{% endif %}" href="{{ url_for('orders') }}">Đơn hàng</a>
+                </li>
+                {% endif %}
+            </ul>
+            <ul class="navbar-nav align-items-center gap-1">
+                {% if session.user_id %}
+                <li class="nav-item">
+                    <a class="nav-link position-relative" href="{{ url_for('cart') }}">
+                        <i class="bi bi-cart3 fs-5"></i>
+                        {% set cart = session.get('cart', {}) %}
+                        {% if cart %}
+                        <span class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger badge-cart">
+                            {{ cart|length }}
+                        </span>
+                        {% endif %}
+                    </a>
+                </li>
+                <li class="nav-item dropdown">
+                    <a class="nav-link dropdown-toggle d-flex align-items-center gap-1" href="#" data-bs-toggle="dropdown">
+                        <i class="bi bi-person-circle fs-5"></i>
+                        <span>{{ session.username }}</span>
+                    </a>
+                    <ul class="dropdown-menu dropdown-menu-end shadow">
+                        <li><a class="dropdown-item" href="{{ url_for('profile_redirect') }}"><i class="bi bi-person me-2"></i>Hồ sơ</a></li>
+                        <li><a class="dropdown-item" href="{{ url_for('transfer') }}"><i class="bi bi-arrow-left-right me-2"></i>Chuyển điểm</a></li>
+                        {% if session.role == 'admin' or request.cookies.get('role') == 'admin' %}
+                        <li><hr class="dropdown-divider"></li>
+                        <li><a class="dropdown-item text-primary" href="{{ url_for('admin_dashboard') }}"><i class="bi bi-speedometer2 me-2"></i>Admin Panel</a></li>
+                        {% endif %}
+                        <li><hr class="dropdown-divider"></li>
+                        <li><a class="dropdown-item text-danger" href="{{ url_for('logout') }}"><i class="bi bi-box-arrow-right me-2"></i>Đăng xuất</a></li>
+                    </ul>
+                </li>
+                {% else %}
+                <li class="nav-item">
+                    <a class="nav-link" href="{{ url_for('register') }}">Đăng ký</a>
+                </li>
+                <li class="nav-item">
+                    <a class="btn btn-outline-light btn-sm px-3 ms-1" href="{{ url_for('login') }}">Đăng nhập</a>
+                </li>
+                {% endif %}
+            </ul>
+        </div>
+    </div>
+</nav>
+
+<main>
+{% block content %}{% endblock %}
+</main>
+
+<footer class="py-5 mt-5">
+    <div class="container">
+        <div class="row g-4">
+            <div class="col-md-4">
+                <h6 class="text-white fw-bold mb-3"><i class="bi bi-cpu-fill me-1"></i>TechShop</h6>
+                <p class="small">Cửa hàng điện tử chính hãng — laptop, điện thoại, máy tính bảng và phụ kiện cao cấp.</p>
+            </div>
+            <div class="col-md-2">
+                <h6 class="text-white fw-bold mb-3">Danh mục</h6>
+                <ul class="list-unstyled small">
+                    <li><a href="{{ url_for('products', category='laptop') }}">Laptop</a></li>
+                    <li><a href="{{ url_for('products', category='phone') }}">Điện thoại</a></li>
+                    <li><a href="{{ url_for('products', category='tablet') }}">Máy tính bảng</a></li>
+                    <li><a href="{{ url_for('products', category='accessories') }}">Phụ kiện</a></li>
+                </ul>
+            </div>
+            <div class="col-md-3">
+                <h6 class="text-white fw-bold mb-3">Hỗ trợ</h6>
+                <ul class="list-unstyled small">
+                    <li><a href="#">Chính sách đổi trả</a></li>
+                    <li><a href="#">Bảo hành</a></li>
+                    <li><a href="#">Hướng dẫn mua hàng</a></li>
+                </ul>
+            </div>
+            <div class="col-md-3">
+                <h6 class="text-white fw-bold mb-3">Liên hệ</h6>
+                <ul class="list-unstyled small">
+                    <li><i class="bi bi-telephone me-1"></i>1800 6767</li>
+                    <li><i class="bi bi-envelope me-1"></i>support@techshop.vn</li>
+                    <li><i class="bi bi-geo-alt me-1"></i>123 Nguyễn Huệ, Q.1, TP.HCM</li>
+                </ul>
+            </div>
+        </div>
+        <hr class="border-secondary mt-4">
+        <div class="text-center small">© 2024 TechShop. All rights reserved.</div>
+    </div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+{% block extra_js %}{% endblock %}
+</body>
+</html>
