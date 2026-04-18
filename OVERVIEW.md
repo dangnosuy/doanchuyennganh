@@ -54,10 +54,9 @@
 - Sự tương tương tác của các phase. 
 - Thiếu tool... => Chuyển qua dạng Dynacmic tool (sau này). 
 - Đổi tên -> Để viết báo cáo. 
-- ManageAgent (main.py => Quản lý task => Tổng hợp lại Một con điều phối) -> Thêm mới.
+- ManageAgent (main.py => Quản lý task => Tổng hợp lại Một con điều phối) -> Thêm mới. https://github.com/crewAIInc/crewAI -> Kiến trúc task. 
 - Red/Blue => Nên là Claude cho Red, Codex là Blue. 
 - Portswigger, Dựng Lab, Bug Bounty. 
-- https://github.com/crewAIInc/crewAI -> Kiến trúc task. 
 - Tổng hợp lên google drive. 
 ---
 
@@ -632,3 +631,209 @@ Tất cả system prompts đều có section **CHỐNG AO TƯỞNG** bắt buộ
 - `fetch()` tool stateless — LLM hay nhầm dùng cho authenticated requests
 - Không có token counting — `recon.md` lớn có thể fill context window LLM silently
 - Không có `requirements.txt` — dependencies không được khai báo chính thức
+
+---
+
+---
+
+# 📋 Lịch sử thay đổi kiến trúc
+
+---
+
+## [v2] Thêm ManageAgent — Bộ điều phối thông minh thay thế hard-coded orchestration
+
+> **Ngày:** 2026-04-18  
+> **Trạng thái:** Đã tích hợp vào `main.py`
+
+---
+
+### Vấn đề của kiến trúc cũ (v1)
+
+Trong phiên bản đầu, `main.py` đóng vai orchestrator bằng cách hard-code toàn bộ luồng chạy:
+
+```python
+# main.py cũ — logic cứng nhắc
+for attempt in range(MAX_EXEC_RETRIES + 1):
+    approved_workflow = phase_debate(...)     # Red ↔ Blue theo vòng cố định
+    exec_report       = phase_execute(...)   # luôn chạy sau approve
+    verdict           = phase_evaluate(...)  # Red đọc, ra verdict
+    if verdict != "RETRY":
+        break
+phase_report(...)
+```
+
+**Hạn chế:**
+- Thứ tự phase là **cố định** — không thể linh hoạt (ví dụ: VERIFY xen giữa EXECUTE → EVALUATE)
+- Không có ai "hiểu ngữ cảnh" để hướng dẫn agent con trước mỗi bước
+- Retry loop đơn giản: đếm số lần thử, không xét lý do thất bại
+- `main.py` gánh cả orchestration + logging + CLI → quá nhiều trách nhiệm
+
+---
+
+### Giải pháp: ManageAgent (v2)
+
+Thêm một LLM agent mới đóng vai **"Sếp"** — thay thế toàn bộ `phase_debate / phase_execute / phase_evaluate / phase_report` trong `main.py`.
+
+Mỗi **tick**, Manager:
+1. Nhận snapshot trạng thái hiện tại (round, attempts, có workflow chưa, có exec report chưa...)
+2. Đọc 12 message gần nhất trong conversation
+3. Gọi LLM → quyết định `[ACTION: XXX]` + viết `<note>` hướng dẫn cụ thể cho agent tiếp theo
+4. Inject `<note>` vào conversation
+5. Gọi đúng agent con theo action
+
+---
+
+### Sơ đồ kiến trúc mới (v2)
+
+```
+python main.py "https://target.com credentials: admin:password"
+│
+├─ [Phase 1: RECON]  ← không đổi
+│   └── CrawlAgent → recon.md
+│
+└─ [Phase 2–5: ManageAgent.run(conversation)]
+     │
+     │   ┌──────────────────────────────────────────────────────┐
+     │   │                MANAGE AGENT (LLM)                    │
+     │   │                                                      │
+     │   │  state: round_num, exec_attempts, red_spoke,         │
+     │   │         blue_spoke, has_workflow, has_exec           │
+     │   │                                                      │
+     │   │  mỗi tick:                                           │
+     │   │  conversation[-12:] + state → LLM → [ACTION: X]     │
+     │   │  + <note> inject vào conversation                    │
+     │   └──────────────┬───────────────────────────────────────┘
+     │                  │
+     │      ┌───────────▼──────────────────────────────────┐
+     │      │         ROUTING theo ACTION tag               │
+     │      └──┬──────┬──────┬────────┬────────┬───────────┘
+     │         │      │      │        │        │
+     │   DEBATE_RED  DEBATE  VERIFY  EXECUTE  EVALUATE
+     │         │    _BLUE    │        │        │
+     │    RedTeam   BlueTeam  Exec    Exec    RedTeam
+     │    .respond  .respond  .answer .run_   (eval
+     │                       (r-o)   workflow  mode)
+     │         │      │
+     │         └──────┘
+     │      (round_num tăng khi cả hai đã nói)
+     │
+     ├─ RETRY_DEBATE → reset Blue (instance mới), reset round state
+     ├─ REPORT_SUCCESS → _write_report(verdict="SUCCESS") → return
+     └─ REPORT_FAIL    → _write_report(verdict="FAIL")    → return
+```
+
+---
+
+### Bảng ACTION tags của ManageAgent
+
+| Action | Agent được gọi | Khi nào Manager dùng |
+|--------|---------------|----------------------|
+| `DEBATE_RED` | `RedTeamAgent.respond()` | Bắt đầu debate, hoặc Blue vừa reject |
+| `DEBATE_BLUE` | `BlueTeamAgent.respond()` | Red vừa nộp chiến lược |
+| `VERIFY` | `ExecAgent.answer(read_only=False)` | Cần kiểm tra endpoint trước khi execute |
+| `EXECUTE` | `ExecAgent.run_workflow()` | Blue đã approve + đủ min rounds |
+| `EVALUATE` | `RedTeamAgent.respond()` (eval mode) | Exec vừa chạy xong |
+| `RETRY_DEBATE` | *(reset state)* | Red muốn thử chiến lược mới + còn retry |
+| `REPORT_SUCCESS` | `_write_report()` | Red confirm thành công |
+| `REPORT_FAIL` | `_write_report()` | Hết retry hoặc hết rounds |
+
+---
+
+### So sánh v1 vs v2
+
+| Tiêu chí | v1 (main.py hard-coded) | v2 (ManageAgent) |
+|----------|------------------------|-----------------|
+| **Ai quyết định bước tiếp theo?** | `if/elif` cứng trong Python | LLM đọc context, lý luận |
+| **Hướng dẫn agent con** | Không có | Manager inject `<note>` mỗi tick |
+| **Retry logic** | Đếm số lần, không xét lý do | Manager xét toàn bộ context trước khi retry |
+| **Thứ tự phase** | Cố định: 2→3→4→5 | Linh hoạt: VERIFY có thể xen giữa bất kỳ đâu |
+| **Khi LLM fail** | Crash hoặc fallback không kiểm soát | Deterministic fallback trong `_extract_action()` |
+| **main.py** | ~400 dòng, ôm toàn bộ logic | ~80 dòng, chỉ Phase 1 + khởi động ManageAgent |
+| **Guardrail** | Hard-coded rounds/retries | Hard guardrail (Python) + Soft guardrail (LLM-aware) |
+| **Chi phí LLM** | Không thêm | +1 LLM call/tick (gpt-5-mini, 512 tokens) |
+
+---
+
+### Guardrail kép trong v2
+
+ManageAgent có **2 lớp** bảo vệ:
+
+**Lớp 1 — Hard guardrail (Python, không qua LLM):**
+```python
+if round_num >= self.max_rounds and not exec_report:
+    → buộc REPORT_FAIL
+if exec_attempts > self.max_exec_retries and exec_report:
+    → buộc REPORT_FAIL
+if tick >= MAX_TICKS (80):
+    → buộc REPORT_FAIL
+```
+
+**Lớp 2 — Soft guardrail (nhúng trong system prompt của Manager):**
+- "Không approve trước khi đủ `min_rounds`"
+- "Không EXECUTE khi chưa có approval từ Blue"
+- "RETRY_DEBATE chỉ khi còn lần retry"
+
+**Lớp 3 — Guardrail con trong DEBATE_BLUE:**
+```python
+# Blue emit [APPROVED] quá sớm → inject SYSTEM message ép tiếp tục
+if tag == "APPROVED" and (round_num + 1) < self.min_debate_rounds:
+    → inject "[SYSTEM]: Chưa đủ số round tối thiểu..."
+```
+
+---
+
+### Fallback khi Manager LLM fail
+
+Nếu LLM không emit action hợp lệ, `_extract_action()` fallback deterministic:
+
+```
+has_exec=True          → EVALUATE
+has_workflow, no exec  → EXECUTE
+red_spoke=True         → DEBATE_BLUE
+default                → DEBATE_RED
+```
+
+Pipeline không bao giờ bị kẹt dù Manager LLM crash hoàn toàn.
+
+---
+
+### Các file thay đổi và thêm mới
+
+#### 🆕 File mới
+
+| File | Mô tả |
+|------|-------|
+| `agents/manage_agent.py` | ManageAgent — LLM orchestrator mới. Chứa toàn bộ `_run_loop`, `_decide`, `_extract_action`, `_write_report`. Tự khởi tạo Red/Blue/ExecAgent bên trong. |
+
+#### ✏️ File sửa đổi
+
+| File | Thay đổi |
+|------|---------|
+| `main.py` | **Xóa hoàn toàn** các hàm `phase_debate()`, `phase_execute()`, `phase_evaluate()`, `phase_report()` và retry loop. **Thêm** `from agents.manage_agent import ManageAgent`. Phase 2–5 giờ chỉ còn 5 dòng: khởi tạo `ManageAgent` → gọi `manage_agent.run(conversation)`. Phase 1 (Recon) giữ nguyên. |
+
+#### 📦 Biến môi trường mới
+
+| Biến | Default | Dùng trong |
+|------|---------|-----------|
+| `MARL_MANAGER_MODEL` | `gpt-5-mini` | `agents/manage_agent.py` — model cho Manager LLM |
+
+#### ⚙️ Hằng số mới trong ManageAgent
+
+| Hằng số | Giá trị | Ý nghĩa |
+|---------|---------|---------|
+| `MAX_TICKS` | 80 | Tổng số tick tối đa cho toàn pipeline (hard limit tuyệt đối) |
+| `MAX_DEBATE_STEPS` | 30 | Giữ nguyên từ v1 |
+| `MAX_ROUNDS` | 5 | Giữ nguyên từ v1 |
+| `MIN_DEBATE_ROUNDS` | 2 | Giữ nguyên từ v1 |
+| `MAX_EXEC_RETRIES` | 2 | Giữ nguyên từ v1 |
+
+> **Lưu ý:** Các constants này được định nghĩa lại trong `manage_agent.py` thay vì đọc từ `main.py`. `main.py` vẫn giữ bản sao nhưng không còn được dùng trực tiếp trong pipeline.
+
+---
+
+### Ghi chú cho đồ án
+
+- ManageAgent áp dụng pattern **"LLM-as-orchestrator"** — thay vì code cứng logic điều phối, dùng LLM để đưa ra quyết định runtime dựa trên context thực tế.
+- Kiến trúc này tương đồng với hướng tiếp cận của **CrewAI** (manager agent điều phối crew) và **LangGraph** (state machine với LLM-driven transitions), nhưng được implement thủ công hoàn toàn không phụ thuộc framework.
+- Điểm khác biệt so với CrewAI: Manager của MARL nhận **toàn bộ conversation history** thay vì chỉ nhận task output — cho phép ra quyết định dựa trên chất lượng tranh luận chứ không chỉ kết quả công việc.
+- Chi phí: thêm ~1 LLM call nhỏ (gpt-5-mini, ≤512 tokens) mỗi tick. Với pipeline 20–30 tick, tổng overhead không đáng kể so với các lượt gọi ExecAgent/CrawlAgent.
