@@ -837,3 +837,18 @@ Pipeline không bao giờ bị kẹt dù Manager LLM crash hoàn toàn.
 - Kiến trúc này tương đồng với hướng tiếp cận của **CrewAI** (manager agent điều phối crew) và **LangGraph** (state machine với LLM-driven transitions), nhưng được implement thủ công hoàn toàn không phụ thuộc framework.
 - Điểm khác biệt so với CrewAI: Manager của MARL nhận **toàn bộ conversation history** thay vì chỉ nhận task output — cho phép ra quyết định dựa trên chất lượng tranh luận chứ không chỉ kết quả công việc.
 - Chi phí: thêm ~1 LLM call nhỏ (gpt-5-mini, ≤512 tokens) mỗi tick. Với pipeline 20–30 tick, tổng overhead không đáng kể so với các lượt gọi ExecAgent/CrawlAgent.
+
+
+
+- Cho nó một share memory -> Cho việc quản lý task để định danh từng con rồi từng con có thể tham khảo resource thì nó sẽ lấy phần đó về
+- Single gì gì đó nên là sai. Rồi context có thể bị cắt rồi sai => Rồi bỏ sót?
+- Hiện thì con Manage Agent là con quyết định hết các luồng chạy, luồng thực thi.
++ Tách ra thêm 1 con AI để policy -> Action nào ở state nào? Khi nào được execute -> Khi nào làm việc gì, ... để giảm phụ thuộc vào con manage agent sai vặt sai là có 1 con AI Policy để kiểm tra lại.
++ Định nghĩa context, persistence 
++ Thu thập dữ liệu để khai thác BAC/BLF (Portswigger, CVE, NIST, Mitre ...) CTI?
++ Tự thu thập playbook -> Framework chung để crawll về và parse định dạng 
+- Kết quả khi chạy ra cuối cùng thì thông số nào? Con số nào được tính => Khóa luận mới cần kết quả (Relative Network). Với ngữ cảnh của tôi thì có thể làm thế nào? Rồi sửa ra sao?...
+- Nếu có 1 số nhược điểm thì có phương pháp nào đó tức là giải quyết research gap nó như thế nào.
+- Sau này chạy được, thực nghiệm được dựa trên số liệu cụ thể.
+
+
