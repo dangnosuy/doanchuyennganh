@@ -30,6 +30,7 @@ class MCPManager:
         self._loop = None
         self._thread = None
         self._started = False
+        self._stderr_sinks = []
 
     def _ensure_event_loop(self):
         """Đảm bảo có event loop chạy trong background thread."""
@@ -307,11 +308,6 @@ class MCPManager:
 
         return results
 
-        if not results:
-            return [{"error": "No results found", "query": query}]
-
-        return results
-
     def add_playwright_server(self, headless: bool = True) -> bool:
         """Thêm Playwright MCP Server (tương tác trình duyệt).
         
@@ -362,8 +358,18 @@ class MCPManager:
             env=server_env,
         )
 
-        # Tạo context managers và giữ chúng mở
-        stdio_ctx = stdio_client(server_params)
+        # Tạo context managers và giữ chúng mở.
+        # MCP servers log every tool call to stderr at INFO level by default.
+        # That noise is useful for SDK debugging but unreadable in marl.log, so
+        # suppress server stderr unless explicitly enabled for troubleshooting.
+        stderr_sink = None
+        if os.environ.get("MARL_MCP_DEBUG", "").strip().lower() in {"1", "true", "yes"}:
+            stderr_sink = sys.stderr
+        else:
+            stderr_sink = open(os.devnull, "w", encoding="utf-8")
+            self._stderr_sinks.append(stderr_sink)
+
+        stdio_ctx = stdio_client(server_params, errlog=stderr_sink)
         read_write = await stdio_ctx.__aenter__()
         read, write = read_write
 
@@ -402,12 +408,15 @@ class MCPManager:
             "serverInfo": server_info,
         }
 
-    def get_openai_tools(self) -> list:
+    def get_openai_tools(self, *, exclude_servers: set[str] | None = None) -> list:
         """Chuyển đổi MCP tools sang OpenAI function calling format.
-        
+
         Chỉ expose các tools thiết yếu để giảm token cost.
         Filesystem: 14 tools → 5 tools (bỏ deprecated, redundant, ít dùng)
         Các server web (playwright, web_search): cho phép tất cả tools.
+
+        Args:
+            exclude_servers: Set of server names to exclude (e.g. {"playwright"}).
         """
         # Whitelist tools cho filesystem (quá nhiều tools thừa)
         FILESYSTEM_ESSENTIAL = {
@@ -421,9 +430,12 @@ class MCPManager:
         openai_tools = []
 
         for server_name, handle in self.servers.items():
+            if exclude_servers and server_name in exclude_servers:
+                continue
+
             for tool in handle["tools"]:
                 tool_name = tool["name"]
-                
+
                 # Filter logic
                 if server_name == "filesystem":
                     if tool_name not in FILESYSTEM_ESSENTIAL:
@@ -519,6 +531,13 @@ class MCPManager:
             except Exception as e:
                 return f"[Lỗi web_search] {e}"
 
+        # Dynamic tools — handle via custom handlers
+        if server_name == "dynamic" and hasattr(self, '_custom_handlers') and tool_name in self._custom_handlers:
+            try:
+                return self._custom_handlers[tool_name](arguments)
+            except Exception as e:
+                return f"[Lỗi dynamic tool] {e}"
+
         try:
             # Shell commands cần timeout dài hơn vì tool có thể chạy nmap, nuclei, etc.
             tool_timeout = 300 if server_name == "shell" else 120
@@ -585,7 +604,49 @@ class MCPManager:
                 if len(desc) > 60:
                     desc = desc[:57] + "..."
                 print(f"    🔧 {name}")
-                print(f"       {desc}")
+            print(f"       {desc}")
+
+    def close(self):
+        """Close MCP stderr sinks owned by this manager."""
+        for sink in self._stderr_sinks:
+            try:
+                sink.close()
+            except Exception:
+                pass
+        self._stderr_sinks.clear()
+
+    def add_dynamic_tool(self, tool_name: str, description: str, parameters: dict, handler_func):
+        """Dynamically add a custom tool to the tool map.
+
+        Args:
+            tool_name: Name of the tool
+            description: Description for the tool
+            parameters: OpenAI-style parameters schema
+            handler_func: Function to handle tool execution (should return str)
+        """
+        # Add to a virtual server for dynamic tools
+        if "dynamic" not in self.servers:
+            self.servers["dynamic"] = {
+                "serverInfo": {"name": "Dynamic Tools", "version": "1.0"},
+                "tools": [],
+                "session": None  # No MCP session for dynamic tools
+            }
+
+        # Create tool definition
+        tool_def = {
+            "name": tool_name,
+            "description": description,
+            "inputSchema": parameters
+        }
+
+        # Add to server's tools list
+        self.servers["dynamic"]["tools"].append(tool_def)
+        self.tool_map[tool_name] = "dynamic"
+
+        # Store handler function (extend the handle to include custom handlers)
+        if not hasattr(self, '_custom_handlers'):
+            self._custom_handlers = {}
+        self._custom_handlers[tool_name] = handler_func
 
     def stop_all(self):
         """Dừng tất cả MCP servers."""
@@ -600,6 +661,7 @@ class MCPManager:
                     pass
         self.servers.clear()
         self.tool_map.clear()
+        self.close()
 
     async def _disconnect_server(self, handle: dict):
         """Ngắt kết nối MCP server (async)."""

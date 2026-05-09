@@ -3,47 +3,101 @@ MARL Orchestrator — Entry point duy nhat cho toan bo pipeline.
 
 Flow:
   Phase 1: RECON — CrawlAgent crawl target → recon.md
-  Phase 2: DEBATE — Red ↔ Blue tranh luan, ca hai co the goi Agent
-           Red viet chien luoc tan cong → Blue review → reject/approve
-  Phase 3: EXECUTION — Agent thuc thi workflow da duoc approve
-  Phase 4: EVALUATION — Red danh gia ket qua, co the de xuat chien luoc moi
-  Phase 5: REPORT — Luu ket qua cuoi cung
+  Phase 2: CANDIDATE_QUEUE — VulnHunter risk-bug.json → ManageAgent chon bug
+  Phase 3: STRATEGY — Red viet strategy ngan, Blue review shot plan
+  Phase 4: EXECUTION — Exec chay Python exploit self-verify
+  Phase 5: REPORT — Manager ghi ket qua cuoi cung tu Exec verdict/artifacts
 
 Usage:
     python main.py
     python main.py "Test https://target.com user:admin pass:secret"
+    python main.py --fresh-workspace "Test https://target.com"
+    python main.py --reuse-workspace "Test https://target.com"
 """
 
+import argparse
 import os
 import re
+import logging
 import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from shared.utils import parse_prompt, extract_next_tag, extract_send_block
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
+
+from shared.utils import parse_prompt
 
 WORKSPACE = "./workspace"
 
 
-def _make_run_dir(target_url: str) -> str:
-    """Create workspace/{domain}_{timestamp}/ for this run.
+def _is_placeholder_recon(text: str) -> bool:
+    """Return True when recon.md is only a placeholder/non-informative stub."""
+    lower = text.lower()
+    return (
+        "llm analysis skipped" in lower
+        or "vulnhunter đọc crawl_data.txt trực tiếp" in lower
+        or len(text.strip()) < 200
+    )
 
-    Returns absolute path to the run directory.
-    """
+
+def _workspace_domain(target_url: str) -> str:
+    """Normalize target hostname into a workspace-safe slug."""
     domain = urlparse(target_url).hostname or "unknown"
-    # Strip port-like suffixes and sanitize for filesystem
-    domain = re.sub(r"[^a-zA-Z0-9._-]", "_", domain)
+    return re.sub(r"[^a-zA-Z0-9._-]", "_", domain)
+
+
+def _find_reusable_run_dir(target_url: str) -> str | None:
+    """Return the newest reusable workspace for *target_url*, if any."""
+    domain = _workspace_domain(target_url)
+    import json as _json
+    workspace_path = Path(WORKSPACE)
+    if workspace_path.exists():
+        for existing in sorted(workspace_path.iterdir(), reverse=True):
+            if existing.is_dir() and existing.name.startswith(domain + "_"):
+                if not (existing / "crawl_data.txt").exists():
+                    continue
+                bugs_file = existing / "risk-bug.json"
+                bugs_count = 0
+                if bugs_file.exists():
+                    try:
+                        with open(bugs_file) as f:
+                            bugs = _json.load(f)
+                            bugs_count = len(bugs) if isinstance(bugs, list) else 0
+                    except: pass
+                if bugs_count > 0:
+                    return str(existing.resolve())
+    return None
+
+
+def _create_fresh_run_dir(target_url: str) -> str:
+    """Create a new workspace/{domain}_{timestamp}/ directory for this run."""
+    domain = _workspace_domain(target_url)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(WORKSPACE) / f"{domain}_{timestamp}"
+    workspace_path = Path(WORKSPACE)
+    run_dir = workspace_path / f"{domain}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return str(run_dir.resolve())
 
 
-MAX_DEBATE_STEPS = 30          # tong so turn toi da (Red + Blue + Agent)
-MAX_ROUNDS = 5                 # so round Red↔Blue reject/revise toi da
-MIN_DEBATE_ROUNDS = 2          # buoc phai co it nhat 2 round truoc khi approve
-MAX_EXEC_RETRIES = 2           # so lan cho Red de xuat chien luoc moi sau exec fail
+def _make_run_dir(target_url: str, workspace_mode: str) -> str:
+    """Resolve run_dir according to workspace mode: fresh or reuse."""
+    if workspace_mode == "reuse":
+        existing = _find_reusable_run_dir(target_url)
+        if existing:
+            print(f"{G}[+] Reusing existing workspace: {existing}{RST}")
+            return existing
+        print(f"{Y}[!] Reuse requested but no suitable workspace found — creating fresh workspace{RST}")
+    return _create_fresh_run_dir(target_url)
+
+
+# Legacy constants kept for older imports/scripts. Active orchestration limits
+# now live in agents/manage_agent.py.
+MAX_DEBATE_STEPS = 30
+MAX_ROUNDS = 5
+MIN_DEBATE_ROUNDS = 0
+MAX_EXEC_RETRIES = 1
 
 # ── ANSI colors ──────────────────────────────────────────────
 R = "\033[91m"
@@ -52,6 +106,9 @@ Y = "\033[93m"
 C = "\033[96m"
 B = "\033[1m"
 RST = "\033[0m"
+
+YELLOW = "\033[93m"  # yellow for backward compatibility
+RESET = "\033[0m"  # reset for backward compatibility
 
 # Regex strip ANSI escape codes for log file
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -141,6 +198,28 @@ def setup_logging(run_dir: str) -> str:
     return log_path
 
 
+def _quiet_third_party_logging() -> None:
+    """Keep runtime logs focused on agent-level orchestration, not library chatter."""
+    logging.getLogger().setLevel(logging.WARNING)
+    for name in (
+        "mcp",
+        "mcp.client",
+        "mcp.server",
+        "mcp.server.lowlevel",
+        "mcp.server.lowlevel.server",
+        "mcp.server.fastmcp",
+        "mcp_server_shell",
+        "mcp_server_fetch",
+        "mcp_client",
+        "httpx",
+        "httpcore",
+        "asyncio",
+        "urllib3",
+        "openai",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 # ═════════════════════════════════════════════════════════════
 # HELPERS
 # ═════════════════════════════════════════════════════════════
@@ -154,10 +233,52 @@ def banner():
     """)
 
 
-def get_user_prompt() -> str:
+def parse_cli_args() -> argparse.Namespace:
+    """Parse CLI flags without breaking the old positional prompt style."""
+    parser = argparse.ArgumentParser(
+        description="MARL multi-agent pentest orchestrator",
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--fresh-workspace",
+        action="store_true",
+        help="Luon tao workspace moi, khong dung recon/memory/risk-bug cu.",
+    )
+    mode_group.add_argument(
+        "--reuse-workspace",
+        action="store_true",
+        help="Tai su dung workspace cu cua cung target neu co crawl_data.txt + risk-bug.json.",
+    )
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help='Prompt chua target URL va credentials, vd: "Test https://target.com user:admin pass:secret"',
+    )
+    return parser.parse_args()
+
+
+def get_workspace_mode(args: argparse.Namespace) -> str:
+    """Resolve workspace mode from CLI flags or env var."""
+    if args.fresh_workspace:
+        return "fresh"
+    if args.reuse_workspace:
+        return "reuse"
+
+    env_mode = os.environ.get("MARL_WORKSPACE_MODE", "fresh").strip().lower()
+    if env_mode in {"fresh", "reuse"}:
+        return env_mode
+    return "fresh"
+
+
+def get_user_prompt(prompt_parts: list[str] | None = None) -> str:
     """Lay prompt tu CLI arg hoac stdin."""
-    if len(sys.argv) > 1:
-        return " ".join(sys.argv[1:])
+    if prompt_parts:
+        return " ".join(prompt_parts).strip()
+    # MARL_AUTO_PROMPT: for scripted runs, bypass stdin
+    import os as _os
+    _auto = _os.environ.get("MARL_AUTO_PROMPT", "")
+    if _auto:
+        return _auto
     print(f"{Y}Nhap prompt (URL + credentials neu co):{RST}")
     prompt = input("> ").strip()
     if not prompt:
@@ -166,29 +287,61 @@ def get_user_prompt() -> str:
     return prompt
 
 
-def strip_tag(text: str) -> str:
-    """Xoa tag [REDTEAM], [BLUETEAM], [AGENT], [APPROVED], [DONE] o cuoi text."""
-    return re.sub(
-        r"\[(?:REDTEAM|BLUETEAM|AGENT(?::run)?|APPROVED|DONE)\]\s*$",
-        "", text, flags=re.IGNORECASE,
-    ).rstrip()
-
-
 # ═════════════════════════════════════════════════════════════
 # PHASE 1: RECON
 # ═════════════════════════════════════════════════════════════
 
 def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
-    """CrawlAgent crawl target → (target_url, recon_path, recon_content)."""
+    """CrawlAgent crawl target → (target_url, recon_path, recon_content).
+
+    Skips Phase 1 (CrawlAgent + VulnHunter) entirely if existing workspace
+    already has both crawl_data.txt and risk-bug.json with at least 1 bug.
+    This avoids expensive re-crawl when a prior run already produced bugs.
+    """
     print(f"\n{C}{B}{'='*60}")
     print(f"  PHASE 1: RECON")
     print(f"{'='*60}{RST}\n")
 
-    from agents.crawl_agent import CrawlAgent
-
     target_url, _ = parse_prompt(user_prompt)
     if not target_url:
         raise ValueError("Khong tim thay URL trong prompt.")
+
+    # ── Check for existing workspace with bugs ──
+    # If both crawl_data.txt + risk-bug.json exist and have content,
+    # skip the expensive Phase 1 (crawl + vuln-hunter).
+    existing_risk_bugs = Path(run_dir) / "risk-bug.json"
+    existing_recon = Path(run_dir) / "recon.md"
+    if existing_risk_bugs.exists() and existing_recon.exists():
+        try:
+            import json
+            with open(existing_risk_bugs) as f:
+                bugs = json.load(f)
+            if bugs and len(bugs) > 0:
+                recon_path = str(existing_recon)
+                recon_content = existing_recon.read_text(encoding="utf-8")
+                if not _is_placeholder_recon(recon_content):
+                    print(f"\033[93m[+] Workspace already has {len(bugs)} bugs — skipping Phase 1 (CrawlAgent + VulnHunter)\033[0m")
+                    print(f"\033[92m[+] Using existing recon.md: {recon_path}\033[0m")
+                    print(f"\033[92m[+] Recon + VulnHunter hoan tat\033[0m")
+                    return target_url, recon_path, recon_content
+
+                existing_crawl_data = Path(run_dir) / "crawl_data.txt"
+                if existing_crawl_data.exists():
+                    print(f"\033[93m[+] Existing recon.md is placeholder — rebuilding from saved crawl artifacts\033[0m")
+                    from agents.crawl_agent import CrawlAgent
+                    crawl = CrawlAgent(working_dir=run_dir)
+                    try:
+                        recon_path = crawl.rebuild_recon_from_saved_artifacts(user_prompt)
+                        recon_content = Path(recon_path).read_text(encoding="utf-8")
+                        print(f"\033[92m[+] Rebuilt recon.md from saved crawl data: {recon_path}\033[0m")
+                        print(f"\033[92m[+] Recon + VulnHunter hoan tat\033[0m")
+                        return target_url, recon_path, recon_content
+                    finally:
+                        crawl.shutdown()
+        except Exception:
+            pass  # proceed with Phase 1 normally
+
+    from agents.crawl_agent import CrawlAgent
 
     crawl = CrawlAgent(working_dir=run_dir)
     try:
@@ -199,369 +352,37 @@ def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
     finally:
         crawl.shutdown()
 
-    print(f"\n{G}[+] Recon hoan tat: {recon_path}{RST}")
-    return target_url, recon_path, recon_content
+    print(f"\n{G}[+] Recon hoan tat: {recon_path}{RST}"
+          f"{C}{B}\n  PHASE 1b: VULN HUNTER — Nhận diện lỗ hổng{RST}\n")
 
+    # Skip VulnHunter if risk-bug.json already exists with bugs
+    existing_risk_bugs = Path(run_dir) / "risk-bug.json"
+    if existing_risk_bugs.exists():
+        try:
+            import json
+            with open(existing_risk_bugs) as f:
+                existing = json.load(f)
+            if existing and len(existing) > 0:
+                print(f"\033[93m[+] VulnHunter skipped — using existing risk-bug.json ({len(existing)} bugs)\033[0m")
+                print(f"\n\033[92m[+] Recon + VulnHunter hoan tat\033[0m")
+                return target_url, recon_path, recon_content
+        except Exception:
+            pass
 
-# ═════════════════════════════════════════════════════════════
-# PHASE 2: DEBATE  (Red ↔ Blue, ca hai co the goi Agent)
-# ═════════════════════════════════════════════════════════════
+    from agents.vuln_hunter_agent import VulnHunterAgent
+    crawler_data = Path(run_dir) / "crawl_data.txt"
 
-def phase_debate(
-    target_url: str,
-    recon_content: str,
-    exec_agent,
-    red,
-    conversation: list[dict],
-) -> tuple[str, list[dict], int]:
-    """Red vs Blue debate loop.
-
-    [GIẢI THÍCH CÁC CƠ CHẾ KIỂM SOÁT DEBATE Ở ĐÂY - THEO ROADMAP]:
-    1. Max Steps (MAX_DEBATE_STEPS=30): "Cầu dao" chống AI rơi vào vòng lặp vô tận (infinite loop). 
-       Giới hạn số lượt thoại qua lại để không đốt API. Nết vượt quá mức này mà vẫn chưa có sự đồng thuận, 
-       hệ thống sẽ raise RuntimeError ép ngừng.
-    2. Max Rounds (MAX_ROUNDS=5): 1 Round là khi Red nộp bản thảo và Blue bắt lỗi. Quá 5 lần sửa nháp 
-       mà vẫn fail thì vứt chiến lược đó. Cùng lúc, MIN_DEBATE_ROUNDS=2 ép Blue phải review cẩn thận, 
-       chống bệnh duyệt bừa của LLM.
-    3. Conversation Memory (Quay lui dữ liệu - Backtracking): Đầu vào "conversation" không hề bị xóa đi.
-       Lý do: Nếu Phase 3 Execute gặp lỗi (VD. 403 Forbidden), kết quả thất bại được nối vào tail của list
-       và quăng ngược lại Phase 2 Retry. Khi đó 2 Agent đọc hiểu ngay "chiến lược 1 thất bại", tự giác 
-       chuyển hướng sang chiến lược 2, không lặp lại lỗi ngớ ngẩn (cắn vào ngõ cụt).
-
-    Args:
-        target_url: URL target.
-        recon_content: Noi dung recon.md.
-        exec_agent: ExecAgent instance (shared across phases).
-        red: RedTeamAgent instance (shared across retries).
-        conversation: Conversation (co the co history/log loi tu retry truoc).
-
-    Returns:
-        (approved_workflow, conversation, round_num)
-
-    Raises:
-        RuntimeError: neu het rounds ma khong duoc approve.
-    """
-    print(f"\n{C}{B}{'='*60}")
-    print(f"  PHASE 2: RED vs BLUE DEBATE")
-    print(f"{'='*60}{RST}\n")
-
-    from agents.blue_team import BlueTeamAgent
-
-    blue = BlueTeamAgent(target_url=target_url, recon_context=recon_content)
-
-    # ── Simple state machine ──
-    # Flow: RED → BLUE → (cai nhau cho den khi APPROVED)
-    # Ca RED va BLUE deu co the goi [AGENT] bat ky luc nao.
-    # Agent tra ket qua ve → quyen noi tra lai cho nguoi da goi Agent.
-    # 1 round = RED da noi + BLUE da noi (Agent khong tinh).
-    round_num = 0
-    red_spoke = False
-    blue_spoke = False
-    next_turn = "REDTEAM"
-    last_caller = "REDTEAM"    # ai goi Agent → Agent tra ve cho nguoi do
-
-    for step in range(MAX_DEBATE_STEPS):
-
-        # ── RED TEAM ──
-        if next_turn == "REDTEAM":
-            # Neu ca Red va Blue da noi → hoan thanh 1 round
-            if red_spoke and blue_spoke:
-                round_num += 1
-                red_spoke = False
-                blue_spoke = False
-
-            if round_num >= MAX_ROUNDS:
-                print(f"{R}[!] Het {MAX_ROUNDS} rounds — REJECTED.{RST}")
-                raise RuntimeError(
-                    f"Debate het {MAX_ROUNDS} rounds ma khong duoc approve."
-                )
-
-            print(f"\n{R}{B}══ RED TEAM — Round {round_num + 1}/{MAX_ROUNDS} ══{RST}")
-
-            response = red.respond(conversation)
-            tag = extract_next_tag(response)
-            conversation.append({
-                "speaker": "REDTEAM",
-                "content": f"[REDTEAM]: {response}",
-            })
-            print(f"{R}{strip_tag(response)}{RST}")
-            red_spoke = True
-
-            if tag == "AGENT":
-                last_caller = "REDTEAM"
-                next_turn = "AGENT"
-            else:
-                next_turn = "BLUETEAM"
-
-        # ── BLUE TEAM ──
-        elif next_turn == "BLUETEAM":
-            print(f"\n{C}{B}══ BLUE TEAM — Review ══{RST}")
-
-            response = blue.respond(conversation)
-            tag = extract_next_tag(response)
-            conversation.append({
-                "speaker": "BLUETEAM",
-                "content": f"[BLUETEAM]: {response}",
-            })
-            print(f"{C}{strip_tag(response)}{RST}")
-            blue_spoke = True
-
-            if tag == "APPROVED":
-                if round_num + 1 < MIN_DEBATE_ROUNDS:
-                    # Chua du round toi thieu — ep Blue phai review them
-                    print(f"\n{Y}{B}[GUARDRAIL] Round {round_num + 1}/{MIN_DEBATE_ROUNDS} "
-                          f"— chua du round toi thieu, ep tiep tuc debate.{RST}")
-                    conversation.append({
-                        "speaker": "SYSTEM",
-                        "content": (
-                            "[SYSTEM]: Chua du so round toi thieu. "
-                            "Ban can dat them cau hoi verify hoac yeu cau "
-                            "Red Team lam ro them truoc khi approve. "
-                            "Hay tiep tuc review."
-                        ),
-                    })
-                    next_turn = "BLUETEAM"
-                else:
-                    print(f"\n{G}{B}══ APPROVED ══{RST}")
-                    workflow = _extract_last_workflow(conversation)
-                    return workflow, conversation, round_num + 1
-            elif tag == "AGENT":
-                last_caller = "BLUETEAM"
-                next_turn = "AGENT"
-            else:
-                next_turn = "REDTEAM"
-
-        # ── AGENT (culi) — ai goi thi tra ve nguoi do ──
-        elif next_turn == "AGENT":
-            caller_name = "Red Team" if last_caller == "REDTEAM" else "Blue Team"
-            print(f"\n{G}{B}[AGENT] Dang xu ly cho {caller_name}...{RST}")
-
-            raw = exec_agent.answer(conversation, caller=last_caller)
-            data = extract_send_block(raw) or raw
-            conversation.append({
-                "speaker": "AGENT",
-                "content": f"[AGENT]: {data}",
-            })
-            print(f"{G}{strip_tag(raw)}{RST}")
-
-            # Tra quyen noi ve cho nguoi da goi Agent
-            next_turn = last_caller
-
-    # Het MAX_DEBATE_STEPS
-    raise RuntimeError(
-        f"Debate het {MAX_DEBATE_STEPS} steps ma khong duoc approve."
+    hunter = VulnHunterAgent(
+        run_dir        = run_dir,
+        target_url     = target_url,
+        recon_md_path  = recon_path,
+        crawl_data_path = str(crawler_data) if crawler_data.exists() else "",
     )
+    bugs = hunter.run()
+    print(f"\n{G}[+] VulnHunter hoan tat: {len(bugs)} bugs identified{RST}")
 
-
-def _extract_last_workflow(conversation: list[dict]) -> str:
-    """Tim workflow/chien luoc tu message Red Team gan nhat.
-
-    Scan nguoc conversation, tim message cua REDTEAM co chua:
-    - "CHIEN LUOC" / "WORKFLOW" / "ATTACK PLAN" / numbered steps
-    - Lay toan bo noi dung cua message do
-    """
-    for msg in reversed(conversation):
-        if msg["speaker"] != "REDTEAM":
-            continue
-        content = msg["content"]
-        # Tim dau hieu co chien luoc
-        lower = content.lower()
-        if any(kw in lower for kw in [
-            "chiến lược", "chien luoc", "workflow", "attack plan",
-            "bước 1", "buoc 1", "step 1",
-        ]):
-            # Xoa prefix [REDTEAM]: va tag cuoi
-            clean = content
-            if clean.startswith("[REDTEAM]:"):
-                clean = clean[len("[REDTEAM]:"):].strip()
-            return strip_tag(clean)
-    # Fallback: lay message Red cuoi cung
-    for msg in reversed(conversation):
-        if msg["speaker"] == "REDTEAM":
-            clean = msg["content"]
-            if clean.startswith("[REDTEAM]:"):
-                clean = clean[len("[REDTEAM]:"):].strip()
-            return strip_tag(clean)
-    raise RuntimeError("Khong tim thay workflow tu Red Team.")
-
-
-# ═════════════════════════════════════════════════════════════
-# PHASE 3: EXECUTION  (Agent thuc thi workflow)
-# ═════════════════════════════════════════════════════════════
-
-def phase_execute(
-    exec_agent,
-    workflow: str,
-    conversation: list[dict],
-) -> str:
-    """Agent thuc thi approved workflow bang MCP tools.
-
-    Returns:
-        exec_report: bao cao thuc thi tu Agent.
-    """
-    print(f"\n{C}{B}{'='*60}")
-    print(f"  PHASE 3: EXECUTION")
-    print(f"{'='*60}{RST}\n")
-
-    print(f"{G}{B}[AGENT] Dang thuc thi workflow...{RST}\n")
-
-    raw = exec_agent.run_workflow(workflow, conversation)
-    exec_report = extract_send_block(raw) or raw
-
-    conversation.append({
-        "speaker": "AGENT",
-        "content": f"[AGENT EXEC]: {exec_report}",
-    })
-    print(f"{G}{strip_tag(raw)}{RST}")
-
-    return exec_report
-
-
-# ═════════════════════════════════════════════════════════════
-# PHASE 4: EVALUATION  (Red danh gia ket qua)
-# ═════════════════════════════════════════════════════════════
-
-def phase_evaluate(
-    red,
-    exec_agent,
-    exec_report: str,
-    conversation: list[dict],
-) -> tuple[str, str, str]:
-    """Red Team danh gia ket qua thuc thi.
-
-    Red co the:
-    - [DONE] → hai long, ket thuc
-    - [BLUETEAM] → de xuat chien luoc moi → quay lai debate
-    - [AGENT] → hoi Agent verify (read_only mode) → roi danh gia lai
-
-    Returns:
-        (verdict, final_analysis, enriched_exec_report)
-        - verdict: "SUCCESS" hoac "RETRY"
-        - final_analysis: Red's evaluation text
-        - enriched_exec_report: exec_report goc + agent verification data (neu co)
-    """
-    print(f"\n{C}{B}{'='*60}")
-    print(f"  PHASE 4: EVALUATION")
-    print(f"{'='*60}{RST}\n")
-
-    # ── Switch Red sang eval mode: system prompt moi, buoc doc evidence ──
-    red.switch_to_eval_mode(exec_report)
-
-    # Inject exec_report vao conversation de Red THAY ket qua
-    conversation.append({
-        "speaker": "SYSTEM",
-        "content": (
-            "[SYSTEM — KET QUA THUC THI]\n"
-            "Day la ket qua thuc thi tu Agent. "
-            "Hay doc ky va danh gia dua tren evidence thuc te.\n\n"
-            f"{exec_report}"
-        ),
-    })
-
-    # Collect agent verification data de append vao exec_report
-    agent_verification_parts: list[str] = []
-
-    max_eval_steps = 5
-    for _ in range(max_eval_steps):
-        print(f"\n{R}{B}══ RED TEAM — Danh gia ket qua ══{RST}")
-
-        response = red.respond(conversation)
-        tag = extract_next_tag(response)
-
-        conversation.append({
-            "speaker": "REDTEAM",
-            "content": f"[REDTEAM]: {response}",
-        })
-        print(f"{R}{strip_tag(response)}{RST}")
-
-        if tag == "DONE":
-            enriched = _enrich_exec_report(exec_report, agent_verification_parts)
-            return "SUCCESS", strip_tag(response), enriched
-        elif tag == "AGENT":
-            # Red hoi Agent verify — READ_ONLY mode (khong cho exploit lai)
-            print(f"\n{G}{B}[AGENT] Dang verify cho Red Team (read-only)...{RST}")
-            raw = exec_agent.answer(conversation, caller="REDTEAM",
-                                    read_only=True)
-            data = extract_send_block(raw) or raw
-            agent_verification_parts.append(data)
-            conversation.append({
-                "speaker": "AGENT",
-                "content": f"[AGENT]: {data}",
-            })
-            print(f"{G}{strip_tag(raw)}{RST}")
-            continue
-        elif tag == "BLUETEAM":
-            # Red muon de xuat chien luoc moi → can debate lai
-            enriched = _enrich_exec_report(exec_report, agent_verification_parts)
-            return "RETRY", strip_tag(response), enriched
-        else:
-            # Khong ro → coi nhu DONE
-            enriched = _enrich_exec_report(exec_report, agent_verification_parts)
-            return "SUCCESS", strip_tag(response), enriched
-
-    enriched = _enrich_exec_report(exec_report, agent_verification_parts)
-    return "SUCCESS", strip_tag(response), enriched
-
-
-def _enrich_exec_report(
-    exec_report: str,
-    agent_parts: list[str],
-) -> str:
-    """Noi exec_report goc voi agent verification data."""
-    if not agent_parts:
-        return exec_report
-    separator = "\n\n--- AGENT VERIFICATION (Phase 4) ---\n\n"
-    return exec_report + separator + "\n\n".join(agent_parts)
-
-
-# ═════════════════════════════════════════════════════════════
-# PHASE 5: REPORT
-# ═════════════════════════════════════════════════════════════
-
-def phase_report(
-    target_url: str,
-    verdict: str,
-    workflow: str,
-    exec_report: str,
-    red_evaluation: str,
-    debate_rounds: int,
-    run_dir: str,
-):
-    """Luu report cuoi cung ra file."""
-    print(f"\n{C}{B}{'='*60}")
-    print(f"  PHASE 5: REPORT")
-    print(f"{'='*60}{RST}\n")
-
-    icon = "✅" if verdict == "SUCCESS" else "❌"
-    print(f"{B}Target:{RST}  {target_url}")
-    print(f"{B}Verdict:{RST} {icon} {verdict}")
-    print(f"{B}Debate rounds:{RST} {debate_rounds}")
-
-    if exec_report:
-        print(f"\n{B}Execution Output (truncated):{RST}")
-        print(exec_report[:3000])
-
-    # ── Save file ──
-    report_path = Path(run_dir) / "report.md"
-
-    report_md = f"""# MARL Penetration Test Report
-**Target:** {target_url}
-**Verdict:** {icon} {verdict}
-**Debate rounds:** {debate_rounds}
-
-## Approved Attack Workflow
-{workflow}
-
-## Execution Report
-```
-{exec_report or "N/A"}
-```
-
-## Red Team Evaluation
-{red_evaluation}
-"""
-    report_path.write_text(report_md, encoding="utf-8")
-    print(f"\n{G}[+] Report saved: {report_path.resolve()}{RST}")
+    print(f"\n{G}[+] Recon + VulnHunter hoan tat{RST}")
+    return target_url, recon_path, recon_content
 
 
 # ═════════════════════════════════════════════════════════════
@@ -571,17 +392,21 @@ def phase_report(
 def main():
     banner()
 
-    user_prompt = get_user_prompt()
+    args = parse_cli_args()
+    workspace_mode = get_workspace_mode(args)
+    user_prompt = get_user_prompt(args.prompt)
 
     # ── Parse target URL to create per-target workspace dir ──
     target_url_early, _ = parse_prompt(user_prompt)
     if not target_url_early:
         print(f"{R}[!] Khong tim thay URL trong prompt.{RST}")
         return
-    run_dir = _make_run_dir(target_url_early)
+    run_dir = _make_run_dir(target_url_early, workspace_mode)
 
     # ── Setup logging — mirror all console output to run_dir/marl.log ──
     log_path = setup_logging(run_dir)
+    _quiet_third_party_logging()
+    print(f"{G}[+] Workspace mode: {workspace_mode}{RST}")
     print(f"{G}[+] Run directory: {run_dir}{RST}")
     print(f"{G}[+] Logging to: {log_path}{RST}\n")
 
@@ -592,79 +417,26 @@ def main():
         print(f"\n{R}[!] Recon failed: {e}{RST}")
         return
 
-    # ── Phase 2–4: Debate → Execute → Evaluate (loop) ──
-    exec_agent = None
+    # ── Phase 2–5: ManageAgent điều phối toàn bộ ──
     try:
-        from agents.exec_agent import ExecAgent
-        from agents.red_team import RedTeamAgent
+        from agents.manage_agent import ManageAgent
 
-        exec_agent = ExecAgent(
-            working_dir=run_dir,
-            target_url=target_url,
-            recon_md=recon_path,
-        )
-
-        red = RedTeamAgent(target_url=target_url, recon_context=recon_content)
         conversation: list[dict] = [
             {"speaker": "USER", "content": f"[USER]: {user_prompt}"},
         ]
-        verdict = "REJECTED"
-        workflow = ""
-        exec_report = ""
-        red_evaluation = ""
-        total_debate_rounds = 0
 
-        for attempt in range(1, MAX_EXEC_RETRIES + 2):
-            if attempt > 1:
-                print(f"\n{Y}{B}══ RETRY #{attempt - 1} — Red de xuat chien luoc"
-                      f" moi ══{RST}")
-
-            # Phase 2: Debate (conversation duoc giu lai giua retries)
-            workflow, conversation, round_num = phase_debate(
-                target_url, recon_content,
-                exec_agent, red, conversation,
-            )
-            total_debate_rounds += round_num
-
-            # Phase 3: Execute
-            exec_report = phase_execute(exec_agent, workflow, conversation)
-
-            # Phase 4: Evaluate
-            verdict, red_evaluation, exec_report = phase_evaluate(
-                red, exec_agent, exec_report, conversation,
-            )
-
-            if verdict == "SUCCESS":
-                break
-            elif verdict == "RETRY" and attempt <= MAX_EXEC_RETRIES:
-                print(f"\n{Y}[!] Red Team muon thu chien luoc moi.{RST}")
-                continue
-            else:
-                break
-
-        # Phase 5: Report
-        phase_report(
-            target_url=target_url,
-            verdict=verdict,
-            workflow=workflow,
-            exec_report=exec_report,
-            red_evaluation=red_evaluation,
-            debate_rounds=total_debate_rounds,
-            run_dir=run_dir,
+        manager = ManageAgent(
+            target_url    = target_url,
+            recon_content = recon_content,
+            run_dir       = run_dir,
         )
+        manager.run(conversation)
 
-    except RuntimeError as e:
-        print(f"\n{R}[!] Pipeline: {e}{RST}")
     except Exception as e:
         print(f"\n{R}[!] Pipeline failed: {e}{RST}")
         import traceback
         traceback.print_exc()
     finally:
-        if exec_agent:
-            try:
-                exec_agent.shutdown()
-            except Exception:
-                pass
         print(f"\n{G}[+] Full session log: {log_path}{RST}")
 
 
