@@ -7,7 +7,7 @@ click buttons, submit forms, extract links from HTML + JS.
 
 Key changes from original:
 - run_crawl() sync wrapper runs in separate thread (avoids asyncio conflict with MCPManager)
-- Response body capped at 2000 chars
+- Response body capped at a larger size for richer recon summaries
 - Configurable max_pages/max_depth
 - CLI mode: JSON output to stdout, all logs to stderr
 """
@@ -15,18 +15,18 @@ Key changes from original:
 import argparse
 import asyncio
 import json
-import os
 import re
 import sys
 import threading
 from collections import deque
 from urllib.parse import urljoin, urlparse
-from typing import List, Dict, Any, Set, Optional, Tuple
+from typing import List, Dict, Any, Set, Optional
 
-from playwright.async_api import async_playwright, Page, Request, BrowserContext
+from playwright.async_api import async_playwright, Page, Request
 
 # URLs containing these keywords are never visited (prevent logout/destruction)
 BLACKLISTED_KEYWORDS = ['logout', 'delete', 'signout', 'exit', 'quit', 'destroy', 'remove']
+RESPONSE_BODY_CAPTURE_LIMIT = 12000
 
 # Static file extensions to skip in link extraction (NOT in traffic capture)
 STATIC_EXTENSIONS = (
@@ -93,12 +93,12 @@ class BrowserAgent:
         resp_status = response.status if response else None
         resp_headers = dict(await response.all_headers()) if response else {}
 
-        # Capture response body (capped)
+        # Capture response body (capped, but large enough for recon summaries)
         resp_body = None
         try:
             if response and request.resource_type in ('document', 'xhr', 'fetch', 'script', 'other'):
                 text = await response.text()
-                resp_body = text[:2000] if text else None
+                resp_body = text[:RESPONSE_BODY_CAPTURE_LIMIT] if text else None
         except Exception:
             pass
 
@@ -237,8 +237,8 @@ class BrowserAgent:
     async def _visit(self, page: Page, url: str, visited: Set, queue: deque,
                      visited_actions: Set, seen: Set) -> bool:
         try:
-            await page.goto(url, wait_until="networkidle", timeout=self.timeout)
-            await page.wait_for_timeout(1500)
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
+            await page.wait_for_timeout(2000)  # wait for initial JS/rendering
             visited.add(url)
         except Exception:
             return False
@@ -260,13 +260,13 @@ class BrowserAgent:
             return
         visited_actions.add(key)
         try:
-            await page.goto(action["url"], wait_until="networkidle", timeout=self.timeout)
-            await page.wait_for_timeout(500)
+            await page.goto(action["url"], wait_until="domcontentloaded", timeout=self.timeout)
+            await page.wait_for_timeout(1000)
             el = page.locator(action["selector"])
             if await el.is_hidden() or not await el.is_enabled():
                 return
             await el.click(timeout=5000)
-            await page.wait_for_load_state("networkidle", timeout=self.timeout)
+            await page.wait_for_load_state("domcontentloaded", timeout=self.timeout)
             await page.wait_for_timeout(1500)
             for link in await self._extract_links(page, page.url):
                 if link not in seen and self._should_queue_url(link):
@@ -282,8 +282,8 @@ class BrowserAgent:
             return
         visited_actions.add(key)
         try:
-            await page.goto(action["url"], wait_until="networkidle", timeout=self.timeout)
-            await page.wait_for_timeout(500)
+            await page.goto(action["url"], wait_until="domcontentloaded", timeout=self.timeout)
+            await page.wait_for_timeout(1000)
             form = page.locator(f"form >> nth={action['form_index']}")
 
             # Fill dummy data
@@ -311,8 +311,8 @@ class BrowserAgent:
             else:
                 await page.evaluate("form => form.submit()", await form.element_handle())
 
-            await page.wait_for_load_state("networkidle", timeout=self.timeout)
-            await page.wait_for_timeout(1500)
+            await page.wait_for_load_state("domcontentloaded", timeout=self.timeout)
+            await page.wait_for_timeout(2000)
 
             for link in await self._extract_links(page, page.url):
                 if link not in seen and self._should_queue_url(link):
@@ -444,9 +444,27 @@ def _parse_header(header_str: str) -> tuple[str, str]:
     return key.strip(), value.strip()
 
 
-def _headers_to_cookies(headers: list[str]) -> list[dict]:
-    """Convert -H 'Cookie: name=val; name2=val2' headers to cookie dicts for injection."""
+def _headers_to_cookies(headers: list[str], url: str = "") -> list[dict]:
+    """Convert -H 'Cookie: name=val; name2=val2' headers to Playwright cookie dicts.
+
+    Playwright's context.add_cookies() requires: name, value, domain, path.
+    - domain must NOT have a leading dot (Playwright rejects it for exact match).
+    - domain must be hostname only (no port).
+    - path defaults to '/'.
+    - httpOnly and secure are set to False (safe default for most cases).
+    - If the URL uses HTTPS, secure is set to True.
+    """
     cookies = []
+    # Extract domain (hostname only, no port) and scheme from URL
+    domain = ""
+    is_https = False
+    if url:
+        parsed = urlparse(url)
+        domain = parsed.hostname or parsed.netloc.split(":")[0]
+        is_https = parsed.scheme == "https"
+        # Strip leading dot if present (Playwright needs exact domain, not wildcard)
+        domain = domain.lstrip(".")
+
     for h in headers:
         key, value = _parse_header(h)
         if key.lower() == "cookie":
@@ -457,8 +475,10 @@ def _headers_to_cookies(headers: list[str]) -> list[dict]:
                     cookies.append({
                         "name": name.strip(),
                         "value": val.strip(),
-                        "domain": "",  # filled later from URL
+                        "domain": domain,
                         "path": "/",
+                        "httpOnly": False,
+                        "secure": is_https,
                     })
     return cookies
 
@@ -484,12 +504,8 @@ def main():
     # Parse cookies from -H headers
     inject_cookies = None
     if args.header:
-        cookie_list = _headers_to_cookies(args.header)
+        cookie_list = _headers_to_cookies(args.header, url=args.url)
         if cookie_list:
-            # Fill domain from URL
-            domain = urlparse(args.url).netloc
-            for c in cookie_list:
-                c["domain"] = domain
             inject_cookies = cookie_list
 
     _log(f"[CRAWLER-CLI] Target: {args.url}")
