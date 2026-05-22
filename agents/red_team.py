@@ -80,16 +80,22 @@ Ban KHONG dung tool, KHONG viet curl/code, KHONG viet review dai.
 
 === NGUYEN TAC ===
 - BUG DOSSIER la source of truth. Chi tap trung 1 bug hien tai.
+- Neu co `AUTHORIZED USER CREDENTIALS` trong context, CHI duoc dung dung cac credential do.
+- Khong duoc tu them credential noi tieng cua lab/demo nhu wiener/carlos/admin/administrator neu khong xuat hien trong dossier hoac user prompt.
+- Neu bug can auth nhung `Auth evidence` noi khong co authenticated recon/session verified, ghi `NEEDS_CONTEXT` thay vi viet strategy khai thac.
 - Don gian truoc: baseline -> probe -> verify. Khong them CSRF/state-changing/concurrency neu khong phuc vu core bug.
-- BAC/IDOR read-only: chi can user thuong/guest + status/marker khac biet ro. Khong bat buoc tao/sua/xoa du lieu.
+- BAC/IDOR read-only: phai chung minh object ownership/cross-user access. Public collection leak UserId/comment
+  ma khong chung minh ownership bypass chi la PARTIAL/INFO_EXPOSURE_ONLY.
 - BLF/input validation: test tung bien the it nhat, sau moi action phai doc lai state/message de verify.
 - Neu endpoint/param/context thieu that su, ghi `NEEDS_CONTEXT` va noi dung thieu, khong phong dai plan.
 - Strategy toi da 450 tu. Execution shot plan mac dinh 1 shot single-script; chi dung 2 shots neu bat buoc setup rieng.
 - ANTI-OVERFITTING: khong hardcode endpoint/marker cua mot lab. Endpoint, marker, account, payload phai den tu dossier/recon/current conversation.
 - MINIMUM SUFFICIENT PROOF: chi dat dieu kien thanh cong toi thieu de chung minh hypothesis, khong bat endpoint/tac dong phu.
-- BAC vertical: user thuong/guest thay duoc privileged page/control/admin marker la EXPLOITED; khong bat buoc truy cap them user-list neu hypothesis chi la admin access.
-- IDOR/BAC horizontal: user A doc duoc object/data cua user B la EXPLOITED.
-- BLF/stateful: thao tung duoc state/gia/balance/cart/order theo huong trai logic la EXPLOITED.
+- BAC vertical/admin: user thuong/guest phai thay control/admin API quyen cao that. Status 200, generic Admin,
+  hoac challenge metadata khong du.
+- IDOR/BAC horizontal: user A/guest doc duoc object/data cu the cua user B la EXPLOITED.
+- BLF/stateful: thao tung duoc state/gia/balance/cart/order theo huong trai logic la EXPLOITED, phai co
+  before/after hoac non-zero delta.
 
 === FORMAT BAT BUOC ===
 === CHIEN LUOC ===
@@ -331,6 +337,18 @@ class RedTeamAgent:
         else:
             examples_text = "\n(Không có http_examples trong risk-bug.json cho bug này)"
 
+        auth_evidence = bug.get("auth_evidence") or ""
+        if not auth_evidence:
+            if bug.get("auth_required") and not http_examples:
+                auth_evidence = (
+                    "NO_VERIFIED_AUTH_CONTEXT: bug yêu cầu auth nhưng không có http_examples "
+                    "hoặc authenticated crawl evidence trong dossier."
+                )
+            elif bug.get("auth_required"):
+                auth_evidence = "AUTH_REQUIRED_WITH_LIMITED_EVIDENCE"
+            else:
+                auth_evidence = "ANONYMOUS_OR_MIXED"
+
         bug_text = (
             f"BUG HIEN TAI (tu risk-bug.json):\n"
             f"  ID: {bug.get('id','?')} [{bug.get('pattern_id','?')}]\n"
@@ -339,6 +357,8 @@ class RedTeamAgent:
             f"  Chuc nang endpoint: {bug.get('endpoint_function','?')}\n"
             f"  Auth: {'required' if bug.get('auth_required') else 'anonymous/mixed'}\n"
             f"  Auth observation: {bug.get('auth_observation','?')}\n"
+            f"  Auth evidence: {auth_evidence}\n"
+            f"  Auth credentials needed labels: {', '.join(bug.get('auth_credentials_needed', []) or ['(none)'])}\n"
             f"  Hypothesis: {bug.get('hypothesis','?')}\n"
             f"  Exploit Approach: {bug.get('exploit_approach','?')}\n"
             f"  Verify Method: {bug.get('verify_method','?')}\n"
@@ -380,6 +400,9 @@ class RedTeamAgent:
 
         bug_text += (
             f"{examples_text}\n\n"
+            "AUTHORIZED USER CREDENTIALS:\n"
+            "- Nếu user prompt trong conversation có credentials, chỉ dùng đúng cặp đó.\n"
+            "- Nếu không có credential cụ thể trong conversation/dossier, không tự bịa credential.\n\n"
             f"HAY TAP TRUNG VIEC KHAI THAC BUG NAY. Khong de y den cac bug khac."
         )
         # Replace system prompt — Red sees ONLY bug info + http_examples, no recon_context

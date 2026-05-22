@@ -293,7 +293,26 @@ class CrawlAgent:
 
         # ── Phase 1: Anonymous crawl ──
         print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 1: Anonymous crawl...{RESET}")
-        anon_data = self._run_crawler(url)
+
+        # Detect SPA targets → reduce page limit to avoid timeout
+        is_spa, spa_framework = self._detect_spa(url)
+        crawl_max_pages = 15 if is_spa else 50
+        if is_spa:
+            print(f"{YELLOW}[CRAWL-AGENT] SPA detected ({spa_framework}) — max_pages={crawl_max_pages}{RESET}")
+
+        anon_data = self._run_crawler(url, max_pages=crawl_max_pages)
+
+        # Fallback: if crawler returned no useful data (timeout/empty), try API discovery
+        if not anon_data or not anon_data.get("http_traffic"):
+            print(f"{YELLOW}[CRAWL-AGENT] Crawler trả về rỗng — thử API discovery fallback...{RESET}")
+            fallback_data = self._api_discovery_fallback(url)
+            if fallback_data and fallback_data.get("http_traffic"):
+                print(f"{GREEN}[CRAWL-AGENT] API fallback: {len(fallback_data['http_traffic'])} requests{RESET}")
+                anon_data = fallback_data
+            elif not anon_data:
+                # Retry crawler with very conservative settings
+                print(f"{YELLOW}[CRAWL-AGENT] Retry crawler (max_pages=5, 1 round)...{RESET}")
+                anon_data = self._run_crawler(url, max_pages=5, max_rounds=1, timeout=60)
 
         # ── Phase 2+3: Loop qua từng account ──
         auth_sessions: list[dict] = []
@@ -594,6 +613,173 @@ class CrawlAgent:
         except Exception as e:
             print(f"{RED}[CRAWL-AGENT] Crawler error: {e}{RESET}")
             return None
+
+    # ─── Internal: SPA detection ─────────────────────────────────
+
+    @staticmethod
+    def _detect_spa(url: str) -> tuple[bool, str]:
+        """Detect if target is a Single Page Application (Angular/React/Vue).
+
+        Returns:
+            (is_spa, framework_name)
+        """
+        try:
+            resp = httpx.get(url, timeout=10, follow_redirects=True, verify=False)
+            html = resp.text.lower()
+
+            # Angular
+            if "<app-root" in html or "ng-version" in html:
+                return True, "Angular"
+            # React
+            if '<div id="root"' in html or '<div id="app"' in html or "_reactroot" in html:
+                return True, "React"
+            # Vue
+            if '<div id="app"' in html and ("vue" in html or "v-cloak" in html):
+                return True, "Vue"
+            # Generic SPA detection: very little text content, lots of JS
+            script_count = html.count("<script")
+            text_len = len(resp.text.replace(" ", "").replace("\n", ""))
+            if script_count >= 5 and "<body" in html:
+                body_start = html.find("<body")
+                body_end = html.find("</body>")
+                if body_start >= 0 and body_end > body_start:
+                    body_content = html[body_start:body_end]
+                    # SPA bodies are mostly empty (just a root div + scripts)
+                    non_script = re.sub(r"<script[^>]*>[\s\S]*?</script>", "", body_content)
+                    non_script = re.sub(r"<[^>]+>", "", non_script).strip()
+                    if len(non_script) < 200:
+                        return True, "Generic SPA"
+
+            return False, ""
+        except Exception:
+            return False, ""
+
+    # ─── Internal: API discovery fallback ─────────────────────────
+
+    def _api_discovery_fallback(self, url: str) -> dict | None:
+        """Probe common REST API patterns when browser crawler fails.
+
+        This is a lightweight HTTP-only fallback for SPA targets where the
+        browser crawler times out or returns no useful data.
+        """
+        # Common API prefixes to probe
+        api_prefixes = ["/api/", "/rest/", "/api/v1/", "/api/v2/"]
+        # Common REST endpoints
+        common_endpoints = [
+            # User/Auth
+            "users", "Users", "user", "accounts", "login", "register",
+            "profile", "me",
+            # Products/Commerce
+            "products", "Products", "items", "orders", "Orders",
+            "cart", "basket", "Baskets",
+            # Admin
+            "admin", "config", "configuration", "settings",
+            # Common patterns
+            "categories", "reviews", "feedback", "Feedbacks",
+            "complaints", "Complaints",
+            "recycles", "Recycles",
+            "SecurityQuestions", "SecurityAnswers",
+            "Challenges", "Quantitys",
+        ]
+        # REST-style search/action endpoints
+        rest_endpoints = [
+            "products/search?q=",
+            "admin/application-version",
+            "admin/application-configuration",
+            "languages",
+            "captcha",
+        ]
+
+        traffic = []
+        discovered_urls = set()
+
+        try:
+            with httpx.Client(timeout=8, follow_redirects=True, verify=False) as client:
+                # 1. First check homepage for embedded API hints
+                try:
+                    home_resp = client.get(url)
+                    home_body = home_resp.text
+
+                    # Extract API URLs from JavaScript source
+                    api_patterns = re.findall(
+                        r'["\'](/(?:api|rest)/[^"\'>\s]+)["\']',
+                        home_body, re.IGNORECASE,
+                    )
+                    for path in api_patterns[:20]:
+                        full_url = urljoin(url, path)
+                        if full_url not in discovered_urls:
+                            discovered_urls.add(full_url)
+                except Exception:
+                    pass
+
+                # 2. Probe common API prefixes + endpoints
+                for prefix in api_prefixes:
+                    for endpoint in common_endpoints:
+                        probe_url = urljoin(url, f"{prefix}{endpoint}")
+                        if probe_url in discovered_urls:
+                            continue
+                        discovered_urls.add(probe_url)
+
+                # 3. Probe REST-style endpoints
+                for endpoint in rest_endpoints:
+                    for prefix in ["/rest/", "/api/"]:
+                        probe_url = urljoin(url, f"{prefix}{endpoint}")
+                        if probe_url not in discovered_urls:
+                            discovered_urls.add(probe_url)
+
+                # 4. Actually probe each URL
+                print(f"{DIM}[CRAWL-AGENT] API fallback: probing {len(discovered_urls)} endpoints...{RESET}")
+                for probe_url in sorted(discovered_urls):
+                    try:
+                        resp = client.get(probe_url)
+                        content_type = resp.headers.get("content-type", "")
+                        body = None
+                        if resp.status_code < 400:
+                            body = resp.text[:12000] if resp.text else None
+
+                        traffic.append({
+                            "method": "GET",
+                            "url": str(resp.url),
+                            "headers": dict(resp.request.headers),
+                            "postData": None,
+                            "response_status": resp.status_code,
+                            "response_headers": dict(resp.headers),
+                            "resource_type": "xhr" if "json" in content_type else "document",
+                            "response_body": body,
+                            "parent_url": url,
+                            "form_fields": None,
+                        })
+                    except Exception:
+                        pass
+
+                # Extract cookies
+                cookies = []
+                domain = urlparse(url).netloc
+                for cookie in client.cookies.jar:
+                    cookies.append({
+                        "name": cookie.name,
+                        "value": cookie.value,
+                        "domain": domain,
+                        "path": cookie.path or "/",
+                    })
+
+        except Exception as e:
+            print(f"{YELLOW}[CRAWL-AGENT] API fallback error: {e}{RESET}")
+            return None
+
+        if not traffic:
+            return None
+
+        # Filter out 404s — only keep endpoints that actually exist
+        useful_traffic = [t for t in traffic if t.get("response_status") and t["response_status"] < 404]
+        print(f"{GREEN}[CRAWL-AGENT] API fallback: {len(useful_traffic)} live endpoints found "
+              f"(out of {len(traffic)} probed){RESET}")
+
+        return {
+            "http_traffic": useful_traffic,
+            "cookies": cookies,
+            "external_links": [],
+        }
 
     @staticmethod
     def _auth_crawl_verified(anon_data: dict | None, auth_data: dict | None) -> bool:

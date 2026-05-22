@@ -3,6 +3,14 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Project runtime outputs
+workspace/
+*.har
+cookiejar*.txt
+cookies.txt
+step*.txt
+.playwright-mcp/
+
 # C extensions
 *.so
 
@@ -149,6 +157,7 @@ activemq-data/
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/

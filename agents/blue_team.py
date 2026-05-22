@@ -98,8 +98,9 @@ Ban KHONG doi viet code/curl, nhung PHAI bat Red cu the hoa endpoint, auth, para
 - APPROVED khi strategy chung minh duoc hypothesis toi thieu; khong yeu cau endpoint/tac dong phu neu khong can.
 - REJECT neu Red dat success condition qua nang lam lech hypothesis.
 - BAC vertical: user thuong/guest thay privileged page/control/admin marker la du; khong bat them user-list neu hypothesis chi la admin access.
-- IDOR/BAC horizontal: user A doc duoc object/data cua user B la du.
-- BLF/stateful: can before/after state, delta, hoac state transition trai logic.
+- BAC-01/admin: can control/admin API quyen cao that; status 200/generic admin/challenge metadata khong du.
+- IDOR/BAC horizontal: user A/guest phai doc duoc object/data cu the cua user B; public list leak UserId/comment chi la INFO_EXPOSURE_ONLY.
+- BLF/stateful: can before/after state, non-zero delta, hoac state transition trai logic da verify.
 
 === TIMELINE MOI BUG ===
 1. propose exploit approach cho BUG-XXX
@@ -125,6 +126,10 @@ Ban KHONG doi viet code/curl, nhung PHAI bat Red cu the hoa endpoint, auth, para
 9. Bug stateful/chaining/BLF ma shot plan khong chia baseline/action/verify hoac khong noi artifact/marker cho shot sau.
 10. Shot verify khong co stop condition ro: marker rong, parse fail, khong co delta/state change thi khong duoc EXPLOITED.
 11. Over-verify: bat them endpoint/tac dong phu khong can thiet de chung minh hypothesis.
+12. Bug `Auth Required: True` nhưng không có HTTP Examples, không có authenticated recon/session evidence, hoặc Red dùng credential không xuất hiện trong user prompt/dossier.
+13. Strategy dựa trên metadata lab như `/api/Challenges` chỉ vì response có tên challenge/admin marker, nhưng không chứng minh endpoint/chức năng BAC/BLF thực tế.
+14. BAC-03/IDOR strategy chỉ chứng minh public collection/info leak, không chứng minh object ownership bypass/cross-user access.
+15. BAC-01/admin strategy chỉ kiểm tra status 200/generic admin text, không chứng minh control/admin API cụ thể.
 
 === DIEU DUOC PHEP APROVED ===
 1. Mo ta DUNG bản chất bug (VD: "backend không verify ownership khi user truy cap product cua user khac")
@@ -230,6 +235,18 @@ class BlueTeamAgent:
         else:
             examples_text = "\n(Không có http_examples trong risk-bug.json cho bug này)"
 
+        auth_evidence = bug.get("auth_evidence") or ""
+        if not auth_evidence:
+            if bug.get("auth_required") and not http_examples:
+                auth_evidence = (
+                    "NO_VERIFIED_AUTH_CONTEXT: auth_required=true nhưng không có http_examples "
+                    "hoặc authenticated crawl/session evidence."
+                )
+            elif bug.get("auth_required"):
+                auth_evidence = "AUTH_REQUIRED_WITH_LIMITED_EVIDENCE"
+            else:
+                auth_evidence = "ANONYMOUS_OR_MIXED"
+
         bug_str = (
             f"ID: {bug.get('id', '?')}\n"
             f"Pattern: {bug.get('pattern_id', '?')}\n"
@@ -239,6 +256,8 @@ class BlueTeamAgent:
             f"Endpoint Function: {bug.get('endpoint_function', '?')}\n"
             f"Auth Required: {bug.get('auth_required', False)}\n"
             f"Auth Observation: {bug.get('auth_observation', '?')}\n"
+            f"Auth Evidence: {auth_evidence}\n"
+            f"Auth Credential Labels Needed: {', '.join(bug.get('auth_credentials_needed', []) or ['(none)'])}\n"
             f"Hypothesis: {bug.get('hypothesis', '?')}\n"
             f"Exploit Approach: {bug.get('exploit_approach', '?')}\n"
             f"Verify Method: {bug.get('verify_method', '?')}\n"

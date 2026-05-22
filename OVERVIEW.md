@@ -163,8 +163,8 @@ Playwright BFS crawler, chạy như CLI subprocess (JSON ra stdout, logs ra stde
 LLM đóng vai chiến lược gia tấn công. Không có MCP tools — chỉ suy nghĩ và viết chiến lược.
 
 **Chế độ hoạt động:**
-- **Debate mode** (Phase 2): Phân tích recon, viết attack workflow theo format chuẩn, gửi Blue review
-- **Eval mode** (Phase 4): Đọc execution report, ra verdict SUCCESS/FAIL/RETRY
+- Phân tích bug dossier + recon, viết strategy ngắn và execution shot plan để Blue review.
+- Strategy phải kèm điều kiện verify tối thiểu để Exec tự kiểm chứng trong exploit script.
 
 **Format chiến lược bắt buộc:**
 ```
@@ -179,6 +179,9 @@ Buoc 1: <mô tả hành động>
   Expect: <kết quả mong đợi>
 ...
 Buoc N (VERIFY): <cách xác nhận thành công>
+=== EXECUTION SHOT PLAN ===
+Shot 1: <baseline/probe/verify tối thiểu>
+=== END EXECUTION SHOT PLAN ===
 === KET THUC CHIEN LUOC ===
 ```
 
@@ -188,12 +191,12 @@ Buoc N (VERIFY): <cách xác nhận thành công>
 
 ### `agents/blue_team.py` — BlueTeamAgent
 
-LLM đóng vai security reviewer. Không có MCP tools — chỉ review và hỏi Agent.
+LLM đóng vai security reviewer. Không có MCP tools — chỉ review strategy/shot plan của Red trước khi Exec chạy.
 
 **Quy tắc bắt buộc:**
-- Round 1: **LUÔN REJECT** — đặt ít nhất 2 câu hỏi/yêu cầu cụ thể
-- Round 2+: Approve nếu đủ điều kiện, reject nếu vẫn thiếu
-- Chỉ 1 tag duy nhất mỗi message: `[AGENT]`, `[REDTEAM]`, hoặc `[APPROVED]`
+- Approve nếu strategy đủ rõ, khả thi và có verify condition tối thiểu.
+- Reject nếu strategy thiếu endpoint/payload/session/điều kiện thành công.
+- Không review evidence sau Exec; Manager sẽ đọc Exec verdict/artifact để quyết định.
 
 **Model:** `MARL_BLUE_MODEL` (default: `gpt-5-mini`)
 
@@ -201,20 +204,19 @@ LLM đóng vai security reviewer. Không có MCP tools — chỉ review và hỏ
 
 ### `agents/exec_agent.py` — ExecAgent
 
-LLM thực thi — có đầy đủ 5 MCP tools. Nhận lệnh từ Red/Blue, dùng tools để làm việc.
+LLM thực thi — có đầy đủ MCP tools. Nhận strategy đã được Blue approve từ Manager và sinh Python exploit.
 
-**4 chế độ hoạt động:**
+**Chế độ hoạt động chính:**
 
 | Method | Dùng khi | System prompt |
 |--------|----------|---------------|
-| `answer()` | Red/Blue hỏi câu hỏi về target | `ANSWER_SYSTEM_PROMPT` |
-| `answer(read_only=True)` | Red verify kết quả (Phase 4) | `VERIFY_SYSTEM_PROMPT` |
-| `execute()` | Chạy PoC Python script | `EXECUTE_SYSTEM_PROMPT` |
-| `run_workflow()` | Thực thi attack workflow | `WORKFLOW_SYSTEM_PROMPT` |
+| `run_workflow()` | Thực thi strategy đã approve | `WORKFLOW_SCRIPT_PROMPT` |
+| `answer()` | Hỏi raw fact về target khi cần debug/manual | `ANSWER_SYSTEM_PROMPT` |
+| `execute()` | Legacy: chạy PoC Python script có sẵn | `EXECUTE_SYSTEM_PROMPT` |
 
 **MCP tools dùng:** `shell`, `fetch`, `filesystem`, `playwright`, `web_search` (5 tools)
 
-**Output format:** Kết quả trong `=========SEND=========...=========END-SEND=========` block + routing tag cuối.
+**Output format:** Kết quả trong `=========SEND=========...=========END-SEND=========` block. Script exploit tự in `SHOT_RESULT`, `EVIDENCE_SUMMARY`, `VERIFY_COMPLETED`, `FINAL`.
 
 **Model:** `MARL_EXECUTOR_MODEL` (default: `gpt-4.1`)
 
@@ -411,55 +413,40 @@ Phase 2: DEBATE
 ```
 Phase 3: EXECUTION
 ├── ExecAgent.run_workflow(approved_workflow, conversation)
-│   ├── System prompt: WORKFLOW_SYSTEM_PROMPT (step-by-step executor)
-│   ├── Agent đọc workflow → thực thi từng bước bằng MCP tools:
-│   │   ├── browser_navigate → đến trang login
-│   │   ├── browser_fill_form + browser_click → đăng nhập
-│   │   ├── browser_evaluate("() => document.cookie") → lấy session cookie
-│   │   ├── execute_command("curl -s -b 'session=...' POST data ...") → tấn công
-│   │   └── Ghi raw HTTP status + response body mỗi bước
+│   ├── Chuẩn bị session/cookie từ crawl artifact hoặc login deterministic
+│   ├── Sinh 1 Python exploit theo strategy đã được Blue approve
+│   ├── Script tự chạy baseline/probe/verify cần thiết
+│   ├── Script in SHOT_RESULT / EVIDENCE_SUMMARY / FINAL
+│   └── Lưu raw request/response/result.json vào exploit_state/<BUG>/
 │   │
-│   └── Output trong SEND block: execution report (từng bước + evidence)
+│   └── Output trong SEND block: script path + execution output + evidence
 │
-└── exec_report lưu vào conversation + Phase 4
+└── exec_report lưu vào conversation + Manager decision
 ```
 
-**Agent không được:**
-- Dùng `fetch()` cho authenticated requests (stateless, không có cookie)
-- Thay đổi hay viết lại PoC script
-- Diễn giải kết quả — chỉ ghi raw facts
+**Agent cần làm:**
+- Dùng cookie/session đã có nếu workflow cần auth
+- Ghi evidence tối thiểu gắn với hypothesis của bug
+- Không hardcode endpoint/marker của riêng một lab; phải lấy từ recon, dossier và strategy hiện tại
+- Nếu evidence đã đủ chứng minh BAC/BLF thì in `FINAL: EXPLOITED`
 
 ---
 
-### Phase 4: EVALUATION (~2–5 phút)
+### Phase 4: MANAGER DECISION (~1–2 phút)
 
 ```
-Phase 4: EVALUATION
-├── Red Team switch sang eval mode (RED_EVAL_PROMPT)
-├── Inject exec_report vào conversation
+Phase 4: MANAGER DECISION
+├── Manager đọc Exec SEND block
+├── Manager đọc result.json / FINAL / SUCCESS / evidence summary
 │
-└── Evaluation Loop (tối đa 5 steps)
-    ├── [RED TEAM] đọc execution report → ra verdict
-    │   ├── [DONE] + SUCCESS: exploit thành công, có evidence rõ ràng
-    │   ├── [DONE] + FAIL: đã thử hết cách, không khai thác được
-    │   ├── [AGENT] → verify read-only (chỉ GET, không POST/exploit mới)
-    │   └── [BLUETEAM] → muốn retry với chiến lược mới
-    │
-    ├── Nếu [AGENT]: ExecAgent.answer(read_only=True)
-    │   ├── System prompt: VERIFY_SYSTEM_PROMPT
-    │   ├── Chỉ được: GET requests, browser_navigate, browser_snapshot
-    │   └── KHÔNG được: POST, form submit, login, exploit
-    │
-    └── Kết thúc:
-        ├── verdict = "SUCCESS" hoặc "FAIL" → Phase 5
-        └── verdict = "RETRY" → quay lại Phase 2 (tối đa MAX_EXEC_RETRIES lần)
+└── Quyết định:
+    ├── EXPLOITED  → NEXT_BUG
+    ├── SCRIPT_ERROR/PARTIAL → RETRY_EXEC tối đa 1 lần
+    └── FAILED/NO_SIGNAL → STOP_BUG
 ```
 
 **Mục tiêu tối cao của Phase 4:**
-Giải quyết bài toán "Ai là người kiểm chứng việc hack có thực sự thành công hay không?" (Tránh tình trạng AI bị ảo giác, thấy HTTP 200 OK là vội kết luận đã hack được dù CSDL chưa hề thay đổi).
-- **RED TEAM (Giám khảo):** Lúc này Red Team bị tước quyền "Lên chiến lược", bị ép chuyển sang Eval Mode (`RED_EVAL_PROMPT`). Nhiệm vụ duy nhất của nó là **đọc chuỗi Log (mã HTML, JSON trả về...)** từ Phase 3 và phân tích xem tấn công có thực sự thành công không.
-- **EXEC AGENT (Người xác minh):** Nếu Red Team thấy Log báo thành công nhưng chưa tin (ví dụ: Log báo đổi giá giỏ hàng thành công, nhưng chưa biết giá thật sự đã đổi chưa), Red sẽ gọi Agent đi xác minh. Lúc này Agent bị khóa tay bằng **Read-Only Mode** (chỉ được GET, xem trang, tuyệt đối không được POST/Click tấn công thêm). Agent lăng xăng đi load lại trang, đọc giá tiền mang về cho Red.
-- **XUẤT REPORT:** Cuối cùng, toàn bộ phán quyết (Verdict: SUCCESS/FAIL/RETRY) ở bước này hoàn toàn do mớ logic phân tích "bằng chứng thép" của LLM Red Team quyết định. Report cuối cùng (Phase 5) sẽ trích xuất thẳng những nhận xét này.
+Giữ pipeline đơn giản và đúng trọng tâm đồ án: Red/Blue debate tạo chiến lược, Exec tự khai thác/tự verify trong exploit, Manager quyết định điều phối. Hệ thống ưu tiên proof tối thiểu đủ cho hypothesis để tránh overfitting vào một lab cụ thể. Vì vậy có thể chấp nhận false positive cao hơn, nhưng đổi lại agent không bị kẹt vì đòi thêm endpoint/tác động phụ không cần thiết.
 
 ---
 
@@ -467,13 +454,13 @@ Giải quyết bài toán "Ai là người kiểm chứng việc hack có thực
 
 ```
 Phase 5: REPORT
-├── In tóm tắt ra console: target, verdict, debate rounds
+├── In tóm tắt ra console: target, số bug, trạng thái từng bug
 ├── Tạo workspace/report.md gồm:
-│   ├── Target URL + Verdict (✅ SUCCESS / ❌ FAIL)
-│   ├── Số debate rounds
-│   ├── Approved Attack Workflow (chiến lược đã được Blue duyệt)
-│   ├── Execution Report (output từ Agent thực thi)
-│   └── Red Team Evaluation (nhận xét cuối cùng)
+│   ├── Finding exploited nếu có
+│   ├── Strategy đã được Blue duyệt
+│   ├── PoC Python script / artifact paths
+│   ├── Execution evidence từ Exec
+│   └── Bug chưa khai thác được / false positive
 └── In đường dẫn log file ra console
 ```
 
@@ -636,6 +623,137 @@ Tất cả system prompts đều có section **CHỐNG AO TƯỞNG** bắt buộ
 
 ---
 
+## [v3] Multi-account Crawl + LLM Prompt Parsing
+
+> **Ngày:** 2026-04-18  
+> **Trạng thái:** Đã tích hợp
+
+---
+
+### Vấn đề của v2
+
+`parse_prompt()` dùng regex cứng chỉ lấy được **1 cặp credentials**. CrawlAgent chỉ login 1 account, authenticated crawl 1 lần. Hệ quả:
+- Không thể phát hiện **Horizontal Privilege Escalation** (User A xem data của User B)
+- Không thể kiểm tra **IDOR chéo tài khoản** (cần session của 2 user khác nhau)
+- Tỷ lệ phát hiện BAC cross-account gần 0% trên các bài Lab yêu cầu 2 accounts
+
+---
+
+### Giải pháp v3
+
+Thay regex parse bằng **LLM parse** → nhận prompt tự do với bất kỳ số lượng accounts → loop crawl từng account → `recon.md` có section **Session Comparison**.
+
+---
+
+### Luồng mới trong Phase 1 (RECON)
+
+```
+CrawlAgent.run(user_prompt)
+│
+├─ [LLM Parse Prompt]  ← MỚI
+│   └── parse_prompt_llm(prompt, client)
+│       ├── Gọi gpt-5-mini (512 tokens, temperature=0)
+│       ├── Trả về JSON: {url, credentials: [...], focus}
+│       └── Fallback: parse_prompt() regex cũ nếu LLM fail
+│
+├─ [Phase 1: Anonymous crawl]  ← không đổi
+│   └── tools/crawler.py subprocess
+│
+├─ [Phase 2+3: Loop qua từng account]  ← MỚI
+│   ├── for cred in credentials_list:
+│   │   ├── _login(url, cred)  → cookies
+│   │   └── _run_crawler(url, cookie_header)  → auth_data
+│   └── auth_sessions = [{"label", "cookies", "data"}, ...]
+│
+└─ [Phase 4: LLM analysis]
+    ├── Format: ANONYMOUS + mỗi AUTHENTICATED session có label riêng
+    └── RECON_SYSTEM_PROMPT: thêm section Session Comparison
+```
+
+---
+
+### Input format mới (tự do)
+
+LLM hiểu bất kỳ cách diễn đạt nào:
+
+```bash
+# 1 account — format cũ vẫn hoạt động
+python main.py "https://target.com credentials: admin:password"
+
+# 2 accounts — format mới
+python main.py "Test https://target.com tài khoản 1: wiener/peter tài khoản 2: carlos/montoya"
+
+# Có focus
+python main.py "https://target.com account1: admin/abc account2: user/xyz, focus IDOR"
+
+# Tiếng Anh tự do
+python main.py "https://target.com user admin pass secret, also user carlos pass hunter2"
+```
+
+---
+
+### Output mới trong recon.md
+
+**Trước (v2):** 2 section — ANONYMOUS + AUTHENTICATED
+
+**Sau (v3):** N+1 section — ANONYMOUS + mỗi account có header riêng:
+```
+==============================
+AUTHENTICATED CRAWL — account: wiener
+==============================
+[traffic data của wiener...]
+
+==============================
+AUTHENTICATED CRAWL — account: carlos
+==============================
+[traffic data của carlos...]
+```
+
+**Thêm section Session Comparison** (chỉ khi ≥2 accounts):
+```markdown
+## Session Comparison
+| Endpoint | Method | wiener | carlos | Nhận xét BAC |
+|----------|--------|--------|--------|--------------|
+| /api/user/profile | GET | 200 → {id:1} | 200 → {id:2} | Thử wiener xem profile của carlos |
+```
+
+---
+
+### Files thay đổi
+
+#### ✏️ File sửa đổi
+
+| File | Thay đổi |
+|------|---------|
+| `shared/utils.py` | Thêm `TypedDict`: `CredentialEntry`, `ParsedTarget`. Thêm hàm `parse_prompt_llm()` + `_PARSE_SYSTEM_PROMPT`. `parse_prompt()` cũ **giữ nguyên** để backward-compat. |
+| `agents/crawl_agent.py` | `run()` gọi `parse_prompt_llm()` thay parse_prompt(), loop qua `credentials_list`. `_login()` nhận `CredentialEntry` (thêm field `label` cho log). `_analyze()` nhận `auth_sessions: list[dict]` thay vì `auth_data: dict`. `RECON_SYSTEM_PROMPT` thêm Session Comparison section và hướng dẫn multi-account. |
+
+#### 📦 Biến môi trường mới (tuỳ chọn)
+
+| Biến | Default | Ý nghĩa |
+|------|---------|---------|
+| `MARL_PARSER_MODEL` | fallback về `MARL_RED_MODEL` → `gpt-5-mini` | Model dùng cho LLM parse prompt |
+
+---
+
+### Backward compatibility
+
+| Trường hợp | Hành vi |
+|---|---|
+| Prompt 1 account format cũ `"credentials: admin:pass"` | LLM parse → `credentials_list` có 1 phần tử → hoạt động y hệt v2 |
+| Prompt không có credentials | `credentials_list = []` → skip login/auth crawl → chỉ anonymous |
+| LLM parse fail (API down) | Fallback `parse_prompt()` regex → tối đa 1 account, không crash |
+| `main.py` | Không thay đổi gì — vẫn gọi `CrawlAgent.run()` như cũ |
+
+---
+
+### Ghi chú cho đồ án
+
+- Đây là ví dụ **"LLM thay thế regex cứng"** — dùng ngôn ngữ tự nhiên làm interface thay vì bắt user học format.
+- Thay đổi nhỏ về code (2 file) nhưng mở ra toàn bộ khả năng kiểm thử BAC cross-account — một lớp lỗ hổng quan trọng trong PortSwigger Web Security Academy.
+- Chi phí: +1 LLM call nhỏ (512 tokens) ở đầu mỗi pipeline. Không đáng kể so với tổng.
+- `CredentialEntry` và `ParsedTarget` là `TypedDict` → type-safe, dễ mở rộng sau này (ví dụ thêm `role`, `2fa_secret`...).
+
 # 📋 Lịch sử thay đổi kiến trúc
 
 ---
@@ -663,7 +781,7 @@ phase_report(...)
 ```
 
 **Hạn chế:**
-- Thứ tự phase là **cố định** — không thể linh hoạt (ví dụ: VERIFY xen giữa EXECUTE → EVALUATE)
+- Thứ tự phase là **cố định** — không thể linh hoạt khi cần retry Red/Blue/Exec theo lý do lỗi cụ thể
 - Không có ai "hiểu ngữ cảnh" để hướng dẫn agent con trước mỗi bước
 - Retry loop đơn giản: đếm số lần thử, không xét lý do thất bại
 - `main.py` gánh cả orchestration + logging + CLI → quá nhiều trách nhiệm
@@ -708,11 +826,11 @@ python main.py "https://target.com credentials: admin:password"
      │      │         ROUTING theo ACTION tag               │
      │      └──┬──────┬──────┬────────┬────────┬───────────┘
      │         │      │      │        │        │
-     │   DEBATE_RED  DEBATE  VERIFY  EXECUTE  EVALUATE
-     │         │    _BLUE    │        │        │
-     │    RedTeam   BlueTeam  Exec    Exec    RedTeam
-     │    .respond  .respond  .answer .run_   (eval
-     │                       (r-o)   workflow  mode)
+     │   DEBATE_RED  DEBATE_BLUE  EXECUTE_BUG  NEXT_BUG
+     │         │          │             │          │
+     │    RedTeam     BlueTeam       Exec      Manager
+     │    .respond    .respond       .run_     decision
+     │                              workflow
      │         │      │
      │         └──────┘
      │      (round_num tăng khi cả hai đã nói)
@@ -730,12 +848,13 @@ python main.py "https://target.com credentials: admin:password"
 |--------|---------------|----------------------|
 | `DEBATE_RED` | `RedTeamAgent.respond()` | Bắt đầu debate, hoặc Blue vừa reject |
 | `DEBATE_BLUE` | `BlueTeamAgent.respond()` | Red vừa nộp chiến lược |
-| `VERIFY` | `ExecAgent.answer(read_only=False)` | Cần kiểm tra endpoint trước khi execute |
-| `EXECUTE` | `ExecAgent.run_workflow()` | Blue đã approve + đủ min rounds |
-| `EVALUATE` | `RedTeamAgent.respond()` (eval mode) | Exec vừa chạy xong |
-| `RETRY_DEBATE` | *(reset state)* | Red muốn thử chiến lược mới + còn retry |
-| `REPORT_SUCCESS` | `_write_report()` | Red confirm thành công |
-| `REPORT_FAIL` | `_write_report()` | Hết retry hoặc hết rounds |
+| `EXECUTE_BUG` | `ExecAgent.run_workflow()` | Blue đã approve strategy hiện tại |
+| `RETRY_EXEC` | `ExecAgent.run_workflow()` | Script/runtime lỗi hoặc partial, còn retry budget |
+| `RETRY_RED` | `RedTeamAgent.respond()` | Strategy sai hướng hoặc Blue reject |
+| `STOP_BUG` | *(Manager state)* | Candidate không có tín hiệu hoặc hết retry |
+| `NEXT_BUG` | *(Manager state)* | Bug đã exploited hoặc đã stop |
+| `REPORT_SUCCESS` | `_write_report_success()` | Có ít nhất một bug `status=EXPLOITED` |
+| `REPORT_FAIL` | `_write_report_fail()` | Không có bug exploited |
 
 ---
 
@@ -746,7 +865,7 @@ python main.py "https://target.com credentials: admin:password"
 | **Ai quyết định bước tiếp theo?** | `if/elif` cứng trong Python | LLM đọc context, lý luận |
 | **Hướng dẫn agent con** | Không có | Manager inject `<note>` mỗi tick |
 | **Retry logic** | Đếm số lần, không xét lý do | Manager xét toàn bộ context trước khi retry |
-| **Thứ tự phase** | Cố định: 2→3→4→5 | Linh hoạt: VERIFY có thể xen giữa bất kỳ đâu |
+| **Thứ tự phase** | Cố định: 2→3→4→5 | Manager điều phối per-bug theo state Red/Blue/Exec |
 | **Khi LLM fail** | Crash hoặc fallback không kiểm soát | Deterministic fallback trong `_extract_action()` |
 | **main.py** | ~400 dòng, ôm toàn bộ logic | ~80 dòng, chỉ Phase 1 + khởi động ManageAgent |
 | **Guardrail** | Hard-coded rounds/retries | Hard guardrail (Python) + Soft guardrail (LLM-aware) |
@@ -787,9 +906,10 @@ if tag == "APPROVED" and (round_num + 1) < self.min_debate_rounds:
 Nếu LLM không emit action hợp lệ, `_extract_action()` fallback deterministic:
 
 ```
-has_exec=True          → EVALUATE
-has_workflow, no exec  → EXECUTE
-red_spoke=True         → DEBATE_BLUE
+exec_result=EXPLOITED  → NEXT_BUG
+exec_result=PARTIAL    → RETRY_EXEC hoặc STOP_BUG
+has_workflow, no exec  → EXECUTE_BUG
+red_strategy=True      → DEBATE_BLUE
 default                → DEBATE_RED
 ```
 
@@ -839,7 +959,6 @@ Pipeline không bao giờ bị kẹt dù Manager LLM crash hoàn toàn.
 - Chi phí: thêm ~1 LLM call nhỏ (gpt-5-mini, ≤512 tokens) mỗi tick. Với pipeline 20–30 tick, tổng overhead không đáng kể so với các lượt gọi ExecAgent/CrawlAgent.
 
 
-
 - Cho nó một share memory -> Cho việc quản lý task để định danh từng con rồi từng con có thể tham khảo resource thì nó sẽ lấy phần đó về
 - Single gì gì đó nên là sai. Rồi context có thể bị cắt rồi sai => Rồi bỏ sót?
 - Hiện thì con Manage Agent là con quyết định hết các luồng chạy, luồng thực thi.
@@ -849,6 +968,165 @@ Pipeline không bao giờ bị kẹt dù Manager LLM crash hoàn toàn.
 + Tự thu thập playbook -> Framework chung để crawll về và parse định dạng 
 - Kết quả khi chạy ra cuối cùng thì thông số nào? Con số nào được tính => Khóa luận mới cần kết quả (Relative Network). Với ngữ cảnh của tôi thì có thể làm thế nào? Rồi sửa ra sao?...
 - Nếu có 1 số nhược điểm thì có phương pháp nào đó tức là giải quyết research gap nó như thế nào.
-- Sau này chạy được, thực nghiệm được dựa trên số liệu cụ thể.
+- Sau này chạy được, thực nghiệm được dựa trên số liệu cụ thể. 
 
 
+
+Thành phần 1: Shared Memory Store (Context & Persistence)                                                   
+                                                                                                              
+  Ý tưởng: Thay vì 1 flat list conversation, tạo một MemoryStore có cấu trúc, mỗi agent chỉ đọc phần liên quan
+   đến mình.                                                                                                  
+                                                                  
+  workspace/{run_dir}/                                                                                        
+    memory/                                                       
+      task_registry.json       ← Đăng ký task, agent, trạng thái                                              
+      recon.md                 ← Giữ nguyên (Phase 1 output)                                                  
+      findings.json            ← Các phát hiện có cấu trúc (structured facts)                                 
+      conversation_full.jsonl  ← Full log (append-only, không bao giờ đọc toàn bộ)                            
+      conversation_summary.md  ← Summary được cập nhật rolling                                                
+      agent_scratchpad/                                                                                       
+        red_notes.md           ← Red tự ghi notes riêng                                                       
+        blue_notes.md                                                                                         
+        exec_notes.md                                             
+                                                                                                              
+  Task Registry — Định danh từng task:                                                                        
+  {
+    "task_id": "T001",                                                                                        
+    "agent": "REDTEAM",                                           
+    "phase": "DEBATE", 
+    "status": "in_progress",
+    "assigned_at": "2026-04-23T10:00:00",
+    "context_snapshot": "Round 2, chiến lược BAC-IDOR",                                                       
+    "artifacts": ["workflow_v2.md"]                    
+  }                                                                                                           
+                                                                  
+  Cơ chế RAG đơn giản (không cần vector DB):                                                                  
+  - Mỗi agent trước khi nhận task → query MemoryStore.get_relevant(agent_id, keywords)                        
+  - Store tìm trong findings.json + conversation_summary.md theo keywords                                     
+  - Trả về "memory chunk" nhỏ thay vì toàn bộ history                   
+
+ Thành phần 2: Policy Agent (AI Guardrail)                                                                   
+                                                                                                              
+  Ý tưởng: Policy là một LLM call nhỏ (cheap model) chạy trước khi ManageAgent execute action. Nó trả về ALLOW
+   / BLOCK / SUGGEST.                                                                                         
+   
+  ManageAgent._decide() → action = "EXECUTE_BUG"                                                                  
+      ↓                                                           
+  PolicyAgent.validate(action, state, conversation_summary)
+      ↓
+  {
+    "verdict": "BLOCK",
+    "reason": "Blue chưa approve workflow",
+    "suggest": "DEBATE_BLUE"                                                                                       
+  }
+      ↓                                                                                                       
+  ManageAgent nhận → override action = "DEBATE_BLUE"                   
+
+  Luật Policy (baked vào system prompt):
+  STATE: workflow exists = True, exec_attempts = 0, blue_approved = False
+  ACTION: EXECUTE_BUG                                                        
+  → BLOCK: Phải có [APPROVED] từ Blue trước khi EXECUTE                                                       
+                                                       
+  STATE: exec_attempts >= 2, no DONE                                                                          
+  ACTION: EXECUTE                                                                                             
+  → BLOCK: Đã thử 2 lần, phải REPORT với verdict FAIL
+                                                                                                              
+  STATE: round_num < min_debate_rounds                            
+  ACTION: EXECUTE                     
+  → BLOCK: Chưa đủ vòng debate tối thiểu
+                                        
+  STATE: red_mode = EVAL (sau switch_to_eval_mode)
+  ACTION: DEBATE_RED (với mục đích viết chiến lược mới)                                                       
+  → BLOCK: Red đã chuyển sang eval mode, không thể debate mới
+                                                                                                              
+  Policy không quyết định logic — chỉ kiểm tra điều kiện hợp lệ để ManageAgent không đi lạc.    
+
+Thành phần 3: Context & Persistence Layer                                                                   
+                                                                  
+  Vấn đề cần giải quyết: Context bị cắt ở nhiều nơi, mỗi agent nhìn thấy thế giới khác nhau.
+                                                                                                              
+  Giải pháp: Conversation Summarizer (chạy rolling):                                                          
+                                                                                                              
+  class ContextManager:                                                                                       
+      def __init__(self, memory_store: MemoryStore):                                                          
+          ...
+                                                                                                              
+      def compress(self, conversation: list[dict], trigger_len: int = 20):                                    
+          """Khi conversation > 20 messages, summarize messages[:-6] thành 1 block"""
+          if len(conversation) <= trigger_len:                                                                
+              return conversation                                                                             
+                                                                                                              
+          to_compress = conversation[:-6]  # giữ 6 messages gần nhất nguyên vẹn                               
+          summary = self._llm_summarize(to_compress)              
+                                                                                                              
+          compressed = [{"speaker": "SYSTEM", "content": f"[CONTEXT SUMMARY]\n{summary}"}]                    
+          compressed += conversation[-6:]
+                                                                                                              
+          # Persist full history riêng                            
+          self.memory_store.append_full_log(to_compress)                                                      
+                                                                                                              
+          return compressed
+                                                                                                              
+  Persistence cho từng agent:                                     
+
+  class AgentScratchpad:
+      """Mỗi agent có 1 file notes riêng, persist qua các round"""
+                                                                                                              
+      def note(self, agent_id: str, key: str, value: str):                                                    
+          """Red ghi: 'found_endpoint': '/api/admin/users'"""                                                 
+          ...                                                                                                 
+                                                                  
+      def recall(self, agent_id: str, query: str) -> str:                                                     
+          """Red hỏi: 'những endpoint nào đã verify?'"""          
+          # Simple keyword search trong notes của agent đó                                                    
+          ...                                               
+    
+đây để tôi mô tả kỹ hơn nhé. Ở đây sẽ là mô hình như một doanh nghiệp về mảng tấn công BLF/BAC. với Manage  
+  sẽ là ông Sếp mục tiêu sẽ là người nắm giữ các luồng giao tiếp của các nhân viên (red, blue, exec). Đi cạnh 
+   ông Manage sẽ là cô thư ký Policy. Chỉ có Policy sẽ là người duyệt xem ông Manage có đi đúng hướng hay     
+  không thôi? Còn lại các thằng nhân viên khác không có Verify hay làm gì với cô thưu ký hết. Rồi ở Manage sẽ 
+   là người nắm luồng thực thi và đưa cái chiến lược, rồi việc làm, ... cho từng nhân viên cụ thể như kiểu    
+  con Red cho chiến lược xong thì con Manage sẽ nhận về nó sẽ đọc đọc qua cái chiến lược đó nếu đó là chiến   
+  lược thì gửi cho con Blue nếu mà nó là việc cần check thì nó sẽ gửi cho con Exec, ... tương tự như thế con  
+  Exec chạy xong thì con Manage sẽ đưa nhiệm vụ tiếp theo về con tương ứng đã gọi nó, ... Xong sau cùng nếu   
+  con Manage Agent nó thấy là chiến lược sau vài lần debate và thực thi mà không có kết quả thì nó sẽ là      
+  người chốt lại cho FAIL và SUCCESS tùy ý để kết thúc thực thi luôn chứ không có làm bừa làm bãi. Đấy kiến   
+  trúc nó sẽ cơ bản như thế đó. Bạn check xem có ổn chưa?
+
+
+- Nhận xét của bản thân khi chạy: 
+- Phase đầu khi red đưa ra rất ổn và hợp lý. Và Manage được xử lý dúng cho chiến lược đi qua Blue. Và ở đây có vẻ Blue chưa đọc recon.md hay gì đó nên lại cần xác nhận lại thông tin => Thừa thải cần phải loại bỏ dể tránh gọi lại Agent.
+- Exec xác nhận và Manage nó truy ngược lại Blue => Ổn và đúng luôn. 
+- Và sau đó con Blue nó xác nhận lại và nó từ chối chiến lược => Hơi gắt gao nhỉ? Liệu có thể nào bóp ở đây lại được không? 
+- Sau khi bị từ chối thì con Manage nó gửi lại Red nhưng mà không nhìn thấy gửi gì => Cần thêm log để hiển thị rõ hơn.
+- Nó lại đưa ra chiến lược và lần này có gọi con Agent để xác nhận 1 số thông tin để tìm ra đúng sản phẩm trước khi nó thực thi. 
+- Exec đi duyệt và thực thi nhưng mà lại lung tung quá gọi tool lại rất nhiều và mệt. Khả năng ta sẽ cần bắt nó truy ngược lại file recon.md để mà đọc lại toàn bộ request? Hoặc là ban đầu file request của ta có đầy đủ chưa? Nó cần phải có đầy đủ để mà AI có thể truy vấn nó ngược lại trước khi nó đi thực thi để mà nó bị tốn token?? 
+- Nó cứ kẹt qua lại ở một số bước dù cái sản phẩm đã được leak ra sau quá trình crawl. Vậy thì khả năng ta sẽ cần nộp hết toàn bộ thông tin crawl lại vào 1 file rồi còn cả file recon.md nữa để sau này nó có thể kiểm tra lại cái file nào cần thiết hoặc là nó có thông tin hơn thì nó ổn hơn. Và có thể nó truy vấn nhiều hơn là gọi tool quá nhiều.
+- Cũng cần cho con LLM Red và Blue hoặc là con Manage Agent để nó có thể giúp truy vấn hay gì đó để cung cấp đủ ngữ cảnh hơn cho 2 con Red và Blue để nó làm việc hiệu quả hơn chứ giờ có vẻ đang hơi cụt. 
+- Blue nó đang siết quá nhiều. Bởi vì là thường phải cho phép "thử" chứ không có ép như thế pentest là quá trình thử đi thử lại chứ không phải là 1 kết quả chạy hết nên cần nhả Blue ra một chút để nó hoạt động tốt hơn.
+- Con Blue sẽ là người tôi nghĩ nó cần xác nhận "tư duy logic" chiến lược chứ không phải là bắt bẻ kỹ vào các điểm như tham số, header, url, path, ... mà đánh giá vào độ tư duy nó hoạt động và khả năng thực thi của chiến lược. 
+27/4
+- Sau khi sửa thì thấy log rõ ràng hơn rồi. Nhưng tôi còn câu hỏi là liệu con Red và Blue có đọc được cái recon.md tức là hiểu được ngữ cảnh trước khi tấn công hay chưa? Hay là lúc gửi yêu cầu thì chỉ có phần request của Manage Agent thôi? 
+- Rồi tại sao con Blue Team lại nói trước? Phải là con Red đi trước nói trước đưa chiến lược trước? Chứ con Blue nói trước là sai quy trình?
+- Cần note thêm mẫy cái log rõ ra ví dụ như là khi con Manage Agent cho con nào nói thì nó con đó sẽ được nói nhưng gì? Gộp những thứ gì? Mà viết dưới dạng tóm tắt lại để người ta nhìn vào hiểu là à con này đang có ngữ cảnh của cái này cái này thì nó sẽ dễ nhìn hơn dễ hiểu hơn. 
+
+28/4
+- Nhận xét bản thân:
++ BLUE Approve rồi nhưng con Manage lại đưa con kia theo dạng là trả lời câu hỏi cho con BLUE? Đang bị sai quy trình? Đáng ra Approve thì nó phải cần phải chạy kịch bản đã đưa ra chứ? Đang bị ngáo ở system prompt làm sai điều khoản rồi.
+- Rồi sau đó APPROVED 2 lần mà con Exec không thực thi mà con Manage Agent nó kém thông minh nó điều hướng chương trình đi lung tung hết.
+- Quy trình ở con Red team chủ yếu là đưa ra chiến lược thì sẽ không đưa ra yêu cầu Exec làm gì? Mà trong dây nó vừa đưa chiến lược nó vừa yêu cầu Exec có thể sẽ là nó kêu con Exec đi thực thi chiến lược ngay cho Red mà chưa qua Blue có thể con Red đang bị thối não ở đoạn đó như vậy
+- Vậy tòm lại cần phải cập nhật tất cả system prompt để quy trình hoạt động trơn tru hơn rõ ràn hơn và chuẩn hơn.
+
+****
+- Nhận xét tiếp: 
++ Sao nó vẫn còn Exec ở bên trong quá trình chạy? Red vẫn biết sự có mặt kìa? Cái đấy vẫn còn sai cần "cách ly" tất cả các con LLM ra bên ngoài không có con nào có thể biết nhiệm vụ của con nào hoặc sự tồn tại của nhau. Vì thế nếu Red đưa chiến lược thì nộp lên Manage, rồi có muốn yêu cầu xác minh hoặc làm trước việc gì đó thì cũng gọi lại Manage luôn nhưng ở đây nó lại xuất hiện sự tồn tại của con Exec.
++ Tương tự như thế các con khác như Blue thì nó cũng chỉ là review và xác minh chiến lược hoặc nếu cần xác minh thì mọi yêu cầu đều gửi lên Manage.
++ Con Exec như là "chân sai vặt chạy bàn" con Manage sẽ lấy các yêu cầu từ con Red hoặc Blue (nếu có) gửi cho và bắt con này đi làm và thực hiện. Có thể làm xác minh hoặc là thực hiện chiến lược được đề ra. 
++ Ngoài ra tôi không cần mô hình ép Debate quá nhiều lần. NẾu lần đầu được duyệt là cho thực thi chiến lược luôn hiểu không?
++ Mô hình nó đang bị lặp ở trong log như này nữa bạn có thể check lại toàn bộ cho tôi đi
+
+/home/dangnosuy/Documents/UIT/doanchuyennganh/MARL/workspace/0a2000f803700f138025bc350036009a.web-security-academy.net_20260428_124144/marl.log
+
+- Con exec tool đang bị kẹt ở tầm tool thứ 30 và không chạy tiếp được? => Không có lý do.
+- Ngoài ra nếu mà thay vì sử dụng Playwright? Thì sử dụng cái curl ưu tiên hơn thì có hay hơn không? Vẫn ghép theo được token vẫn chạy tốt mà nhỉ? CÒn đỡ hao token hơn nhiều vì gọi playwright? 
+- Sau đó thì nó cũng có tự gọi thêm request dẫn đến hết token? Một điểm đang lưu ý 

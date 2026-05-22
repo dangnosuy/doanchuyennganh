@@ -26,7 +26,9 @@ from shared.utils import extract_send_block, truncate
 from shared.memory_store import MemoryStore
 from shared.context_manager import ContextManager
 from shared.bug_dossier import load_and_enrich_risk_bugs
+from shared.logger import log
 from agents.policy_agent import PolicyAgent
+from knowledge.bac_blf_playbook import get_playbook_text
 
 # ── Env / Connection ─────────────────────────────────────────
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "gho_token")
@@ -85,9 +87,22 @@ STOP_HINTS = (
     "not_found", "not found", "no signal", "no differential", "khong con kha thi",
 )
 
+AUTH_BLOCK_STATUSES = {"BLOCKED_AUTH", "AUTH_BLOCKED"}
+NON_EXPLOITED_STATUSES = {"NOT_EXPLOITED", "OOS_SCOPE", "SKIPPED_DUPLICATE", *AUTH_BLOCK_STATUSES}
+
 MANAGER_PROMPT = """\
-Ban la MANAGER dieu phoi pipeline pentest BAC/BLF.
-Ban khong truc tiep khai thac. Ban chi chon action tiep theo dua tren state va evidence.
+Ban la MANAGER — Lead chuyen gia BAC/BLF dieu phoi pipeline pentest.
+Ban co kien thuc sau ve Broken Access Control va Business Logic Flaw.
+Ban khong truc tiep khai thac. Ban DIEU PHOI va PHAN TICH ket qua tu cac agent con.
+
+=== VAI TRO CUA BAN ===
+- Ban la "Sep" thong thai: HIEU tai sao exploit thanh cong hay that bai.
+- Khi Exec fail, ban PHAN TICH nguyen nhan TRUOC khi quyet dinh buoc tiep theo.
+- Ban co the yeu cau Red VIET LAI strategy dua tren phan tich cua ban.
+- Ban KHONG bao gio stop bug ma khong hieu tai sao no fail.
+
+=== KIEN THUC BAC/BLF ===
+{playbook_summary}
 
 === TARGET ===
 {target_url}
@@ -101,19 +116,30 @@ Ban khong truc tiep khai thac. Ban chi chon action tiep theo dua tren state va e
 === STATE ===
 {state_context_display}
 
+=== KHUNG PHAN TICH THAT BAI ===
+Khi Exec that bai, ban PHAI phan tich theo 4 nguyen nhan:
+1. RECON_GAP: Thieu du lieu recon (chua login, thieu endpoint, thieu form fields)
+   → Giai phap: yeu cau bo sung recon hoac chi dan Red dua tren du lieu hien co
+2. STRATEGY_GAP: Red viet strategy sai (sai endpoint, sai logic, sai hypothesis)
+   → Giai phap: RETRY_RED voi feedback cu the tu phan tich cua ban
+3. TARGETING_GAP: Exec nham resource ID, sai URL, sai params
+   → Giai phap: RETRY_EXEC hoac RETRY_RED voi chi dan ID/URL dung
+4. NOT_VULNERABLE: Endpoint thuc su khong co loi -> dung bug
+   → Giai phap: STOP_BUG voi ly do cu the
+
 === HOT PATH ===
 1. DEBATE_RED: Red viet strategy ngan + execution shot plan cho dung 1 bug.
 2. DEBATE_BLUE: Blue review strategy/shot plan truoc khi thuc thi.
 3. EXECUTE_BUG: Exec chay bounded script shots va luu raw request/response/artifacts.
-4. Manager doc Exec verdict/evidence va quyet dinh ngay: EXPLOITED / retry / stop.
-5. EXPLOITED -> NEXT_BUG. SCRIPT_ERROR -> RETRY_EXEC. FAILED -> STOP_BUG. Het bug -> report.
+4. Manager doc Exec verdict/evidence va PHAN TICH: EXPLOITED / retry / stop.
+5. EXPLOITED -> NEXT_BUG. SCRIPT_ERROR -> RETRY_EXEC. FAILED -> PHAN TICH -> quyet dinh.
 
 === ACTIONS ===
 [ACTION: DEBATE_RED]     — Viet strategy ngan cho bug hien tai.
 [ACTION: EXECUTE_BUG]    — Chay Python exploit self-verify cho strategy da co.
-[ACTION: RETRY_RED]      — Sua strategy khi endpoint/verify sai.
+[ACTION: RETRY_RED]      — Sua strategy khi endpoint/verify sai. KEM THEO LY DO FAIL.
 [ACTION: RETRY_EXEC]     — Chay lai Exec khi loi runtime/script hoac evidence thieu nhung strategy dung.
-[ACTION: STOP_BUG]       — Dung bug hien tai.
+[ACTION: STOP_BUG]       — Dung bug hien tai SAU KHI DA PHAN TICH nguyen nhan.
 [ACTION: NEXT_BUG]       — Chuyen bug tiep theo.
 [ACTION: REPORT_SUCCESS] — Viet report co finding validated.
 [ACTION: REPORT_FAIL]    — Viet report khong co finding validated.
@@ -124,11 +150,12 @@ Ban khong truc tiep khai thac. Ban chi chon action tiep theo dua tren state va e
 - Sau Red strategy hop le, phai DEBATE_BLUE truoc khi EXECUTE_BUG.
 - Chi EXECUTE_BUG khi co current workflow va Blue da approve.
 - Exec script tu verify va in FINAL/SUCCESS. Manager doc verdict/evidence de quyet dinh.
-- Minimum sufficient proof: neu evidence khop hypothesis toi thieu cua bug thi chap nhan EXPLOITED, khong bat them endpoint/tac dong phu.
-- Anti-overfitting: khong hardcode endpoint/marker cua lab; dung dossier, recon, strategy va artifact hien tai.
+- Proof gate bat buoc truoc khi chap nhan EXPLOITED:
+  * BAC-01/admin: phai thay control/admin API quyen cao that, khong chi status 200/admin marker/challenge metadata.
+  * BAC-03/IDOR: phai chung minh object ownership bypass/cross-user access. Public list leak UserId/comment chi la INFO_EXPOSURE_ONLY.
+  * BLF/stateful: phai co before/after state, non-zero delta, hoac invalid state transition da verify.
+- Khi Exec FAILED/PARTIAL: PHAN TICH nguyen nhan TRUOC. Neu la STRATEGY_GAP → RETRY_RED. Neu NOT_VULNERABLE → STOP_BUG.
 - Neu Exec loi syntax/runtime/script, uu tien RETRY_EXEC de Exec tu sua script.
-- Neu Exec chay dung nhung evidence sai/khong khop hypothesis, route RETRY_RED de sua strategy.
-- Neu Exec tra FAILED/PARTIAL sau retry, dung bug de tiet kiem tick.
 - Chi BAC/BLF. Khong brute force, DDoS, SQLi/XSS/SSRF.
 
 Tra loi 1-2 cau tieng Viet + <note> ngan + dung mot action tag.
@@ -280,7 +307,13 @@ def _exec_success_verdict(exec_result: str) -> str:
 
 
 def _classify_exec_attempt(exec_result: str, current_bug: dict) -> dict:
-    """Classify an Exec attempt for Manager's attempt ledger."""
+    """Classify an Exec attempt for Manager's attempt ledger.
+
+    Priority order:
+      1. Runtime/syntax error → RUNTIME_ERROR
+      2. Explicit FINAL marker (EXPLOITED/FAILED/PARTIAL) → trust the script
+      3. Heuristic proof markers (only when script is ambiguous)
+    """
     output = _extract_exec_output(exec_result) or exec_result
     lower = output.lower()
     result_lower = str(exec_result or "").lower()
@@ -289,12 +322,22 @@ def _classify_exec_attempt(exec_result: str, current_bug: dict) -> dict:
     final_marker = _exec_final_marker(exec_result)
     digest = hashlib.sha256(str(exec_result or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
 
+    # ── Proof markers: chỉ giữ những từ khóa đặc trưng, loại bỏ generic ──
     proof_markers = (
-        "admin dashboard", "admin panel", "admin", "privileged",
+        "admin dashboard", "admin panel", "privileged",
         "different user", "other user", "another user", "not owner",
-        "idor vulnerability confirmed", "leaked", "api key", "balance changed",
-        "price changed", "quantity changed", "order", "delta", "verified",
-        "verify_completed: yes", "shot_result: exploited",
+        "idor vulnerability confirmed", "leaked", "api key",
+        "balance changed", "balance increased", "balance decreased",
+        "price changed", "quantity changed",
+        "shot_result: exploited",
+    )
+    # ── Negative markers: chỉ ra script THỰC SỰ fail, chặn false positive ──
+    negative_markers = (
+        "missing data", "could not", "cannot", "not found",
+        "balance=none", "balance_extracted=false",
+        "no admin marker", "no marker found", "no unauthorized",
+        "same or missing", "same as current",
+        "failed to get", "did not increase", "did not change",
     )
     error_markers = (
         "syntax error", "command not found", "[timeout]", "timed out",
@@ -309,23 +352,31 @@ def _classify_exec_attempt(exec_result: str, current_bug: dict) -> dict:
     )
     has_2xx = any(hit["status"].startswith("2") for hit in status_hits)
     has_only_negative_status = bool(status_hits) and not has_2xx
+    all_404 = bool(status_hits) and all(hit["status"] == "404" for hit in status_hits)
     has_marker = any(marker in lower for marker in proof_markers)
+    has_negative = any(marker in lower for marker in negative_markers)
     runtime_error = any(marker in result_lower or marker in lower for marker in error_markers)
     explicit_failed = final_marker == "FAILED" or success_verdict == "NO"
     partial = final_marker == "PARTIAL" or success_verdict == "PARTIAL"
     candidate_success = success_verdict == "YES" or final_marker == "EXPLOITED"
 
+    # ── Classification logic: script's own verdict wins ──
     if runtime_error:
         signal = "RUNTIME_ERROR"
+    elif all_404:
+        signal = "WRONG_TARGET"
     elif contradiction:
         signal = "CONTRADICTION"
-    elif candidate_success and has_marker:
+    elif candidate_success and has_marker and not has_negative:
         signal = "PROOF_CANDIDATE"
-    elif has_2xx and has_marker:
+    elif explicit_failed:
+        # Script nói FAILED → tôn trọng, KHÔNG override bởi heuristic
+        signal = "NO_SIGNAL"
+    elif has_2xx and has_marker and not has_negative and not explicit_failed:
         signal = "NEW_LEAD"
     elif partial:
         signal = "PARTIAL"
-    elif explicit_failed or has_only_negative_status:
+    elif has_only_negative_status:
         signal = "NO_SIGNAL"
     else:
         signal = "UNCLEAR"
@@ -472,9 +523,9 @@ class ManageAgent:
         if risk_bugs_path.exists():
             try:
                 self.risk_bugs = load_and_enrich_risk_bugs(run_dir)
-                print(f"{C}[MANAGER] Loaded {len(self.risk_bugs)} bugs from risk-bug.json{RST}")
+                log.debug(f"[MANAGER] Loaded {len(self.risk_bugs)} bugs from risk-bug.json")
             except Exception as e:
-                print(f"{Y}[MANAGER] Could not load risk-bug.json: {e}{RST}")
+                log.debug(f"[MANAGER] Could not load risk-bug.json: {e}")
 
         # Build risk_bugs_summary for manager prompt
         if self.risk_bugs:
@@ -485,11 +536,15 @@ class ManageAgent:
         else:
             risk_bugs_summary = "(chua co bug nao — VulnHunter chua chay)"
 
+        # Build compact playbook summary for Manager (shorter than full playbook)
+        playbook_summary = self._build_playbook_summary()
+
         self.client = OpenAI(api_key=GITHUB_TOKEN, base_url=SERVER_URL)
         self.system_prompt = MANAGER_PROMPT.format(
             target_url         = target_url,
             recon_summary      = truncate(recon_content, 4000),
             risk_bugs_summary  = risk_bugs_summary,
+            playbook_summary   = playbook_summary,
             state_context_display = "{state_context_display}",
         )
 
@@ -509,6 +564,7 @@ class ManageAgent:
         # Ghi finding recon vào memory ngay khi khởi tạo
         self.memory.add_finding("recon", "recon_content",
                                 truncate(recon_content, 3000), agent="crawl")
+        self.has_authenticated_context = self._has_authenticated_context()
         self._report_state = {
             "verdict": "PENDING",
             "workflow": "",
@@ -523,6 +579,140 @@ class ManageAgent:
         if not cleaned:
             return "-"
         return ", ".join(cleaned[:limit])
+
+    @staticmethod
+    def _build_playbook_summary() -> str:
+        """Build compact BAC/BLF pattern summary for Manager prompt.
+
+        Shorter than full playbook — only IDs, names, key indicators, and success criteria.
+        """
+        from knowledge.bac_blf_playbook import BAC_PATTERNS, BLF_PATTERNS
+        lines = ["BAC Patterns:"]
+        for p in BAC_PATTERNS:
+            indicators_short = "; ".join(ind[:60] for ind in p["indicators"][:2])
+            lines.append(f"  {p['id']}: {p['name']} [{p['severity']}] — {indicators_short}")
+        lines.append("BLF Patterns:")
+        for p in BLF_PATTERNS:
+            indicators_short = "; ".join(ind[:60] for ind in p["indicators"][:2])
+            lines.append(f"  {p['id']}: {p['name']} [{p['severity']}] — {indicators_short}")
+        return "\n".join(lines)
+
+    def _diagnose_failure(
+        self,
+        current_bug: dict,
+        exec_result: str,
+        exec_status: str,
+        retry_count: int,
+    ) -> tuple[str, str]:
+        """Phân tích nguyên nhân Exec fail với BAC/BLF knowledge.
+
+        Returns:
+            (action, diagnosis_note): action để _decide routing, note chứa phân tích.
+        """
+        bug_id = current_bug.get("id", "?")
+        bug_label = _bug_label(bug_id)
+        evidence = _summarize_exec_output(exec_result, max_lines=8)
+        hypothesis = current_bug.get("hypothesis", "")
+        pattern_id = current_bug.get("pattern_id", "")
+        endpoint = current_bug.get("endpoint", "")
+        method = current_bug.get("method", "")
+        auth_required = current_bug.get("auth_required", False)
+        exec_reason = current_bug.get("exec_result_reason", "")
+
+        # ── Deterministic diagnosis trước (nhanh, không tốn LLM) ──
+
+        lower_evidence = evidence.lower()
+        lower_reason = (exec_reason or "").lower()
+
+        # 1. WRONG_TARGET / 404: Exec target sai resource
+        if exec_status == "WRONG_TARGET" or "404" in lower_evidence:
+            if retry_count < 1:
+                return "RETRY_RED", (
+                    f"[PHÂN TÍCH] {bug_label} thất bại do TARGETING_GAP: "
+                    f"Tất cả request trả 404 — endpoint {endpoint} hoặc resource ID không tồn tại. "
+                    f"Red cần kiểm tra lại recon.md để chọn endpoint/ID thực tế có trong hệ thống."
+                )
+            return "STOP_BUG", (
+                f"[PHÂN TÍCH] {bug_label}: Đã retry nhưng endpoint {endpoint} vẫn 404. "
+                f"Kết luận: NOT_VULNERABLE — endpoint không tồn tại trên target."
+            )
+
+        # 2. Auth required nhưng không có session
+        if auth_required and ("redirect" in lower_evidence or "login" in lower_evidence
+                               or "401" in lower_evidence or "403" in lower_evidence):
+            return "STOP_BUG", (
+                f"[PHÂN TÍCH] {bug_label}: BLOCKED_AUTH — bug yêu cầu authenticated session "
+                f"nhưng Exec/recon không có session hợp lệ (401/403/redirect/login fail). "
+                f"Dừng candidate này để tránh retry Red/Blue không giải quyết được auth."
+            )
+
+        if "metadata_only_proof" in lower_evidence or "challenge metadata" in lower_evidence:
+            return "STOP_BUG", (
+                f"[PHÂN TÍCH] {bug_label}: METADATA_ONLY_PROOF — evidence chỉ đến từ "
+                f"metadata/challenge text, không chứng minh được endpoint/chức năng BAC/BLF thực tế."
+            )
+
+        if exec_status in {"INFO_EXPOSURE_ONLY", "PROOF_QUALITY_FAIL"}:
+            return "STOP_BUG", (
+                f"[PHÂN TÍCH] {bug_label}: {exec_status} — "
+                f"{truncate(exec_reason or evidence, 420)}"
+            )
+
+        # 3. Script ran OK nhưng evidence không match hypothesis
+        if exec_status == "FAILED" and ("not found" in lower_evidence or "missing" in lower_evidence):
+            if retry_count < 1:
+                return "RETRY_RED", (
+                    f"[PHÂN TÍCH] {bug_label} thất bại do STRATEGY_GAP: "
+                    f"Script chạy OK nhưng evidence không khớp hypothesis '{truncate(hypothesis, 100)}'. "
+                    f"Có thể Red đã chọn sai marker/endpoint. "
+                    f"Red cần xem lại recon và đề xuất approach khác cho pattern {pattern_id}."
+                )
+            return "STOP_BUG", (
+                f"[PHÂN TÍCH] {bug_label}: Strategy đã retry nhưng vẫn fail. "
+                f"Kết luận: NOT_VULNERABLE — endpoint {endpoint} không có lỗ hổng {pattern_id}."
+            )
+
+        # 4. SCRIPT_ERROR — lỗi code
+        if exec_status == "SCRIPT_ERROR":
+            if retry_count < 1:
+                return "RETRY_EXEC", (
+                    f"[PHÂN TÍCH] {bug_label}: Lỗi script/runtime — "
+                    f"Exec cần sửa code và chạy lại."
+                )
+            return "STOP_BUG", (
+                f"[PHÂN TÍCH] {bug_label}: Script vẫn lỗi sau retry. STOP bug."
+            )
+
+        # 5. PARTIAL — có signal nhưng chưa đủ
+        if exec_status == "PARTIAL":
+            if retry_count < 1:
+                return "RETRY_EXEC", (
+                    f"[PHÂN TÍCH] {bug_label}: PARTIAL — có tín hiệu nhưng chưa đủ evidence. "
+                    f"Exec retry 1 lần để chốt."
+                )
+            # Sau retry PARTIAL, thử Red viết lại nếu chưa thử
+            if retry_count < 2:
+                return "RETRY_RED", (
+                    f"[PHÂN TÍCH] {bug_label}: Vẫn PARTIAL sau exec retry. "
+                    f"STRATEGY_GAP có thể — Red hãy thử approach khác cho {pattern_id}."
+                )
+            return "STOP_BUG", (
+                f"[PHÂN TÍCH] {bug_label}: PARTIAL sau nhiều lần thử. "
+                f"Kết luận: Có tín hiệu nhưng không đủ chứng minh — dừng bug."
+            )
+
+        # 6. Default FAILED — generic
+        if retry_count < 1:
+            return "RETRY_RED", (
+                f"[PHÂN TÍCH] {bug_label} FAILED. Manager yêu cầu Red phân tích lại: "
+                f"Evidence cho thấy: '{truncate(evidence, 150)}'. "
+                f"Red hãy đổi approach cho pattern {pattern_id} trên endpoint {method} {endpoint}."
+            )
+
+        return "STOP_BUG", (
+            f"[PHÂN TÍCH] {bug_label}: Đã thử nhiều hướng, endpoint {endpoint} "
+            f"không có lỗ hổng {pattern_id}. NOT_VULNERABLE."
+        )
 
     def _format_bug_summary_line(self, bug: dict) -> str:
         bid = bug.get("id", "?")
@@ -580,6 +770,7 @@ class ManageAgent:
             f"Endpoint: {bug.get('method', '?')} {bug.get('endpoint', '?')} | Status: {bug.get('status', 'PENDING')}\n"
             f"Function: {truncate(str(bug.get('endpoint_function', '-') or '-'), 220)}\n"
             f"Auth: required={bug.get('auth_required', False)} | observation={truncate(str(bug.get('auth_observation', '-') or '-'), 180)}\n"
+            f"Authenticated recon available: {self.has_authenticated_context}\n"
             f"Params: {self._compact_list(bug.get('request_params') or [])}\n"
             f"Form fields: {self._compact_list(form_fields)}\n"
             f"Hypothesis: {truncate(str(bug.get('hypothesis', '-') or '-'), 260)}\n"
@@ -603,13 +794,12 @@ class ManageAgent:
         from agents.red_team  import RedTeamAgent
         from agents.exec_agent import ExecAgent
 
-        print(f"\n{M}{B}{'='*60}")
-        print(f"  MANAGE AGENT — Per-bug Pipeline")
-        print(f"{'='*60}{RST}\n")
+        log.phase_banner(2, "KHAI THÁC", f"Pipeline xử lý {len(self.risk_bugs)} bug candidates")
+        log.bug_table(self.risk_bugs)
 
         # Nếu không có bug nào → REPORT_FAIL ngay
         if not self.risk_bugs:
-            print(f"{R}[!] Không có bug nào trong risk-bug.json — REPORT_FAIL{RST}")
+            log.error("Không có bug nào trong risk-bug.json — REPORT_FAIL")
             self._write_report_fail("Không có bug nào để khai thác.")
             return
 
@@ -630,10 +820,10 @@ class ManageAgent:
         try:
             self._run_loop(red, exec_agent, conversation)
         except RuntimeError as e:
-            print(f"\n{R}[!] ManageAgent: {e}{RST}")
+            log.error(f"ManageAgent: {e}")
             self._write_report_fail(f"Pipeline kết thúc do lỗi: {e}")
         except KeyboardInterrupt as e:
-            print(f"\n{Y}[!] ManageAgent bị ngắt: {e}{RST}")
+            log.warn(f"ManageAgent bị ngắt: {e}")
             self._save_report_checkpoint()
         finally:
             self._restore_signal_handlers(old_handlers)
@@ -670,6 +860,24 @@ class ManageAgent:
         for tick in range(MAX_TICKS):
             tick_start_len = len(conversation)
 
+            preflight_result = self._preflight_current_bug(
+                conversation, current_bug, current_bug_index, bugs_processed_count,
+                red, exec_agent,
+            )
+            if preflight_result == "CONTINUE":
+                bugs_processed_count += 1
+                current_bug_index = self.current_bug_index
+                current_bug = self.risk_bugs[current_bug_index]
+                red_approved = False
+                red_attempts = 0
+                exec_retry_count = 0
+                current_approach = ""
+                blue = None
+                self._last_action = "NEXT_BUG"
+                continue
+            if preflight_result in ("REPORT_SUCCESS", "REPORT_FAIL"):
+                return
+
             # Build state context for _decide
             state_context = {
                 "tick":                 tick,
@@ -687,22 +895,24 @@ class ManageAgent:
                 "exec_result_status":   current_bug.get("exec_result_status", ""),
                 "exec_result_reason":   current_bug.get("exec_result_reason", ""),
             }
-            print(f"\n{M}{'─'*60}{RST}")
+
+            # Bug header khi bắt đầu bug mới
+            if tick == 0 or getattr(self, '_last_action', '') == 'NEXT_BUG':
+                log.bug_header(current_bug_index + 1, len(self.risk_bugs), current_bug)
 
             action, note = self._decide(conversation, state_context)
 
-            # PolicyAgent validates action
             verdict = self.policy.validate(action, state_context, conversation)
             if verdict is not None and verdict.verdict == "BLOCK":
                 consecutive_blocks = getattr(self, "_consecutive_blocks", 0) + 1
                 self._consecutive_blocks = consecutive_blocks
-                print(f"{Y}[POLICY tick={tick}] BLOCK '{action}' → {verdict.reason[:100]}{RST}")
+                log.policy_log(tick, "BLOCK", action, verdict.reason[:100])
                 if consecutive_blocks >= 3:
                     if not red_approved:
                         action = "DEBATE_RED"
                     else:
                         action = "EXECUTE_BUG"
-                    print(f"{Y}[RECOVERY] {consecutive_blocks} BLOCKs → force {action}{RST}")
+                    log.debug(f"[RECOVERY] {consecutive_blocks} BLOCKs → force {action}")
                     note = f"Recovery sau {consecutive_blocks} policy blocks."
                     self._consecutive_blocks = 0
                 else:
@@ -714,27 +924,17 @@ class ManageAgent:
                     )
                     continue
             elif verdict is not None and verdict.verdict == "SUGGEST" and verdict.suggested_action:
-                print(f"{Y}[POLICY tick={tick}] SUGGEST '{action}' → '{verdict.suggested_action}': {verdict.reason[:80]}{RST}")
+                log.policy_log(tick, "SUGGEST", action, f"→ '{verdict.suggested_action}': {verdict.reason[:80]}")
                 action = verdict.suggested_action
                 note = f"Policy điều chỉnh: {verdict.reason}"
 
             self._last_action = action
             self._consecutive_blocks = 0
 
-            print(f"\n{M}{B}[MANAGER tick={tick}] → {action}{RST}", end="")
-            if note:
-                print(f"  |  {note}")
-            else:
-                print()
-
-            # Log tick state
-            print(
-                f"{Y}[MANAGER tick={tick}] "
-                f"bug={current_bug_index + 1}/{len(self.risk_bugs)} "
-                f"({current_bug.get('id', '?')}) "
-                f"red_attempts={red_attempts}/2 "
-                f"approved={'✓' if red_approved else '✗'}{RST}"
-            )
+            # Manager decision — terminal + log
+            log.manager_decision(tick, action, current_bug.get('id', '?'), note)
+            log.manager_tick_state(tick, current_bug_index, len(self.risk_bugs),
+                                   current_bug.get('id', '?'), red_attempts, red_approved)
 
             # Inject Manager note into conversation
             if note:
@@ -749,13 +949,12 @@ class ManageAgent:
 
             # DEBATE_RED
             if action == "DEBATE_RED":
-                print(f"\n{R}{B}══ RED TEAM — Bug {current_bug_index + 1}/{len(self.risk_bugs)} ══{RST}")
+                log.debug(f"[RED TEAM] Bug {current_bug_index + 1}/{len(self.risk_bugs)}")
                 red.set_current_bug(current_bug)
                 response = red.respond(conversation)
 
                 if response.startswith("[LLM Error:"):
-                    print(f"{R}{response}{RST}")
-                    # Lỗi kết nối → Manager quyết định retry hay stop
+                    log.red_brief(response, is_valid=False)
                     conversation.append({
                         "speaker": "REDTEAM",
                         "content": response,
@@ -766,8 +965,9 @@ class ManageAgent:
                         "speaker": "REDTEAM",
                         "content": response,
                     })
-                    print(f"{R}{_strip_tag_display(response)}{RST}")
-                    if _is_valid_red_approach(response):
+                    is_valid = _is_valid_red_approach(response)
+                    log.red_brief(response, is_valid=is_valid)
+                    if is_valid:
                         current_approach = _strip_tag_display(response)
                         red_approved = False
                         exec_retry_count = 0
@@ -776,7 +976,7 @@ class ManageAgent:
                             current_approach,
                             "PENDING_BLUE_REVIEW: Red strategy captured; Blue must approve before Exec.",
                         )
-                        print(f"{G}[MANAGER] Red strategy captured — sending to Blue review{RST}")
+                        log.debug("[MANAGER] Red strategy captured — sending to Blue review")
 
             # DEBATE_BLUE
             elif action == "DEBATE_BLUE":
@@ -786,15 +986,15 @@ class ManageAgent:
                         recon_context = self.recon_content,
                         memory_store  = self.memory,
                     )
-                print(f"\n{C}{B}══ BLUE TEAM — Review ══{RST}")
+                log.debug(f"[BLUE TEAM] Review")
                 blue.set_current_bug(current_bug)
                 response = blue.respond(conversation)
 
                 if response.startswith("[LLM Error:"):
-                    print(f"{R}{response}{RST}")
-                    # Lỗi kết nối → vẫn ghi vào conversation để Manager thấy
+                    log.blue_brief(response, "ERROR")
                 else:
-                    print(f"{C}{_strip_tag_display(response)}{RST}")
+                    blue_intent_preview = _infer_dialog_intent("BLUETEAM", response)
+                    log.blue_brief(response, blue_intent_preview)
 
                 conversation.append({
                     "speaker": "BLUETEAM",
@@ -815,15 +1015,14 @@ class ManageAgent:
                         red_approved = True
                         exec_retry_count = 0
                         self._record_strategy(current_bug, current_approach, response)
-                        print(f"{G}[MANAGER] Blue APPROVED — approach recorded{RST}")
+                        log.debug("[MANAGER] Blue APPROVED — approach recorded")
                 elif blue_intent_raw == "REVISE":
                     red_approved = False
                     current_approach = ""
                     red_attempts += 1
-                    print(f"{Y}[MANAGER] Blue REJECTED — red_attempts={red_attempts}/2{RST}")
+                    log.debug(f"[MANAGER] Blue REJECTED — red_attempts={red_attempts}/2")
                     if red_attempts >= 2:
-                        # Exhausted revision attempts → mark NOT_EXPLOITED
-                        print(f"{R}[!] 2× REJECTED — mark STOPPED → NEXT_BUG{RST}")
+                        log.warn(f"2× bị từ chối — dừng bug và chuyển tiếp")
                         self._mark_bug_not_exploited(
                             current_bug,
                             f"Blue rejected strategy twice. Last review: {response[:400]}",
@@ -845,7 +1044,7 @@ class ManageAgent:
                         blue = None
                         self._last_action = "NEXT_BUG"
                 elif blue_intent_raw == "STOP":
-                    print(f"{Y}[MANAGER] Blue STOPPED — mark NOT_EXPLOITED and next bug{RST}")
+                    log.debug("[MANAGER] Blue STOPPED — mark NOT_EXPLOITED and next bug")
                     self._mark_bug_not_exploited(
                         current_bug,
                         f"Blue stopped exploitation. Last review: {response[:400]}",
@@ -871,13 +1070,14 @@ class ManageAgent:
 
             # RETRY_RED — Red chạy lại
             elif action == "RETRY_RED":
-                print(f"\n{R}{B}══ RED TEAM (RETRY) — Bug {current_bug_index + 1}/{len(self.risk_bugs)} ══{RST}")
+                log.debug(f"[RED TEAM] RETRY — Bug {current_bug_index + 1}/{len(self.risk_bugs)}")
                 red.set_current_bug(current_bug)
                 response = red.respond(conversation)
                 if response.startswith("[LLM Error:"):
-                    print(f"{R}{response}{RST}")
+                    log.red_brief(response, is_valid=False)
                 else:
-                    print(f"{R}{_strip_tag_display(response)}{RST}")
+                    is_valid = _is_valid_red_approach(response)
+                    log.red_brief(response, is_valid=is_valid)
                 conversation.append({
                     "speaker": "REDTEAM",
                     "content": response,
@@ -892,11 +1092,11 @@ class ManageAgent:
                         current_approach,
                         "PENDING_BLUE_REVIEW: Red retry strategy captured; Blue must approve before Exec.",
                     )
-                    print(f"{G}[MANAGER] Red retry strategy captured — sending to Blue review{RST}")
+                    log.debug("[MANAGER] Red retry strategy captured — sending to Blue review")
                 else:
                     red_approved = False
                     current_approach = ""
-                print(f"{Y}[MANAGER] Red revision consumed — red_attempts={red_attempts}/2{RST}")
+                log.debug(f"[MANAGER] Red revision consumed — red_attempts={red_attempts}/2")
 
             # RETRY_BLUE — Blue chạy lại
             elif action == "RETRY_BLUE":
@@ -906,13 +1106,14 @@ class ManageAgent:
                         recon_context = self.recon_content,
                         memory_store  = self.memory,
                     )
-                print(f"\n{C}{B}══ BLUE TEAM (RETRY) — Review ══{RST}")
+                log.debug(f"[BLUE TEAM] RETRY — Review")
                 blue.set_current_bug(current_bug)
                 response = blue.respond(conversation)
                 if response.startswith("[LLM Error:"):
-                    print(f"{R}{response}{RST}")
+                    log.blue_brief(response, "ERROR")
                 else:
-                    print(f"{C}{_strip_tag_display(response)}{RST}")
+                    blue_intent_preview_r = _infer_dialog_intent("BLUETEAM", response)
+                    log.blue_brief(response, blue_intent_preview_r)
                 conversation.append({
                     "speaker": "BLUETEAM",
                     "content": response,
@@ -925,20 +1126,17 @@ class ManageAgent:
                     candidate_approach = current_approach
                     if not candidate_approach:
                         red_approved = False
-                        print(
-                            f"{Y}[MANAGER] Blue APPROVED (retry) but no current Red strategy/shot plan exists — "
-                            f"forcing Red retry{RST}"
-                        )
+                        log.debug("[MANAGER] Blue APPROVED (retry) but no strategy — forcing Red retry")
                     else:
                         self._record_strategy(current_bug, current_approach, response)
-                        print(f"{G}[MANAGER] Blue APPROVED (retry) — approach recorded{RST}")
+                        log.debug("[MANAGER] Blue APPROVED (retry) — approach recorded")
                 elif blue_intent_raw == "REVISE":
                     red_approved = False
                     current_approach = ""
                     red_attempts += 1
-                    print(f"{Y}[MANAGER] Blue REJECTED (retry) — red_attempts={red_attempts}/2{RST}")
+                    log.debug(f"[MANAGER] Blue REJECTED (retry) — red_attempts={red_attempts}/2")
                 elif blue_intent_raw == "STOP":
-                    print(f"{Y}[MANAGER] Blue STOPPED (retry) — mark NOT_EXPLOITED and next bug{RST}")
+                    log.debug("[MANAGER] Blue STOPPED (retry) — mark NOT_EXPLOITED and next bug")
                     self._mark_bug_not_exploited(
                         current_bug,
                         f"Blue stopped exploitation on retry. Last review: {response[:400]}",
@@ -965,7 +1163,7 @@ class ManageAgent:
             # EXECUTE_BUG
             elif action == "EXECUTE_BUG":
                 if not current_approach:
-                    print(f"{R}[!] EXECUTE_BUG but no approach — fallback DEBATE_RED{RST}")
+                    log.debug("[!] EXECUTE_BUG but no approach — fallback DEBATE_RED")
                     red_approved = False
                     self._last_action = ""
                     conversation.append({
@@ -974,14 +1172,14 @@ class ManageAgent:
                     })
                     continue
 
-                print(f"\n{C}{B}{'='*60}")
-                print(f"  EXECUTE_BUG — {current_bug.get('id', '?')}")
-                print(f"{'='*60}{RST}\n")
-                print(
-                    f"{G}[MANAGER] → EXECUTE_BUG | bug={current_bug.get('id', '?')} "
-                    f"endpoint={current_bug.get('endpoint', '?')} shots=auto(base=1){RST}"
+                log.exec_phase(
+                    f"THỰC THI — {current_bug.get('id', '?')}",
+                    f"Endpoint: {current_bug.get('method', '?')} {current_bug.get('endpoint', '?')}",
                 )
-                print(f"{G}[MANAGER] input: accepted Red strategy sent to Exec{RST}\n")
+                log.debug(
+                    f"[MANAGER] → EXECUTE_BUG | bug={current_bug.get('id', '?')} "
+                    f"endpoint={current_bug.get('endpoint', '?')} shots=auto(base=1)"
+                )
 
                 def _run_with_timeout():
                     import threading
@@ -1013,7 +1211,20 @@ class ManageAgent:
                     "speaker": "AGENT",
                     "content": f"Execution result:\n{exec_result}",
                 })
-                print(f"{G}[MANAGER] Exec output: {_summarize_exec_result(exec_result)}{RST}")
+
+                # Parse and display exec output on terminal
+                exec_output = _extract_exec_output(exec_result)
+                if exec_output:
+                    log.parse_and_display_exec_output(exec_output)
+                
+                # Show verdict
+                decision_preview = self._exec_decision(exec_result, current_bug)
+                log.verdict_box(
+                    decision_preview.get('status', 'UNKNOWN'),
+                    evidence=decision_preview.get('evidence', ''),
+                    reason=decision_preview.get('reason', ''),
+                )
+                log.debug(f"[MANAGER] Exec output: {_summarize_exec_result(exec_result)}")
 
                 # Lưu exec_result vào instance để _decide đọc được
                 self._last_exec_result = exec_result
@@ -1022,7 +1233,7 @@ class ManageAgent:
             # RETRY_EXEC — Exec chạy lại
             elif action == "RETRY_EXEC":
                 if not current_approach:
-                    print(f"{R}[!] RETRY_EXEC but no approach — fallback DEBATE_RED{RST}")
+                    log.debug("[!] RETRY_EXEC but no approach — fallback DEBATE_RED")
                     red_approved = False
                     self._last_action = ""
                     conversation.append({
@@ -1031,14 +1242,10 @@ class ManageAgent:
                     })
                     continue
                 exec_retry_count += 1
-                print(f"\n{C}{B}{'='*60}")
-                print(f"  RETRY_EXEC — {current_bug.get('id', '?')}")
-                print(f"{'='*60}{RST}\n")
-                print(
-                    f"{G}[MANAGER] → RETRY_EXEC | bug={current_bug.get('id', '?')} "
-                    f"endpoint={current_bug.get('endpoint', '?')} shots=auto(base=1){RST}"
+                log.exec_phase(
+                    f"THỰC THI LẠI — {current_bug.get('id', '?')}",
+                    f"Endpoint: {current_bug.get('method', '?')} {current_bug.get('endpoint', '?')} (lần thử {exec_retry_count})",
                 )
-                print(f"{G}[MANAGER] input: retry after partial/failed exploit evidence{RST}\n")
 
                 def _run_with_timeout():
                     import threading
@@ -1070,7 +1277,18 @@ class ManageAgent:
                     "speaker": "AGENT",
                     "content": f"Execution result:\n{exec_result}",
                 })
-                print(f"{G}[MANAGER] Exec output: {_summarize_exec_result(exec_result)}{RST}")
+
+                exec_output = _extract_exec_output(exec_result)
+                if exec_output:
+                    log.parse_and_display_exec_output(exec_output)
+                
+                decision_preview = self._exec_decision(exec_result, current_bug)
+                log.verdict_box(
+                    decision_preview.get('status', 'UNKNOWN'),
+                    evidence=decision_preview.get('evidence', ''),
+                    reason=decision_preview.get('reason', ''),
+                )
+                log.debug(f"[MANAGER] Exec output: {_summarize_exec_result(exec_result)}")
                 self._last_exec_result = exec_result
                 self._record_exec_result(current_bug, current_approach, exec_result)
 
@@ -1079,6 +1297,8 @@ class ManageAgent:
                 # Manager quyết định dừng bug hiện tại (đọc từ note hoặc conversation)
                 # Default: NOT_EXPLOITED, có thể override bằng OOS_SCOPE
                 stop_reason = "NOT_EXPLOITED"
+                if note and "BLOCKED_AUTH" in note.upper():
+                    stop_reason = "BLOCKED_AUTH"
                 for msg in reversed(conversation):
                     if "OOS_SCOPE" in msg.get("content", "").upper():
                         stop_reason = "OOS_SCOPE"
@@ -1088,7 +1308,7 @@ class ManageAgent:
                 current_bug["failure_reason"] = note or f"Manager stopped bug as {stop_reason}."
                 self._save_risk_bugs()
                 bugs_processed_count += 1
-                print(f"{Y}[MANAGER] STOP_BUG — {current_bug.get('id','?')} marked {stop_reason}{RST}")
+                log.debug(f"[MANAGER] STOP_BUG — {current_bug.get('id','?')} marked {stop_reason}")
 
                 result = self._advance_bug(
                     conversation, current_bug, current_bug_index,
@@ -1098,6 +1318,13 @@ class ManageAgent:
                     return
                 current_bug_index = self.current_bug_index
                 current_bug = self.risk_bugs[current_bug_index]
+                # ── Dedup: skip nếu endpoint đã EXPLOITED ở bug trước ──
+                current_bug, current_bug_index = self._skip_duplicate_endpoints(
+                    conversation, current_bug, current_bug_index,
+                    bugs_processed_count, red, exec_agent,
+                )
+                if current_bug is None:
+                    return  # hết bug
                 red_approved = False
                 red_attempts = 0
                 exec_retry_count = 0
@@ -1111,16 +1338,16 @@ class ManageAgent:
                 if prior_action in ("EXECUTE_BUG", "RETRY_EXEC") and current_bug.get("status") == "EXPLOITED":
                     current_bug["PoC"] = current_bug.get("PoC") or getattr(self, "_last_exec_result", "")
                     self._save_risk_bugs()
-                    print(f"{G}[MANAGER] {current_bug.get('id', '?')} marked EXPLOITED{RST}")
+                    log.info(f"{current_bug.get('id', '?')} → KHAI THÁC THÀNH CÔNG")
                 elif current_bug.get("status", "PENDING") == "PENDING":
                     self._mark_bug_not_exploited(
                         current_bug,
                         "Manager advanced before a confirmed exploit was captured.",
                         current_approach,
                     )
-                    print(
-                        f"{Y}[MANAGER] {current_bug.get('id', '?')} marked NOT_EXPLOITED "
-                        f"before advancing{RST}"
+                    log.debug(
+                        f"[MANAGER] {current_bug.get('id', '?')} marked NOT_EXPLOITED "
+                        f"before advancing"
                     )
                 bugs_processed_count += 1
                 result = self._advance_bug(
@@ -1132,6 +1359,13 @@ class ManageAgent:
                 # Sync local state after _advance_bug updates self
                 current_bug_index = self.current_bug_index
                 current_bug = self.risk_bugs[current_bug_index]
+                # ── Dedup: skip nếu endpoint đã EXPLOITED ở bug trước ──
+                current_bug, current_bug_index = self._skip_duplicate_endpoints(
+                    conversation, current_bug, current_bug_index,
+                    bugs_processed_count, red, exec_agent,
+                )
+                if current_bug is None:
+                    return  # hết bug
                 red_approved = False
                 red_attempts = 0
                 exec_retry_count = 0
@@ -1149,7 +1383,7 @@ class ManageAgent:
                 return
 
             else:
-                print(f"{Y}[!] Action không hợp lệ '{action}' → fallback DEBATE_RED{RST}")
+                log.debug(f"[!] Action không hợp lệ '{action}' → fallback DEBATE_RED")
 
             # End of tick: persist + compress
             self._persist_new_messages(conversation, tick_start_len)
@@ -1160,7 +1394,7 @@ class ManageAgent:
             )
 
         # MAX_TICKS exhausted
-        print(f"\n{R}[!] Hết {MAX_TICKS} ticks — REPORT_FAIL{RST}")
+        log.warn(f"Hết {MAX_TICKS} ticks — REPORT_FAIL")
         self._write_report_fail(f"Hết giới hạn {MAX_TICKS} ticks.")
 
     def _advance_bug(
@@ -1205,11 +1439,154 @@ class ManageAgent:
                     f"{next_bug.get('id', '?')} — {next_bug.get('title', '?')}"
                 ),
             })
-            print(
-                f"{M}[MANAGER] NEXT_BUG → {next_index + 1}/{n} "
-                f"({next_bug.get('id', '?')}){RST}"
-            )
+            log.bug_header(next_index + 1, n, next_bug)
             return "CONTINUE"
+
+    def _preflight_current_bug(
+        self,
+        conversation: list[dict],
+        current_bug: dict,
+        current_bug_index: int,
+        bugs_processed_count: int,
+        red,
+        exec_agent,
+    ) -> str:
+        """Skip candidates whose prerequisites are absent before spending Red/Blue/Exec turns."""
+        status = str(current_bug.get("status", "PENDING") or "PENDING").upper()
+        if status != "PENDING":
+            return ""
+
+        bug_id = current_bug.get("id", "?")
+        http_examples = current_bug.get("http_examples") or []
+        if current_bug.get("auth_required") and not self.has_authenticated_context and not http_examples:
+            reason = (
+                "BLOCKED_AUTH: candidate yêu cầu authenticated context nhưng crawl không có "
+                "authenticated session verified và bug không có http_examples để Exec bám theo."
+            )
+            current_bug["status"] = "BLOCKED_AUTH"
+            current_bug["failure_reason"] = reason
+            self._save_risk_bugs()
+            log.warn(f"{bug_id} bị chặn preflight: {reason}")
+            return self._advance_bug(
+                conversation, current_bug, current_bug_index,
+                bugs_processed_count + 1, red, exec_agent,
+            )
+
+        if self._is_challenge_metadata_candidate(current_bug):
+            reason = (
+                "SKIPPED_METADATA: candidate chỉ dựa trên metadata /api/Challenges của lab "
+                "(tên challenge/admin marker), không phải endpoint/chức năng BAC/BLF thực tế."
+            )
+            current_bug["status"] = "SKIPPED_METADATA"
+            current_bug["failure_reason"] = reason
+            self._save_risk_bugs()
+            log.warn(f"{bug_id} bị chặn preflight: {reason}")
+            return self._advance_bug(
+                conversation, current_bug, current_bug_index,
+                bugs_processed_count + 1, red, exec_agent,
+            )
+
+        return ""
+
+    def _has_authenticated_context(self) -> bool:
+        """Return True only when crawl captured a non-placeholder authenticated session."""
+        path = Path(self.run_dir) / "crawl_raw.json"
+        if not path.is_file():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        authenticated = payload.get("authenticated", []) or []
+        if not isinstance(authenticated, list):
+            return False
+        for entry in authenticated:
+            if not isinstance(entry, dict):
+                continue
+            cookies = entry.get("cookies", []) or []
+            if not cookies:
+                continue
+            header = "; ".join(
+                f"{c.get('name')}={c.get('value')}"
+                for c in cookies
+                if isinstance(c, dict) and c.get("name") and c.get("value")
+            )
+            if header and "<value>" not in header and "placeholder" not in header.lower():
+                return True
+        return False
+
+    @staticmethod
+    def _is_challenge_metadata_candidate(bug: dict) -> bool:
+        endpoint = str(bug.get("endpoint", "") or "").lower()
+        http_examples = bug.get("http_examples") or []
+        text = " ".join(
+            str(bug.get(k, "") or "")
+            for k in ("title", "hypothesis", "exploit_approach", "verify_method")
+        ).lower()
+        clues = " ".join(str(c) for c in (bug.get("response_clues") or [])).lower()
+        combined = f"{text}\n{clues}"
+        metadata_markers = (
+            "challenge metadata",
+            "challenge list",
+            "adminsectionchallenge",
+            "registeradminchallenge",
+            "admin registration",
+            "admin section",
+            "challenge key",
+            "contains admin-related challenges",
+            "recon notes mention admin-related challenges",
+            "key includes",
+        )
+        if "challenge" in endpoint:
+            return any(marker in combined for marker in metadata_markers)
+        if http_examples:
+            return False
+        return any(marker in combined for marker in metadata_markers)
+
+    def _skip_duplicate_endpoints(
+        self,
+        conversation: list[dict],
+        current_bug: dict,
+        current_bug_index: int,
+        bugs_processed_count: int,
+        red,
+        exec_agent,
+    ) -> tuple[dict | None, int]:
+        """Skip bugs whose endpoint was already EXPLOITED by a prior bug.
+
+        Returns (current_bug, current_bug_index) after skipping, or
+        (None, -1) if all remaining bugs were skipped and report was written.
+        """
+        n = len(self.risk_bugs)
+        exploited_endpoints = {
+            b.get("endpoint")
+            for b in self.risk_bugs[:current_bug_index]
+            if b.get("status") == "EXPLOITED" and b.get("endpoint")
+        }
+
+        while current_bug.get("endpoint") in exploited_endpoints:
+            log.info(
+                f"⏭ {current_bug.get('id', '?')} — endpoint "
+                f"{current_bug.get('endpoint')} đã EXPLOITED ở bug trước → bỏ qua"
+            )
+            current_bug["status"] = "SKIPPED_DUPLICATE"
+            current_bug["failure_reason"] = (
+                f"Endpoint {current_bug.get('endpoint')} đã được khai thác thành công "
+                f"ở bug khác — không cần test lại."
+            )
+            self._save_risk_bugs()
+            bugs_processed_count += 1
+
+            result = self._advance_bug(
+                conversation, current_bug, current_bug_index,
+                bugs_processed_count, red, exec_agent,
+            )
+            if result in ("REPORT_SUCCESS", "REPORT_FAIL"):
+                return None, -1
+            current_bug_index = self.current_bug_index
+            current_bug = self.risk_bugs[current_bug_index]
+
+        return current_bug, current_bug_index
 
     def _record_strategy(
         self,
@@ -1279,6 +1656,10 @@ class ManageAgent:
         self._record_exec_attempt(current_bug, approach, exec_result)
         decision = self._exec_decision(exec_result, current_bug)
         status = decision["status"]
+        log.debug(
+            f"[MANAGER] Exec decision: status={status} "
+            f"signal={decision.get('signal', '?')} reason={truncate(decision.get('reason', ''), 150)}"
+        )
 
         current_bug["exec_result_status"] = status
         current_bug["exec_result_reason"] = decision["reason"]
@@ -1303,20 +1684,25 @@ class ManageAgent:
             current_bug["PoC"] = exec_result
             current_bug["exploited_evidence_summary"] = truncate(decision["evidence"], 1600)
             current_bug.pop("failure_reason", None)
-            print(
-                f"{G}[MANAGER] Exec decision: EXPLOITED — "
-                f"{truncate(decision['evidence'], 220)}{RST}"
+            log.debug(
+                f"[MANAGER] Exec decision: EXPLOITED — "
+                f"{truncate(decision['evidence'], 220)}"
             )
         elif status == "SCRIPT_ERROR":
             current_bug["failure_reason"] = truncate(decision["reason"], 1000)
-            print(f"{Y}[MANAGER] Exec decision: SCRIPT_ERROR — {truncate(decision['reason'], 220)}{RST}")
+            log.debug(f"[MANAGER] Exec decision: SCRIPT_ERROR — {truncate(decision['reason'], 220)}")
+        elif status == "WRONG_TARGET":
+            # 404 trên tất cả request → resource ID sai, xử lý như PARTIAL để cho retry
+            current_bug["failure_reason"] = truncate(decision["reason"], 1000)
+            current_bug["exec_result_status"] = "WRONG_TARGET"
+            log.warn(f"[MANAGER] Exec decision: WRONG_TARGET — endpoint/resource ID không tồn tại. Có thể retry.")
         elif status == "PARTIAL":
             current_bug["failure_reason"] = truncate(decision["reason"], 1000)
-            print(f"{Y}[MANAGER] Exec decision: PARTIAL — {truncate(decision['reason'], 220)}{RST}")
+            log.debug(f"[MANAGER] Exec decision: PARTIAL — {truncate(decision['reason'], 220)}")
         else:
             current_bug["status"] = "NOT_EXPLOITED"
             current_bug["failure_reason"] = truncate(decision["reason"], 1000)
-            print(f"{Y}[MANAGER] Exec decision: FAILED — {truncate(decision['reason'], 220)}{RST}")
+            log.debug(f"[MANAGER] Exec decision: FAILED — {truncate(decision['reason'], 220)}")
 
         self._save_risk_bugs()
         return decision
@@ -1441,10 +1827,18 @@ class ManageAgent:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self.risk_bugs, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"{Y}[!] Could not save risk-bug.json: {e}{RST}")
+            log.debug(f"[!] Could not save risk-bug.json: {e}")
 
     def _exec_decision(self, exec_result: str, current_bug: dict) -> dict:
-        """Classify Exec's self-verified exploit result without a second verifier."""
+        """Classify Exec's self-verified exploit result.
+
+        Priority (top → bottom, first match wins):
+          1. Runtime/syntax error → SCRIPT_ERROR
+          2. All 404s → WRONG_TARGET (resource không tồn tại, cần retry khác ID)
+          3. Script's explicit FINAL marker (EXPLOITED/FAILED) → trust script
+          4. result.json status → trust JSON
+          5. Heuristic signal (chỉ khi script ko rõ ràng)
+        """
         output = _extract_exec_output(exec_result) or exec_result or ""
         lower_result = str(exec_result or "").lower()
         lower_output = str(output or "").lower()
@@ -1456,6 +1850,7 @@ class ManageAgent:
         return_code = self._extract_exec_return_code(exec_result)
         evidence = _summarize_exec_output(exec_result, max_lines=8)
 
+        # ── 1. Runtime/syntax error ──
         runtime_markers = (
             "syntax_check: fail", "script validation failed", "python py_compile failed",
             "syntax error", "command not found", "[timeout]", "timed out",
@@ -1468,41 +1863,81 @@ class ManageAgent:
                 "evidence": evidence,
             }
 
-        if json_status == "EXPLOITED" or success_verdict == "YES" or final_marker == "EXPLOITED":
+        # ── 2. All 404 = targeting sai resource ID, không phải exploit failed ──
+        if attempt.get("signal") == "WRONG_TARGET":
             return {
-                "status": "EXPLOITED",
-                "reason": evidence or "Exec reported EXPLOITED.",
+                "status": "WRONG_TARGET",
+                "reason": evidence or "Tất cả request đều trả 404 — endpoint/resource ID sai.",
                 "evidence": evidence,
             }
 
-        # Anti-overfitting: accept minimum sufficient proof from the current dossier/strategy.
-        # A read-only BAC/IDOR proof can be a 2xx response plus a privileged/object marker;
-        # it does not need extra endpoints or stronger side effects.
-        if attempt.get("signal") in {"PROOF_CANDIDATE", "NEW_LEAD"}:
+        # ── 3. Script nói rõ EXPLOITED → tin tưởng ──
+        if final_marker == "EXPLOITED" or success_verdict == "YES":
+            return self._confirmed_exploit_decision(
+                exec_result,
+                current_bug,
+                result_json,
+                evidence,
+                "Exec reported EXPLOITED.",
+            )
+
+        # ── 4. Script nói rõ FAILED → tin tưởng, KHÔNG override bởi heuristic ──
+        #    Đây là fix chống false positive: khi script in FINAL: FAILED + rc=1,
+        #    trước đây heuristic vẫn có thể override lên EXPLOITED.
+        if final_marker == "FAILED" or (success_verdict == "NO" and return_code == 1):
             return {
-                "status": "EXPLOITED",
-                "reason": evidence or "Exec observed a candidate proof matching the bug hypothesis.",
+                "status": "FAILED",
+                "reason": evidence or "Exec marked the exploit as failed.",
                 "evidence": evidence,
             }
 
+        # ── 5. result.json status ──
+        if json_status == "EXPLOITED":
+            return self._confirmed_exploit_decision(
+                exec_result,
+                current_bug,
+                result_json,
+                evidence,
+                "result.json reports EXPLOITED.",
+            )
+        if json_status in {"FAILED", "NO", "NOT_EXPLOITED"}:
+            return {
+                "status": "FAILED",
+                "reason": evidence or "result.json reports FAILED.",
+                "evidence": evidence,
+            }
+
+        # ── 6. result.json có positive marker cụ thể ──
         if self._result_json_has_positive_marker(result_json):
-            return {
-                "status": "EXPLOITED",
-                "reason": evidence or "result.json contains a positive proof marker.",
-                "evidence": evidence,
-            }
+            return self._confirmed_exploit_decision(
+                exec_result,
+                current_bug,
+                result_json,
+                evidence,
+                "result.json contains a positive proof marker.",
+            )
+
+        # ── 7. Heuristic signal (chỉ khi script ko rõ ràng) ──
+        if attempt.get("signal") == "PROOF_CANDIDATE":
+            return self._confirmed_exploit_decision(
+                exec_result,
+                current_bug,
+                result_json,
+                evidence,
+                "Heuristic: proof candidate matching hypothesis.",
+            )
 
         if json_status in {"PARTIAL", "INCONCLUSIVE"} or success_verdict == "PARTIAL" or final_marker == "PARTIAL" or return_code == 2:
             return {
                 "status": "PARTIAL",
-                "reason": evidence or "Exec found some signal but did not mark the exploit complete.",
+                "reason": evidence or "Exec found some signal but exploit incomplete.",
                 "evidence": evidence,
             }
 
-        if json_status in {"FAILED", "NO", "NOT_EXPLOITED"} or success_verdict == "NO" or final_marker == "FAILED" or return_code == 1:
+        if success_verdict == "NO" or return_code == 1:
             return {
                 "status": "FAILED",
-                "reason": evidence or "Exec marked the exploit as failed.",
+                "reason": evidence or "Exec indicated failure.",
                 "evidence": evidence,
             }
 
@@ -1511,6 +1946,307 @@ class ManageAgent:
             "reason": evidence or "Exec result is ambiguous.",
             "evidence": evidence,
         }
+
+    def _confirmed_exploit_decision(
+        self,
+        exec_result: str,
+        current_bug: dict,
+        result_json: dict,
+        evidence: str,
+        default_reason: str,
+    ) -> dict:
+        """Accept EXPLOITED only after BAC/BLF proof-quality gates pass."""
+        quality_block = self._proof_quality_block(exec_result, current_bug, result_json)
+        if quality_block:
+            return quality_block
+        return {
+            "status": "EXPLOITED",
+            "reason": evidence or default_reason,
+            "evidence": evidence,
+        }
+
+    def _proof_quality_block(
+        self,
+        exec_result: str,
+        current_bug: dict,
+        result_json: dict,
+    ) -> dict:
+        """Downgrade weak success claims that do not prove the target BAC/BLF pattern."""
+        metadata_reason = self._metadata_only_exec_proof_reason(exec_result, current_bug)
+        if metadata_reason:
+            return {
+                "status": "PROOF_QUALITY_FAIL",
+                "reason": metadata_reason,
+                "evidence": metadata_reason,
+            }
+
+        pattern_id = str(current_bug.get("pattern_id", "") or "").upper()
+        category = str(current_bug.get("category", "") or "").lower()
+        bug_text = " ".join(
+            str(current_bug.get(k, "") or "")
+            for k in ("title", "hypothesis", "endpoint", "verify_method", "exploit_approach")
+        ).lower()
+        exec_text = str(exec_result or "").lower()
+        json_text = self._json_text(result_json)
+
+        if pattern_id == "BAC-01" or ("admin" in bug_text and "bac" in category):
+            if not self._has_concrete_admin_control(exec_text, json_text):
+                reason = (
+                    "PROOF_QUALITY_FAIL: BAC-01/admin proof requires a concrete privileged "
+                    "control or admin API capability. Status 200, generic admin text, or "
+                    "challenge markers alone are not accepted."
+                )
+                return {"status": "PROOF_QUALITY_FAIL", "reason": reason, "evidence": reason}
+
+        if pattern_id in {"BAC-02", "BAC-03"} or "idor" in bug_text:
+            if not self._has_object_ownership_bypass(result_json, exec_text):
+                if self._has_public_info_exposure_signal(result_json, exec_text):
+                    reason = (
+                        "INFO_EXPOSURE_ONLY: response exposes user-linked data publicly, "
+                        "but Exec did not prove object ownership bypass/cross-user access. "
+                        "Do not count this as confirmed BAC/IDOR."
+                    )
+                    return {"status": "INFO_EXPOSURE_ONLY", "reason": reason, "evidence": reason}
+                reason = (
+                    "PROOF_QUALITY_FAIL: BAC/IDOR proof requires accessing an object/data "
+                    "record owned by another user or role. The current evidence does not "
+                    "show ownership bypass."
+                )
+                return {"status": "PROOF_QUALITY_FAIL", "reason": reason, "evidence": reason}
+
+        if pattern_id.startswith("BLF") or "business logic" in category or "blf" in category:
+            if not self._has_business_logic_state_change(result_json, exec_text):
+                reason = (
+                    "PROOF_QUALITY_FAIL: BLF proof requires before/after state, a non-zero "
+                    "delta, or a verified invalid state transition. A successful request "
+                    "without measured impact is not accepted."
+                )
+                return {"status": "PROOF_QUALITY_FAIL", "reason": reason, "evidence": reason}
+
+        return {}
+
+    @staticmethod
+    def _metadata_only_exec_proof_reason(exec_result: str, current_bug: dict) -> str:
+        """Reject success claims whose proof comes from challenge/metadata text only."""
+        text = str(exec_result or "").lower()
+        bug_text = " ".join(
+            str(current_bug.get(k, "") or "")
+            for k in ("endpoint", "title", "hypothesis", "verify_method")
+        ).lower()
+
+        metadata_hits = (
+            "/api/challenges",
+            '"probe": "challenges"',
+            "adminsectionchallenge",
+            "registeradminchallenge",
+            "challenge metadata",
+            "challenge list",
+            "admin marker found in anonymous probe",
+        )
+        if not any(hit in text for hit in metadata_hits):
+            return ""
+
+        strong_admin_controls = (
+            "admin dashboard",
+            "user management",
+            "manage users",
+            "role management",
+            "delete user",
+            "order management",
+            "admin api resource",
+            "privileged control",
+        )
+        if any(marker in text for marker in strong_admin_controls):
+            return ""
+
+        admin_candidate = (
+            "admin" in bug_text
+            or str(current_bug.get("pattern_id", "")).upper() == "BAC-01"
+        )
+        if not admin_candidate:
+            return ""
+
+        return (
+            "METADATA_ONLY_PROOF: Exec reported EXPLOITED using /api/Challenges or "
+            "challenge metadata markers, but no concrete admin UI/API control was proven "
+            "on the claimed endpoint."
+        )
+
+    @staticmethod
+    def _json_text(data: dict) -> str:
+        try:
+            return json.dumps(data or {}, ensure_ascii=False, sort_keys=True).lower()
+        except Exception:
+            return str(data or "").lower()
+
+    @staticmethod
+    def _as_list(value) -> list:
+        if isinstance(value, list):
+            return value
+        if value is None:
+            return []
+        return [value]
+
+    @staticmethod
+    def _status_is_2xx(value) -> bool:
+        try:
+            code = int(value)
+        except Exception:
+            return False
+        return 200 <= code < 300
+
+    @staticmethod
+    def _has_owner_marker(item: dict) -> bool:
+        owner_keys = {"userid", "user_id", "ownerid", "owner_id", "accountid", "account_id", "customerid", "customer_id"}
+        return any(str(key).lower() in owner_keys for key in item)
+
+    @classmethod
+    def _iter_dicts(cls, value):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from cls._iter_dicts(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from cls._iter_dicts(child)
+
+    @classmethod
+    def _has_object_ownership_bypass(cls, result_json: dict, exec_text: str) -> bool:
+        """True only for concrete direct-object or cross-user access proof."""
+        direct_keys = (
+            "probe_results", "probes", "direct_object_results",
+            "object_probes", "idor_probes", "cross_user_results",
+        )
+        for key in direct_keys:
+            for item in cls._as_list((result_json or {}).get(key)):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("error"):
+                    continue
+                status = item.get("status_code", item.get("status"))
+                if cls._status_is_2xx(status) and any(cls._has_owner_marker(nested) for nested in cls._iter_dicts(item)):
+                    return True
+
+        verify = (result_json or {}).get("verify_result")
+        if isinstance(verify, dict) and cls._status_is_2xx(verify.get("status_code", verify.get("status"))):
+            requested_user = verify.get("userId", verify.get("user_id"))
+            rows = verify.get("feedbacks") or verify.get("items") or verify.get("records") or []
+            if requested_user is not None and isinstance(rows, list) and rows:
+                try:
+                    requested = int(requested_user)
+                    observed = [
+                        int(row.get("UserId", row.get("userId", row.get("user_id"))))
+                        for row in rows
+                        if isinstance(row, dict)
+                        and row.get("UserId", row.get("userId", row.get("user_id"))) is not None
+                    ]
+                except Exception:
+                    observed = []
+                if observed and all(user_id == requested for user_id in observed):
+                    return True
+
+        for item in cls._iter_dicts(result_json or {}):
+            if any(
+                bool(item.get(key))
+                for key in (
+                    "ownership_bypass", "cross_user_access", "other_user_access",
+                    "unauthorized_object_access", "accessed_other_user_object",
+                )
+            ):
+                return True
+
+        direct_object_pattern = (
+            r"/api/[a-z0-9_/-]+/\d+\s+status=2\d\d"
+            r".{0,160}(userid|user_id|ownerid|owner_id|accountid|customerid)\s*="
+        )
+        if re.search(direct_object_pattern, exec_text, re.IGNORECASE | re.DOTALL):
+            return True
+        if re.search(r"(cross-user|other user|user a .* user b|not owned by).{0,160}status=2\d\d", exec_text, re.IGNORECASE | re.DOTALL):
+            return True
+        return False
+
+    @classmethod
+    def _has_public_info_exposure_signal(cls, result_json: dict, exec_text: str) -> bool:
+        baseline = (result_json or {}).get("baseline_summary")
+        if isinstance(baseline, dict):
+            entries = baseline.get("sample_entries") or baseline.get("entries") or []
+            if baseline.get("count", 0) and isinstance(entries, list):
+                for item in entries:
+                    if isinstance(item, dict) and cls._has_owner_marker(item):
+                        return True
+        proof = (result_json or {}).get("proof")
+        if isinstance(proof, dict):
+            for item in cls._as_list(proof.get("baseline")):
+                if isinstance(item, dict) and cls._has_owner_marker(item):
+                    return True
+        public_markers = (
+            "baseline leaks userid", "baseline leaks user_id",
+            "public exposure", "public get", "feedbacks_found",
+            "userid+comment", "user-linked data",
+        )
+        return any(marker in exec_text for marker in public_markers)
+
+    @staticmethod
+    def _has_concrete_admin_control(exec_text: str, json_text: str) -> bool:
+        text = f"{exec_text}\n{json_text}"
+        control_markers = (
+            "admin dashboard", "admin panel", "administration dashboard",
+            "user management", "manage users", "delete user", "remove user",
+            "role management", "change role", "promote user", "demote user",
+            "privileged control", "admin api resource", "admin-only api",
+            "all users", "/api/users status=200", "/rest/admin", "/api/admin",
+        )
+        return any(marker in text for marker in control_markers)
+
+    @classmethod
+    def _has_business_logic_state_change(cls, result_json: dict, exec_text: str) -> bool:
+        positive_bool_markers = (
+            "state_changed", "changed", "price_changed", "total_changed",
+            "balance_changed", "cart_changed", "quantity_changed",
+            "inventory_decremented", "stock_decreased", "discount_applied",
+            "order_created", "checkout_succeeded", "invalid_state_accepted",
+            "negative_quantity_accepted", "coupon_reused",
+        )
+        for item in cls._iter_dicts(result_json or {}):
+            for key, value in item.items():
+                key_lower = str(key).lower()
+                if key_lower == "status":
+                    continue
+                if isinstance(value, bool) and value and any(marker in key_lower for marker in positive_bool_markers):
+                    return True
+                if isinstance(value, (int, float)) and "delta" in key_lower and value != 0:
+                    return True
+            if "before" in item and "after" in item:
+                before = item.get("before")
+                after = item.get("after")
+                if before is not None and after is not None and str(before) != str(after):
+                    return True
+
+        for match in re.finditer(r"(?:delta|change|difference)\s*[:=]\s*(-?\d+(?:\.\d+)?)", exec_text):
+            try:
+                if float(match.group(1)) != 0:
+                    return True
+            except ValueError:
+                continue
+
+        before_after = re.search(
+            r"before[^0-9-]{0,40}(-?\d+(?:\.\d+)?).*after[^0-9-]{0,40}(-?\d+(?:\.\d+)?)",
+            exec_text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if before_after:
+            try:
+                return float(before_after.group(1)) != float(before_after.group(2))
+            except ValueError:
+                return True
+
+        text_state_markers = (
+            "state changed", "balance changed", "price changed", "total changed",
+            "inventory decreased", "order created", "checkout succeeded",
+            "invalid state transition accepted", "negative quantity accepted",
+            "coupon reused",
+        )
+        return any(marker in exec_text for marker in text_state_markers)
 
     @staticmethod
     def _extract_exec_return_code(exec_result: str) -> int:
@@ -1646,14 +2382,13 @@ Artifact:
             if b not in exploitable
         ]
 
-        print(f"\n{C}{B}{'='*60}")
-        print(f"  REPORT_SUCCESS — {len(exploitable)} validated bug(s)")
-        print(f"{'='*60}{RST}\n")
+        log.report_summary(
+            exploitable,
+            len(self.risk_bugs),
+            str(Path(self.run_dir) / "report.md"),
+        )
         for b in exploitable:
-            print(f"{G}  [{b.get('id', '?')}] {b.get('title', '?')}{RST}")
-            print(f"    Status: {b.get('status')}")
-            print(f"    PoC: {str(b.get('PoC', ''))[:200]}...")
-            print()
+            log.debug(f"  [{b.get('id', '?')}] {b.get('title', '?')} Status: {b.get('status')}")
 
         exploited_text = (
             "\n".join(self._format_bug_report_section(b) for b in exploitable)
@@ -1736,15 +2471,14 @@ Các candidate không đủ bằng chứng được giữ riêng ở mục cuố
         raw_path.write_text(raw_report_md, encoding="utf-8")
         final_path.write_text(final_report_md, encoding="utf-8")
         report_path.write_text(final_report_md, encoding="utf-8")
-        print(f"\n{G}[+] Report saved: {report_path.resolve()}{RST}")
-        print(f"{G}[+] Raw report saved: {raw_path.resolve()}{RST}")
-        print(f"{G}[+] Final Vietnamese report saved: {final_path.resolve()}{RST}")
+        log.debug(f"Report saved: {report_path.resolve()}")
+        log.debug(f"Raw report saved: {raw_path.resolve()}")
+        log.debug(f"Final Vietnamese report saved: {final_path.resolve()}")
 
     def _write_report_fail(self, reason: str) -> None:
-        print(f"\n{C}{B}{'='*60}")
-        print(f"  REPORT_FAIL")
-        print(f"{'='*60}{RST}\n")
-        print(f"{R}Reason: {reason}{RST}")
+        not_exploitable = self.risk_bugs
+        log.report_summary([], len(self.risk_bugs), str(Path(self.run_dir) / "report.md"))
+        log.debug(f"REPORT_FAIL Reason: {reason}")
 
         raw_report_md = f"""# MARL Raw Penetration Test Report
 **Target:** {self.target_url}
@@ -1784,9 +2518,9 @@ No bugs were successfully exploited. Reason: {reason}
         raw_path.write_text(raw_report_md, encoding="utf-8")
         final_path.write_text(final_report_md, encoding="utf-8")
         report_path.write_text(final_report_md, encoding="utf-8")
-        print(f"\n{G}[+] Report saved: {report_path.resolve()}{RST}")
-        print(f"{G}[+] Raw report saved: {raw_path.resolve()}{RST}")
-        print(f"{G}[+] Final Vietnamese report saved: {final_path.resolve()}{RST}")
+        log.debug(f"Report saved: {report_path.resolve()}")
+        log.debug(f"Raw report saved: {raw_path.resolve()}")
+        log.debug(f"Final Vietnamese report saved: {final_path.resolve()}")
 
     # ══════════════════════════════════════════════════════════
     # INTERNAL — Manager LLM decision
@@ -1871,17 +2605,34 @@ No bugs were successfully exploited. Reason: {reason}
             status = str(current_bug.get("exec_result_status") or decision.get("status", "")).upper()
             reason = truncate(str(current_bug.get("exec_result_reason") or decision.get("reason", "")), 220)
 
+            # ── EXPLOITED → immediate success ──
             if status == "EXPLOITED":
                 return "NEXT_BUG", f"Exec {bug_label} tự verify EXPLOITED. {reason}"
-            if status == "SCRIPT_ERROR":
-                if retry_count < 1:
-                    return "RETRY_EXEC", f"Exec {bug_label} lỗi script/runtime. Retry Exec một lần. {reason}"
-                return "STOP_BUG", f"Exec {bug_label} vẫn lỗi script sau retry. STOP bug."
-            if status == "PARTIAL":
-                if retry_count < 1:
-                    return "RETRY_EXEC", f"Exec {bug_label} PARTIAL. Retry Exec một lần để chốt evidence. {reason}"
-                return "STOP_BUG", f"Exec {bug_label} vẫn PARTIAL sau retry. STOP bug để tránh overfitting."
-            return "STOP_BUG", f"Exec {bug_label} FAILED/NO_SIGNAL. {reason}"
+
+            # ── Non-EXPLOITED → DIAGNOSIS trước khi quyết định ──
+            log.debug(
+                f"[MANAGER] 🔍 Phân tích thất bại {bug_label}: "
+                f"status={status} retry_count={retry_count}"
+            )
+            diag_action, diag_note = self._diagnose_failure(
+                current_bug, last_exec, status, retry_count,
+            )
+
+            # Guardrail: nếu diagnosis nói RETRY_RED nhưng đã quá số lần → force STOP
+            red_attempts_count = state_context.get("red_attempts", 0)
+            if diag_action == "RETRY_RED" and red_attempts_count >= 2:
+                log.info(
+                    f"[MANAGER] Diagnosis nói RETRY_RED nhưng red_attempts={red_attempts_count} >= 2 "
+                    f"→ force STOP_BUG để tránh loop."
+                )
+                diag_action = "STOP_BUG"
+                diag_note = (
+                    f"[PHÂN TÍCH] {bug_label}: Đã thử {red_attempts_count} lần strategy khác nhau. "
+                    f"NOT_VULNERABLE — dừng bug."
+                )
+
+            log.info(f"[PHÂN TÍCH] {bug_label} → {diag_action}")
+            return diag_action, diag_note
 
         # ── Shortcut: first tick → always start with DEBATE_RED ──
         if state_context.get("tick", 0) == 0:
@@ -1965,7 +2716,7 @@ No bugs were successfully exploited. Reason: {reason}
             )
             text = resp.choices[0].message.content or ""
         except Exception as e:
-            print(f"{Y}[!] Manager LLM error: {e} — fallback logic{RST}")
+            log.debug(f"[!] Manager LLM error: {e} — fallback logic")
             text = ""
 
         action = self._extract_action(text, state_context)

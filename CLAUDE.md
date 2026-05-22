@@ -60,27 +60,28 @@ Phase 1: RECON
   → LLM analyzes traffic → writes workspace/recon.md
 
 Phase 2: DEBATE (max 30 steps, max 5 reject/revise rounds)
-  Red Team writes attack workflow (can ask ExecAgent via [AGENT] tag)
-  → Blue Team reviews against criteria
-  → [APPROVED] or [REDTEAM] (reject) or [AGENT] (verify)
+  ManageAgent orchestrates: Red writes strategy → Blue reviews
+  → ManageAgent infers intent (APPROVE/REVISE/STOP) from content
+  → Blue approval gates execution
 
 Phase 3: EXECUTION
-  ExecAgent executes approved workflow step-by-step via MCP tools
+  ExecAgent generates a Python exploit for the approved strategy
+  → py_compile → run script → save artifacts → self-verify with FINAL/result.json
 
-Phase 4: EVALUATION (max 5 eval steps)
-  Red Team evaluates results → [DONE] or [BLUETEAM] (new strategy, up to 2 retries)
-  Red can call [AGENT] for read-only verification (VERIFY_SYSTEM_PROMPT)
+Phase 4: MANAGER DECISION
+  ManageAgent reads Exec output/result.json
+  → EXPLOITED goes NEXT_BUG, SCRIPT_ERROR/PARTIAL retries once, FAILED stops bug
 
 Phase 5: REPORT
-  Generate workspace/report.md with verdict, workflow, execution output
+  Generate workspace/report.md/report_final_vi.md with findings and false-positive candidates
 ```
 
-The outer loop retries Phases 2–4 up to `MAX_EXEC_RETRIES + 1` (3) times if Red requests a new strategy. The conversation accumulates across retries.
+ManageAgent handles retries per bug inside the tick loop. Exec retry is capped to one retry by default.
 
 ### Guardrails
 
-- **MIN_DEBATE_ROUNDS (2)**: Blue's `[APPROVED]` is blocked if fewer than 2 Red↔Blue rounds have completed. The orchestrator injects a `SYSTEM` message telling Blue to keep reviewing.
-- **Workflow extraction**: `_extract_last_workflow()` scans the conversation backwards for Red's most recent message containing keywords (`chiến lược`, `workflow`, `attack plan`, `bước 1`, etc.). Falls back to the last Red message.
+- **Blue strategy gate**: Exec only runs after the current Red strategy has Blue approval.
+- **Current workflow scoping**: Manager uses the current in-memory strategy, not a stale strategy from an older bug.
 
 ### Logging
 
@@ -90,11 +91,15 @@ The outer loop retries Phases 2–4 up to `MAX_EXEC_RETRIES + 1` (3) times if Re
 
 Each run creates `workspace/{domain}_{YYYYMMDD_HHMMSS}/` (gitignored):
 - `recon.md` — CrawlAgent's reconnaissance report (Phase 1)
-- `report.md` — final penetration test report with verdict, workflow, execution output, Red evaluation (Phase 5)
+- `report.md` / `report_final_vi.md` — final report with exploited findings and false-positive candidates
 - `marl.log` — full session log with timestamps
 - PoC scripts and evidence files created by ExecAgent during Phase 3
 
 All agent file I/O (filesystem MCP, shell) is scoped to this run directory.
+
+### Agent Isolation Model
+
+Agents operate in **isolation** — each agent works in its own "room" and does not know other agents exist. Red Team does not know about Blue Team or ExecAgent. Blue Team does not know about Red Team or ExecAgent. ExecAgent does not know about Red/Blue. ManageAgent is the **sole orchestrator** that bridges communication between agents. This prevents agents from bypassing the debate process (e.g., Red directly commanding ExecAgent to run exploits) and keeps each agent focused on its specific role.
 
 ### Conversation Format and Message Flow
 
@@ -111,19 +116,18 @@ Each agent's `_build_messages()` converts this to OpenAI format:
 
 Legacy modules in `test/` use `{"role": ..., "content": ...}` format and are incompatible.
 
-### Tag-Driven Routing
+### Intent-Based Routing
 
-Agents signal the next handler via tags at the end of their response. `extract_next_tag()` in `shared/utils.py` finds all tags matching `\[(TAG)\]\s*$` (multiline regex), then returns the **highest-priority** one: AGENT > DONE > APPROVED > REDTEAM > BLUETEAM > USER. This means `[APPROVED]` + `[AGENT]` in the same message → returns `"AGENT"` (agent runs first).
+Red/Blue agents no longer emit routing tags. ManageAgent reads the **content** of each response to determine intent via `_infer_dialog_intent()` in `manage_agent.py`. This function uses keyword analysis (primary) with tag detection as fallback — if an LLM still emits a tag, it's honored but not required.
 
-| Tag | Meaning | Emitted by |
+| Intent | Keywords detected | Action |
 |---|---|---|
-| `[AGENT]` | Ask ExecAgent a question | Red, Blue |
-| `[REDTEAM]` | Pass turn to Red Team | Blue (reject) |
-| `[BLUETEAM]` | Pass turn to Blue Team | Red (submit for review) |
-| `[APPROVED]` | Approve workflow → trigger execution | Blue |
-| `[DONE]` | Exploitation complete | Red (after evaluation) |
+| APPROVE | "approved", "đồng ý", "chấp thuận" (Blue only) | ManageAgent triggers `EXECUTE_BUG` |
+| REVISE | "reject", "chưa đủ", "không đồng ý" (Blue only) | ManageAgent routes back to Red |
+| STOP | "stopped", "không khả thi", "out of scope" | ManageAgent stops current bug |
+| NONE | Default / strategy text | ManageAgent decides via LLM or shortcut logic |
 
-If the LLM forgets a tag, agents retry up to `MAX_TAG_RETRIES` (2) times with a nudge, then force-append the expected tag (Red→`[BLUETEAM]`, Blue→`[REDTEAM]`).
+`extract_next_tag()` and `normalize_routing_tags()` in `shared/utils.py` still exist for ExecAgent's SEND block parsing and as fallback in `_infer_dialog_intent()`.
 
 ### SEND Block Pattern
 
@@ -149,17 +153,20 @@ Both agents share the same `_tool_loop` pattern with safety mechanisms:
 
 **CrawlAgent** (`agents/crawl_agent.py`): Runs `tools/crawler.py` as a subprocess (JSON to stdout, logs to stderr). Two-pass crawl: anonymous → login (httpx finds `/login` from 4 candidate paths, extracts CSRF with 3 regex patterns, POSTs credentials) → authenticated. LLM analyzes both passes using filesystem MCP tools → writes `workspace/recon.md`. Uses `[DONE]` tag (not debate tags). Has shell + fetch + filesystem MCP tools (no Playwright/web_search).
 
-**ExecAgent** (`agents/exec_agent.py`): Four system prompts for different modes:
+**ExecAgent** (`agents/exec_agent.py`): Main execution modes:
 - `answer()` → `ANSWER_SYSTEM_PROMPT`: answers Red/Blue questions using MCP tools
-- `answer(read_only=True)` → `VERIFY_SYSTEM_PROMPT`: Phase 4 read-only verification (no POST/exploit)
 - `execute()` → `EXECUTE_SYSTEM_PROMPT`: extracts PoC Python code → saves → runs
-- `run_workflow()` → `WORKFLOW_SYSTEM_PROMPT`: step-by-step execution with evidence capture
+- `run_workflow()` → **Two-phase execution**:
+  - Phase 1 (SESSION PREP): reuse crawl cookies/base session first, then deterministic HTTP login, then browser fallback if needed.
+  - Phase 2 (EXPLOIT): generate a Python exploit for the approved strategy, run `py_compile`, execute it, save artifacts, and let the script self-verify via `FINAL`/`result.json`.
 
-Has all 5 MCP tools: shell, browser (Playwright), fetch, filesystem (5 whitelisted tools), web search (DuckDuckGo).
+Has all 5 MCP tools: shell, browser (Playwright), fetch, filesystem, web search (DuckDuckGo). Runtime hot path no longer has a separate post-Exec verifier; Manager reads Exec's self-verified output directly.
 
-**RedTeamAgent** (`agents/red_team.py`): Writes numbered attack workflows ("CHIEN LUOC") with login, CSRF, verify steps. System prompt is baked at init with target_url + recon_context + BAC/BLF playbook from `knowledge/bac_blf_playbook.py` (17 patterns: 8 BAC + 9 BLF). Truncates messages over `MAX_MSG_CHARS` (6000 chars). No MCP tools — text-only LLM calls.
+**RedTeamAgent** (`agents/red_team.py`): Writes numbered attack workflows ("CHIEN LUOC") with login, CSRF, verify steps and an `EXECUTION SHOT PLAN`. System prompt is baked at init with target_url + recon_context + BAC/BLF playbook from `knowledge/bac_blf_playbook.py` (17 patterns: 8 BAC + 9 BLF). Truncates messages over `MAX_MSG_CHARS` (6000 chars). No MCP tools — text-only LLM calls. **No routing tags** — ManageAgent reads response content to determine intent. `respond()` calls LLM once and returns text directly (no retry loop).
 
-**BlueTeamAgent** (`agents/blue_team.py`): Reviews Red's strategy against criteria. System prompt also bakes playbook. Can call `[AGENT]` to verify endpoints. Same `MAX_MSG_CHARS` (6000) truncation. No MCP tools — text-only LLM calls.
+**BlueTeamAgent** (`agents/blue_team.py`): Reviews Red's strategy against criteria before Exec runs. System prompt also bakes playbook. Same `MAX_MSG_CHARS` (6000) truncation. No MCP tools — text-only LLM calls. **No routing tags** — ManageAgent reads response content to determine intent (APPROVE/REVISE/STOP). `respond()` calls LLM once and returns text directly (no retry loop). Blue does not review post-Exec evidence.
+
+**ManageAgent** (`agents/manage_agent.py`): LLM-driven orchestrator that replaces the hand-coded retry loop in `main.py`. ManageAgent is called on every tick and decides which action to take next by emitting one of these tags: `DEBATE_RED`, `DEBATE_BLUE`, `EXECUTE_BUG`, `RETRY_RED`, `RETRY_BLUE`, `RETRY_EXEC`, `STOP_BUG`, `NEXT_BUG`, `REPORT_SUCCESS`, `REPORT_FAIL`. Uses `_infer_dialog_intent()` to read Red/Blue response content and route accordingly. All child agents are invoked only through ManageAgent — no agent calls another agent directly. After Exec runs, Manager reads `FINAL`, `SUCCESS`, `result.json`, and evidence summary directly, then decides `EXPLOITED`, retry, or stop. Controlled by `MARL_MANAGER_MODEL` and capped at `MAX_TICKS` (60) total pipeline ticks.
 
 ### MCP Client (`mcp_client.py`)
 
@@ -189,6 +196,7 @@ FastAPI proxy: OpenAI SDK → GitHub Copilot endpoints (`api.individual.githubco
 - Exponential backoff retry (3 attempts, 2s base, retryable statuses: 429, 500, 502, 503, 504) with automatic token refresh on 401
 - Upstream timeouts: connect=15s, read=300s, write=15s, pool=15s
 - Strips Copilot-specific metadata for SDK compatibility; supports SSE streaming
+- **GPT Codex routing**: models in `GPT_CODEX_RESPONSES_MODELS` (e.g. `gpt-5.1-codex-mini`, `gpt-5.4`) are routed to Copilot's `/responses` endpoint (Responses API) instead of `/chat/completions`. The proxy converts the request/response format transparently.
 
 ### Knowledge Base (`knowledge/bac_blf_playbook.py`)
 
@@ -204,6 +212,7 @@ Contains 17 attack pattern templates (8 BAC, 9 BLF) used by Red and Blue Team sy
 | `MARL_EXECUTOR_MODEL` | `gpt-4.1` | exec_agent.py |
 | `MARL_RED_MODEL` | `gpt-5-mini` | red_team.py |
 | `MARL_BLUE_MODEL` | `gpt-5-mini` | blue_team.py |
+| `MARL_MANAGER_MODEL` | `gpt-5-mini` | manage_agent.py |
 | `MARL_DEBUG` | (unset) | crawl_agent.py (set to `1`/`true`/`yes` for verbose) |
 | `PORT` | `5000` | server/server.py |
 
@@ -215,20 +224,48 @@ All agents load `.env` from project root via `python-dotenv`.
 |---|---|---|---|
 | `MAX_DEBATE_STEPS` | 30 | main.py | Total turns in debate phase |
 | `MAX_ROUNDS` | 5 | main.py | Red↔Blue reject/revise cycles |
-| `MAX_EXEC_RETRIES` | 2 | main.py | Retry attempts after execution failure |
-| `MIN_DEBATE_ROUNDS` | 2 | main.py | Minimum Red↔Blue rounds before approve allowed |
-| `MAX_TOOL_ROUNDS` | 50 | exec_agent.py | Tool calls per ExecAgent invocation |
+| `MAX_EXEC_RETRIES` | 1 | main.py/manage_agent.py | Retry attempts after execution failure |
+| `MAX_TICKS` | 60 | manage_agent.py | Total pipeline ticks for ManageAgent |
+| `MIN_DEBATE_ROUNDS` | 0 | main.py/manage_agent.py | Deterministic Red→Blue gate handles minimum flow |
+| `MAX_TOOL_ROUNDS` | 30 | exec_agent.py | Tool calls per ExecAgent answer/execute |
+| `MAX_WORKFLOW_LOGIN_ROUNDS` | 8 | exec_agent.py | Login/session-prep fallback rounds |
 | `MAX_TOOL_ROUNDS` | 30 | crawl_agent.py | Tool calls per CrawlAgent invocation |
 | `MAX_CONSECUTIVE_ERRORS` | 3 | exec_agent, crawl_agent | Tool failures before forcing summary |
 | `MAX_CONSECUTIVE_REPEATS` | 3 | exec_agent.py | Identical tool calls before breaking loop |
-| `MAX_TAG_RETRIES` | 2 | red_team, blue_team | Nudges before force-appending tag |
+| ~~MAX_TAG_RETRIES~~ | ~~2~~ | ~~red_team, blue_team~~ | Removed — routing tags no longer required |
 | `MAX_MSG_CHARS` | 6000 | red_team, blue_team | Message truncation in `_build_messages()` |
 | `TRUNCATE_LIMIT` | 15000 | shared/utils.py | Output truncation threshold |
-| `max_eval_steps` | 5 | main.py `phase_evaluate()` | Max Agent calls during evaluation |
 | LLM `temperature` | 0.3 | exec_agent, crawl_agent, blue_team | |
 | LLM `temperature` | 0.4 | red_team.py | Slightly higher creativity for Red |
 | LLM `max_tokens` | 4096 | exec_agent, red_team, blue_team | |
 | LLM `max_tokens` | 8192 | crawl_agent.py | Larger for recon analysis |
+
+## Additional Shared Modules (not yet in main pipeline)
+
+### PolicyAgent (`agents/policy_agent.py`)
+Two-phase guardrail that runs **before** ManageAgent executes each action:
+1. **Hard rules** (no LLM): validates actions against `VALID_ACTIONS` set, checks state fields (`tick`, `round_num`, `exec_attempts`, `has_workflow`, `has_exec`, `red_spoke`). For recoverable states (e.g. EXECUTE before workflow exists), returns SUGGEST with a fallback action instead of hard BLOCK to prevent infinite loops. Hard BLOCK is reserved for truly invalid transitions (e.g. RETRY_DEBATE before any execution).
+2. **LLM semantic check**: sends 6 recent messages + state JSON to an LLM (low temperature 0.1, max 256 tokens) — detects semantic violations like executing after a fresh Blue reject, or infinite loops. Fails **open** on parse error (returns ALLOW).
+
+Returns `PolicyVerdict(verdict, reason, suggested_action)`. Verdict is one of `ALLOW / BLOCK / SUGGEST`. Only wired into `ManageAgent` (not `main.py`'s hand-coded pipeline).
+
+### ContextManager (`shared/context_manager.py`)
+Conversation compression for long runs. Called per tick inside ManageAgent:
+- `compress_if_needed(conversation, trigger_len=20, keep_recent=6)`: if the conversation exceeds `trigger_len` messages, LLM-summarises the oldest `n - 6` messages, saves them to MemoryStore, and replaces them with a single `SYSTEM` summary message. Modifies the list **in-place** and returns it.
+- `get_context_for_agent(agent_id, conversation, keywords)`: assembles a summary + relevant MemoryStore findings block to prepend to an agent's prompt.
+
+### MemoryStore (`shared/memory_store.py`)
+File-backed persistent store scoped to `{run_dir}/memory/`. Never crashes the pipeline (all I/O is try/except). Files:
+- `task_registry.json` — structured task tracking (`register_task`, `update_task`, `list_tasks`)
+- `findings.json` — typed facts (`add_finding(category, key, value, agent)`, canonical categories: `endpoint / credential / vulnerability / note`)
+- `conversation_full.jsonl` — append-only full log (`append_message`)
+- `conversation_summary.md` — rolling LLM-generated summary (`update_summary` / `get_summary`)
+- `scratchpad/{agent}_notes.json` — per-agent key-value notes (`scratchpad_write`, `scratchpad_read`, `scratchpad_search`)
+
+`get_relevant_context(agent, keywords, max_chars=2000)` does keyword search across findings + scratchpad + summary to build a RAG-style context block.
+
+### Multi-account credentials (`shared/utils.py`)
+`ParsedTarget` TypedDict supports multiple accounts: `{url, credentials: [{label, username, password}], focus}`. `parse_prompt_llm(user_prompt, client)` uses an LLM call to extract structured credentials from free-text prompts. `parse_prompt()` is the regex-based fallback used in `main.py`.
 
 ## Known Issues
 
@@ -237,6 +274,5 @@ All agents load `.env` from project root via `python-dotenv`.
 - Legacy modules in `test/` hardcode GitHub tokens instead of using env vars
 - `test/debate.py` conversation format (`role`-based) is incompatible with `agents/` format (`speaker`-based)
 - No explicit token counting — relies on upstream truncation; large `recon.md` can fill context quickly
-- No `requirements.txt` / `pyproject.toml` — dependencies are undeclared
 - CrawlAgent's httpx login only tries 4 hardcoded paths (`/login`, `/my-account`, `/account/login`, `/signin`); sites with non-standard login URLs will fail
-- ExecAgent system prompts warn about `fetch()` being stateless (no cookies) — this is a recurring source of bugs where the LLM uses fetch instead of curl for authenticated requests
+- ExecAgent's exploit phase removes Playwright from tool list to force curl usage, but `answer()` and `execute()` modes still have browser tools and may waste tokens on Playwright calls

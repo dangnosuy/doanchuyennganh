@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 from shared.utils import parse_prompt
+from shared.logger import log, install_log_capture
 
 WORKSPACE = "./workspace"
 
@@ -86,9 +87,9 @@ def _make_run_dir(target_url: str, workspace_mode: str) -> str:
     if workspace_mode == "reuse":
         existing = _find_reusable_run_dir(target_url)
         if existing:
-            print(f"{G}[+] Reusing existing workspace: {existing}{RST}")
+            log.info(f"Tái sử dụng workspace: {existing}")
             return existing
-        print(f"{Y}[!] Reuse requested but no suitable workspace found — creating fresh workspace{RST}")
+        log.warn("Yêu cầu tái sử dụng nhưng không tìm thấy workspace phù hợp — tạo mới")
     return _create_fresh_run_dir(target_url)
 
 
@@ -99,7 +100,7 @@ MAX_ROUNDS = 5
 MIN_DEBATE_ROUNDS = 0
 MAX_EXEC_RETRIES = 1
 
-# ── ANSI colors ──────────────────────────────────────────────
+# ── ANSI colors (kept for backward compat with any remaining references) ──
 R = "\033[91m"
 G = "\033[92m"
 Y = "\033[93m"
@@ -107,94 +108,21 @@ C = "\033[96m"
 B = "\033[1m"
 RST = "\033[0m"
 
-YELLOW = "\033[93m"  # yellow for backward compatibility
-RESET = "\033[0m"  # reset for backward compatibility
-
-# Regex strip ANSI escape codes for log file
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-# ═════════════════════════════════════════════════════════════
-# TEE LOGGER — mirror stdout/stderr to log file
-# ═════════════════════════════════════════════════════════════
-
-class TeeLogger:
-    """Write to both original stream and a log file — realtime.
-
-    - Console gets full ANSI colors as normal
-    - Log file gets clean text (ANSI codes stripped) + timestamp per line
-    - Every write() is flushed IMMEDIATELY to disk (os.fsync)
-      so log is never lost even on Ctrl+C or crash
-    """
-
-    def __init__(self, log_path: str, stream):
-        self._stream = stream          # original sys.stdout or sys.stderr
-        # Open unbuffered (buffering=1 is line-buffered, but we flush manually)
-        self._log_file = open(log_path, "a", encoding="utf-8")
-        self._at_line_start = True     # track for timestamp insertion
-
-    def write(self, text: str):
-        # Console: pass through as-is (with colors)
-        self._stream.write(text)
-        self._stream.flush()
-
-        # Log file: strip ANSI, add timestamps, flush immediately
-        clean = _ANSI_RE.sub("", text)
-        if clean:
-            lines = clean.split("\n")
-            for i, line in enumerate(lines):
-                if i > 0:
-                    self._log_file.write("\n")
-                    self._at_line_start = True
-                if line:
-                    if self._at_line_start:
-                        ts = datetime.now().strftime("%H:%M:%S")
-                        self._log_file.write(f"[{ts}] {line}")
-                    else:
-                        self._log_file.write(line)
-                    self._at_line_start = False
-            # If text ended with \n, next write starts a new line
-            if clean.endswith("\n"):
-                self._at_line_start = True
-
-            # REALTIME: flush to disk immediately — survive Ctrl+C / crash
-            self._log_file.flush()
-            os.fsync(self._log_file.fileno())
-
-    def flush(self):
-        self._stream.flush()
-        self._log_file.flush()
-
-    def close(self):
-        self._log_file.close()
-
-    def fileno(self):
-        return self._stream.fileno()
-
-    def isatty(self):
-        return self._stream.isatty()
-
-    @property
-    def encoding(self):
-        return self._stream.encoding
+YELLOW = "\033[93m"
+RESET = "\033[0m"
 
 
 def setup_logging(run_dir: str) -> str:
-    """Setup TeeLogger to mirror all output to {run_dir}/marl.log.
+    """Setup MarlLogger to write all output to {run_dir}/marl.log.
 
     Returns:
         Path to the log file.
     """
     log_path = str(Path(run_dir) / "marl.log")
-
-    # Write header
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write(f"MARL Session Log — {datetime.now().isoformat()}\n")
-        f.write(f"{'=' * 60}\n\n")
-
-    sys.stdout = TeeLogger(log_path, sys.__stdout__)
-    sys.stderr = TeeLogger(log_path, sys.__stderr__)
-
+    log.setup(log_path)
+    # Redirect all print() from agents to log file only
+    # Terminal output is now exclusively via log.terminal()
+    install_log_capture(pass_through=False)
     return log_path
 
 
@@ -225,12 +153,8 @@ def _quiet_third_party_logging() -> None:
 # ═════════════════════════════════════════════════════════════
 
 def banner():
-    print(f"""{C}{B}
-    ╔══════════════════════════════════════════╗
-    ║   MARL — Multi-Agent Red-team LLM        ║
-    ║   Penetration Testing via Debate          ║
-    ╚══════════════════════════════════════════╝{RST}
-    """)
+    # Legacy — replaced by log.main_banner() in main()
+    pass
 
 
 def parse_cli_args() -> argparse.Namespace:
@@ -279,10 +203,10 @@ def get_user_prompt(prompt_parts: list[str] | None = None) -> str:
     _auto = _os.environ.get("MARL_AUTO_PROMPT", "")
     if _auto:
         return _auto
-    print(f"{Y}Nhap prompt (URL + credentials neu co):{RST}")
+    log.terminal("\033[93mNhập prompt (URL + credentials nếu có):\033[0m")
     prompt = input("> ").strip()
     if not prompt:
-        print(f"{R}[!] Prompt khong duoc de trong.{RST}")
+        log.error("Prompt không được để trống.")
         sys.exit(1)
     return prompt
 
@@ -298,17 +222,13 @@ def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
     already has both crawl_data.txt and risk-bug.json with at least 1 bug.
     This avoids expensive re-crawl when a prior run already produced bugs.
     """
-    print(f"\n{C}{B}{'='*60}")
-    print(f"  PHASE 1: RECON")
-    print(f"{'='*60}{RST}\n")
+    log.phase_banner(1, "TRINH SÁT", "CrawlAgent thu thập thông tin mục tiêu")
 
     target_url, _ = parse_prompt(user_prompt)
     if not target_url:
-        raise ValueError("Khong tim thay URL trong prompt.")
+        raise ValueError("Không tìm thấy URL trong prompt.")
 
     # ── Check for existing workspace with bugs ──
-    # If both crawl_data.txt + risk-bug.json exist and have content,
-    # skip the expensive Phase 1 (crawl + vuln-hunter).
     existing_risk_bugs = Path(run_dir) / "risk-bug.json"
     existing_recon = Path(run_dir) / "recon.md"
     if existing_risk_bugs.exists() and existing_recon.exists():
@@ -320,21 +240,19 @@ def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
                 recon_path = str(existing_recon)
                 recon_content = existing_recon.read_text(encoding="utf-8")
                 if not _is_placeholder_recon(recon_content):
-                    print(f"\033[93m[+] Workspace already has {len(bugs)} bugs — skipping Phase 1 (CrawlAgent + VulnHunter)\033[0m")
-                    print(f"\033[92m[+] Using existing recon.md: {recon_path}\033[0m")
-                    print(f"\033[92m[+] Recon + VulnHunter hoan tat\033[0m")
+                    log.info(f"Workspace đã có {len(bugs)} bugs — bỏ qua Giai đoạn 1")
+                    log.info(f"Sử dụng recon.md có sẵn: {recon_path}")
                     return target_url, recon_path, recon_content
 
                 existing_crawl_data = Path(run_dir) / "crawl_data.txt"
                 if existing_crawl_data.exists():
-                    print(f"\033[93m[+] Existing recon.md is placeholder — rebuilding from saved crawl artifacts\033[0m")
+                    log.warn("recon.md là placeholder — đang xây dựng lại từ crawl data")
                     from agents.crawl_agent import CrawlAgent
                     crawl = CrawlAgent(working_dir=run_dir)
                     try:
                         recon_path = crawl.rebuild_recon_from_saved_artifacts(user_prompt)
                         recon_content = Path(recon_path).read_text(encoding="utf-8")
-                        print(f"\033[92m[+] Rebuilt recon.md from saved crawl data: {recon_path}\033[0m")
-                        print(f"\033[92m[+] Recon + VulnHunter hoan tat\033[0m")
+                        log.info(f"Đã xây dựng lại recon.md: {recon_path}")
                         return target_url, recon_path, recon_content
                     finally:
                         crawl.shutdown()
@@ -347,13 +265,13 @@ def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
     try:
         recon_path = crawl.run(user_prompt)
         if not recon_path or not Path(recon_path).exists():
-            raise RuntimeError("CrawlAgent khong tao duoc recon file.")
+            raise RuntimeError("CrawlAgent không tạo được recon file.")
         recon_content = Path(recon_path).read_text(encoding="utf-8")
     finally:
         crawl.shutdown()
 
-    print(f"\n{G}[+] Recon hoan tat: {recon_path}{RST}"
-          f"{C}{B}\n  PHASE 1b: VULN HUNTER — Nhận diện lỗ hổng{RST}\n")
+    log.info(f"Trinh sát hoàn tất: {recon_path}")
+    log.sub_phase("VULN HUNTER — Nhận diện lỗ hổng")
 
     # Skip VulnHunter if risk-bug.json already exists with bugs
     existing_risk_bugs = Path(run_dir) / "risk-bug.json"
@@ -363,8 +281,7 @@ def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
             with open(existing_risk_bugs) as f:
                 existing = json.load(f)
             if existing and len(existing) > 0:
-                print(f"\033[93m[+] VulnHunter skipped — using existing risk-bug.json ({len(existing)} bugs)\033[0m")
-                print(f"\n\033[92m[+] Recon + VulnHunter hoan tat\033[0m")
+                log.info(f"VulnHunter bỏ qua — sử dụng risk-bug.json có sẵn ({len(existing)} bugs)")
                 return target_url, recon_path, recon_content
         except Exception:
             pass
@@ -379,9 +296,8 @@ def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
         crawl_data_path = str(crawler_data) if crawler_data.exists() else "",
     )
     bugs = hunter.run()
-    print(f"\n{G}[+] VulnHunter hoan tat: {len(bugs)} bugs identified{RST}")
+    log.info(f"VulnHunter hoàn tất: {len(bugs)} lỗ hổng tiềm năng")
 
-    print(f"\n{G}[+] Recon + VulnHunter hoan tat{RST}")
     return target_url, recon_path, recon_content
 
 
@@ -390,8 +306,6 @@ def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
 # ═════════════════════════════════════════════════════════════
 
 def main():
-    banner()
-
     args = parse_cli_args()
     workspace_mode = get_workspace_mode(args)
     user_prompt = get_user_prompt(args.prompt)
@@ -399,22 +313,23 @@ def main():
     # ── Parse target URL to create per-target workspace dir ──
     target_url_early, _ = parse_prompt(user_prompt)
     if not target_url_early:
-        print(f"{R}[!] Khong tim thay URL trong prompt.{RST}")
+        log.error("Không tìm thấy URL trong prompt.")
         return
     run_dir = _make_run_dir(target_url_early, workspace_mode)
 
-    # ── Setup logging — mirror all console output to run_dir/marl.log ──
+    # ── Setup logging — MarlLogger handles everything ──
     log_path = setup_logging(run_dir)
     _quiet_third_party_logging()
-    print(f"{G}[+] Workspace mode: {workspace_mode}{RST}")
-    print(f"{G}[+] Run directory: {run_dir}{RST}")
-    print(f"{G}[+] Logging to: {log_path}{RST}\n")
+
+    # ── Main banner (printed AFTER logging is set up) ──
+    log.main_banner(target_url_early, run_dir, workspace_mode)
+    log.debug(f"Log file: {log_path}")
 
     # ── Phase 1: Recon ──
     try:
         target_url, recon_path, recon_content = phase_recon(user_prompt, run_dir)
     except Exception as e:
-        print(f"\n{R}[!] Recon failed: {e}{RST}")
+        log.error(f"Trinh sát thất bại: {e}")
         return
 
     # ── Phase 2–5: ManageAgent điều phối toàn bộ ──
@@ -433,11 +348,12 @@ def main():
         manager.run(conversation)
 
     except Exception as e:
-        print(f"\n{R}[!] Pipeline failed: {e}{RST}")
+        log.error(f"Pipeline thất bại: {e}")
         import traceback
-        traceback.print_exc()
+        log.file_only(traceback.format_exc())
     finally:
-        print(f"\n{G}[+] Full session log: {log_path}{RST}")
+        log.terminal(f"\n ℹ Log đầy đủ: {log_path}")
+        log.close()
 
 
 if __name__ == "__main__":

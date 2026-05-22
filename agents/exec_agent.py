@@ -286,9 +286,12 @@ Ví dụ SAI (sẽ bị reject):
    - Khong hardcode marker/endpoint cua mot lab. Lay endpoint, marker, account, payload tu approved workflow/dossier.
    - Khong tu them endpoint phu lam dieu kien thanh cong neu workflow khong yeu cau.
    - Neu da dat minimum proof cua hypothesis, in SHOT_RESULT: EXPLOITED va FINAL: EXPLOITED ngay.
-   - BAC vertical: low-privileged session thay privileged page/control/admin marker la EXPLOITED.
-   - IDOR/BAC horizontal: user A doc duoc object/data cua user B la EXPLOITED.
-   - BLF/stateful: gia/balance/cart/order/state thay doi trai logic la EXPLOITED.
+   - BAC-01/admin: chi EXPLOITED khi low-privileged session thay control/admin API quyen cao that.
+     Status 200, generic "Admin", hoac challenge metadata khong du.
+   - IDOR/BAC horizontal: chi EXPLOITED khi user A/guest doc duoc object/data cu the cua user B.
+     Public collection leak UserId/comment ma khong chung minh ownership bypass thi FINAL: PARTIAL.
+   - BLF/stateful: chi EXPLOITED khi gia/balance/cart/order/state thay doi trai logic va co before/after,
+     non-zero delta, hoac invalid state transition da verify.
 
 1. MOI STEP PHAI CHAY DUNG, KE CA STEP KHAC FAIL
    - KHONG sys.exit(1) ngay khi 1 step fail neu con step doc lap khac
@@ -331,7 +334,7 @@ Ví dụ SAI (sẽ bị reject):
    - Verify trong script phai bam minimum proof cua approved workflow.
    - Khong doi them endpoint/tac dong phu neu endpoint/marker hien tai da chung minh hypothesis.
    - Voi BAC/IDOR read-only bang GET/HEAD: neu current shot da tu login/access/verify du bang chung
-     (role/session dung, status 2xx, response marker cu the), duoc ket luan EXPLOITED va in
+     object ownership/cross-user access (role/session dung, status 2xx, response marker cu the), duoc ket luan EXPLOITED va in
      `VERIFY_COMPLETED: yes`, `EARLY_STOP_ALLOWED: yes`.
    - Neu shot hien tai tao tien de nhung chua chung minh bug, ket luan FINAL: PARTIAL va exit 2.
    - Neu artifact bat buoc bi thieu, in ro thieu file nao va ket luan FINAL: PARTIAL/FAILED.
@@ -491,14 +494,18 @@ def _looks_like_empty_cookie(cookie: str) -> bool:
     lower = cookie.strip().lower()
     bad_markers = (
         "empty", "rỗng", "rong", "không lấy", "khong lay", "not found",
-        "none", "null", "undefined", "no cookie", "failed",
+        "none", "null", "undefined", "no cookie", "failed", "<value>",
+        "<cookie", "placeholder", "your_session", "session_value",
     )
     if any(marker in lower for marker in bad_markers):
         return True
     if "=" not in cookie:
         return True
     name, _, value = cookie.partition("=")
-    return not name.strip() or not value.strip() or any(ch in name for ch in " (),;")
+    value = value.strip()
+    if not value or value.startswith("<") or value.endswith(">"):
+        return True
+    return not name.strip() or any(ch in name for ch in " (),;")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -819,22 +826,50 @@ class ExecAgent:
         """Infer whether the current workflow needs an authenticated session."""
         chunks = [workflow_text]
         if conversation:
-            chunks.extend(msg.get("content", "") for msg in conversation[-8:])
+            # Only current workflow should decide anonymous vs auth. Conversation can
+            # contain older bug strategies with credentials/login and must not taint
+            # an anonymous candidate.
+            chunks.extend(
+                msg.get("content", "")
+                for msg in conversation[-3:]
+                if msg.get("speaker") in {"SYSTEM", "AGENT"}
+            )
         text = "\n".join(chunks)
         lower = text.lower()
 
         if "auth: required=false" in lower or "auth_required: false" in lower:
             return False
-        if "auth: anonymous/mixed" in lower and not self._extract_credentials(workflow_text, conversation)[0]:
+        if "auth: anonymous/mixed" in lower or "auth required: false" in lower:
             return False
-        if self._extract_credentials(workflow_text, conversation)[0]:
-            return True
+
+        anonymous_markers = (
+            "anonymous", "unauthenticated", "without auth", "without authentication",
+            "no auth", "no authentication", "public get", "public endpoint",
+            "endpoint public", "public exposure", "khong can auth", "không cần auth",
+            "khong yeu cau auth", "không yêu cầu auth", "cong khai", "công khai",
+            "khong can dang nhap", "không cần đăng nhập",
+        )
+        strong_auth_markers = (
+            "auth: required", "auth_required: true", "requires auth", "require auth",
+            "requires login", "must login", "must authenticate", "authenticated session",
+            "dang nhap bat buoc", "đăng nhập bắt buộc", "can dang nhap", "cần đăng nhập",
+        )
+        if any(marker in lower for marker in anonymous_markers) and not any(
+            marker in lower for marker in strong_auth_markers
+        ):
+            return False
+
         auth_markers = (
             "auth: required", "authenticated", "login", "dang nhap", "đăng nhập",
             "session", "cookie", "/profile", "/my-account", "/account", "/cart",
             "/checkout", "/transfer", "/orders", "/admin",
         )
-        return any(marker in lower for marker in auth_markers)
+        if any(marker in lower for marker in auth_markers):
+            return True
+
+        # Credentials in the original user prompt are global test context. They
+        # should not force login for a current workflow that can be proven public.
+        return bool(self._extract_credentials(workflow_text, conversation)[0])
 
     def _run_script_shots(
         self,
@@ -862,6 +897,7 @@ class ExecAgent:
             print(f"{YELLOW}[EXEC-AGENT] Script shot {shot_index}/{total_shots}{RESET}")
             script_content = self._generate_exploit_script(
                 workflow_text,
+                conversation,
                 cookies_path,
                 session_cookie,
                 shot_index=shot_index,
@@ -1153,7 +1189,9 @@ class ExecAgent:
                         continue
                     parts = stripped.split("\t")
                     if len(parts) >= 7 and parts[5] and parts[6]:
-                        pairs.append(f"{parts[5]}={parts[6]}")
+                        cookie = f"{parts[5]}={parts[6]}"
+                        if not _looks_like_empty_cookie(cookie):
+                            pairs.append(cookie)
         except OSError:
             return ""
         return "; ".join(pairs)
@@ -1250,6 +1288,12 @@ class ExecAgent:
         last_note = "No suitable login form found."
 
         with httpx.Client(follow_redirects=True, timeout=20.0) as client:
+            api_summary, api_header = self._try_api_logins(client, username, password)
+            if api_header:
+                return api_summary, api_header
+            if api_summary:
+                last_note = extract_send_block(api_summary) or api_summary
+
             for login_url in login_urls:
                 try:
                     resp = client.get(login_url)
@@ -1293,7 +1337,7 @@ class ExecAgent:
                     for cookie in client.cookies.jar
                 ]
                 header = self._cookie_header_from_cookie_objects(cookies)
-                if not header:
+                if not header or _looks_like_empty_cookie(header):
                     last_note = f"No cookies issued after POST {form_info['action_url']}"
                     continue
 
@@ -1317,9 +1361,71 @@ class ExecAgent:
 
         return (_send_block(f"LOGIN_STATUS: FAIL\nREASON: {last_note}"), "")
 
+    def _try_api_logins(self, client, username: str, password: str) -> tuple[str, str]:
+        """Try common JSON login endpoints before browser/form login."""
+        if not self.target_url:
+            return "", ""
+        candidates = [
+            ("rest/user/login", {"email": username, "password": password}),
+            ("rest/user/login", {"username": username, "password": password}),
+            ("api/Users/login", {"email": username, "password": password}),
+        ]
+        notes: list[str] = []
+        for path, payload in candidates:
+            url = urljoin(self.target_url.rstrip("/") + "/", path)
+            try:
+                resp = client.post(url, json=payload, headers={"Content-Type": "application/json"})
+            except Exception as e:
+                notes.append(f"POST /{path} error={e}")
+                continue
+            notes.append(f"POST /{path} status={resp.status_code}")
+            token = ""
+            try:
+                data = resp.json()
+                auth_obj = data.get("authentication") if isinstance(data, dict) else {}
+                if isinstance(auth_obj, dict):
+                    token = str(auth_obj.get("token") or auth_obj.get("session") or "")
+                token = token or str(data.get("token", "") if isinstance(data, dict) else "")
+            except Exception:
+                data = {}
+            cookies = [
+                {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": cookie.domain or (urlparse(str(resp.url)).hostname or ""),
+                    "path": cookie.path or "/",
+                    "httpOnly": False,
+                    "secure": bool(cookie.secure),
+                }
+                for cookie in client.cookies.jar
+            ]
+            header = self._cookie_header_from_cookie_objects(cookies)
+            if token and not _looks_like_empty_cookie(f"Authorization={token}"):
+                # Store token in a cookie file only for scripts that import cookies;
+                # scripts should still use the explicit AUTH_TOKEN hint below.
+                header = header or f"token={token}"
+            if resp.status_code in (200, 201) and header and not _looks_like_empty_cookie(header):
+                preferred_label = username
+                base_path = self._base_cookies_path(preferred_label)
+                work_path = self._working_cookies_path()
+                self._save_cookies_file(header, path=base_path)
+                self._copy_cookie_file(base_path, work_path)
+                summary = _send_block(
+                    "LOGIN_STATUS: API_LOGIN_SUCCESS\n"
+                    f"USERNAME: {username}\n"
+                    f"LOGIN_URL: {url}\n"
+                    f"COOKIE_FILE: {work_path}\n"
+                    f"SESSION_COOKIE: {header}\n"
+                    + (f"AUTH_TOKEN: {token}\n" if token else "")
+                    + "VERIFY_NOTE: API login returned success status and reusable auth material."
+                )
+                return summary, header
+        return (_send_block("LOGIN_STATUS: API_LOGIN_FAIL\nREASON: " + " | ".join(notes[:6])), "")
+
     def _generate_exploit_script(
         self,
         workflow_text: str,
+        conversation: list[dict] | None,
         cookies_path: str,
         session_cookie: str,
         *,
@@ -1354,9 +1460,18 @@ class ExecAgent:
         shot_scope = self._extract_current_shot_scope(workflow_text, shot_index)
 
         if session_cookie:
+            token_hint = ""
+            if session_cookie.lower().startswith("token="):
+                token_value = session_cookie.split("=", 1)[1]
+                token_hint = (
+                    f"AUTH_TOKEN: {token_value}\n"
+                    "Neu target dung JWT/Bearer auth, dung header "
+                    "`Authorization: Bearer <AUTH_TOKEN>` cho API requests.\n"
+                )
             user_content += (
                 f"=== SESSION (tu buoc login) ===\n"
                 f"Cookie: {session_cookie}\n"
+                f"{token_hint}"
                 f"COOKIE_FILE: {cookies_path}\n"
                 f"Dung absolute path: curl -sS -L -b '{cookies_path}' ...\n"
                 "Session prep da tao/import cookie hop le truoc khi script duoc sinh. "
@@ -1369,9 +1484,22 @@ class ExecAgent:
             user_content += (
                 "=== SESSION ===\n"
                 "Chua co cookie tu buoc login.\n"
-                "Neu co file cookies.txt ton tai, dung no cho buoc login.\n"
-                "Neu khong, script phai tu login bang curl truoc.\n\n"
+                "Khong duoc dung cookie placeholder. Neu workflow can auth va login fail, "
+                "ket luan FINAL: FAILED voi FINAL_REASON: auth blocked/login failed.\n\n"
                 "Khi doc state HTML de verify, BAT BUOC dung curl -sS -L de follow redirect.\n\n"
+            )
+
+        auth_user, auth_pass = self._extract_credentials(workflow_text, conversation=None)
+        user_prompt_user, user_prompt_pass = self._extract_user_prompt_credentials(conversation)
+        if user_prompt_user:
+            auth_user, auth_pass = user_prompt_user, user_prompt_pass
+        if auth_user:
+            user_content += (
+                "=== AUTHORIZED USER CREDENTIALS ===\n"
+                f"username: {auth_user}\n"
+                f"password: {auth_pass}\n"
+                "Only use these credentials. Ignore any different demo/lab credentials "
+                "inside older Red/Blue conversation.\n\n"
             )
 
         if previous_attempts:
@@ -1402,7 +1530,7 @@ class ExecAgent:
                     "Khong thuc hien truoc cac shot sau neu shot hien tai chi la baseline/action.\n"
                     "Dung thu muc `$WORKDIR/exploit_state` de luu/doc artifact giua cac shot.\n"
                     "Ngoai le: neu BAC/IDOR read-only va shot hien tai da tu verify du bang chung "
-                    "(role/session dung, status 2xx, marker response cu the), hay in VERIFY_COMPLETED: yes "
+                    "object ownership/cross-user access (role/session dung, status 2xx, marker response cu the), hay in VERIFY_COMPLETED: yes "
                     "va EARLY_STOP_ALLOWED: yes. Khong yeu cau them endpoint/tac dong phu neu minimum proof "
                     "da chung minh hypothesis.\n\n"
                 )
@@ -2362,16 +2490,43 @@ class ExecAgent:
         conversation: list[dict] | None = None,
     ) -> tuple[str, str]:
         """Extract username/password from workflow or original conversation."""
+        user_creds = ExecAgent._extract_user_prompt_credentials(conversation)
+        if user_creds[0]:
+            return user_creds
+
         chunks = [workflow_text]
         if conversation:
-            chunks.extend(msg.get("content", "") for msg in conversation)
+            chunks.extend(
+                msg.get("content", "")
+                for msg in conversation
+                if msg.get("speaker") in {"USER", "SYSTEM"}
+            )
         text = "\n".join(chunks)
 
         patterns = [
             r"(?:username|user|tài khoản|tai khoan)\s*[:=]\s*([^\s,;/]+).*?(?:password|pass|mật khẩu|mat khau)\s*[:=]\s*([^\s,;/]+)",
             r"(?:credentials?|login)\s*[:=]\s*([^\s:;/]+)\s*[:/]\s*([^\s,;/]+)",
-            r"\b(wiener|carlos|administrator|admin)\s*/\s*([^\s,;/]+)",
-            r"\b(wiener|carlos|administrator|admin)\s*:\s*([^\s,;/]+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
+            if m:
+                return m.group(1).strip("`'\""), m.group(2).strip("`'\"")
+        return "", ""
+
+    @staticmethod
+    def _extract_user_prompt_credentials(
+        conversation: list[dict] | None = None,
+    ) -> tuple[str, str]:
+        if not conversation:
+            return "", ""
+        text = "\n".join(
+            msg.get("content", "")
+            for msg in conversation
+            if msg.get("speaker") == "USER"
+        )
+        patterns = [
+            r"(?:credentials?|login)\s*[:=]?\s*([^\s:;/]+)\s*[:/]\s*([^\s,;/]+)",
+            r"(?:username|user)\s*[:=]\s*([^\s,;/]+).*?(?:password|pass)\s*[:=]\s*([^\s,;/]+)",
         ]
         for pat in patterns:
             m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
@@ -2640,12 +2795,17 @@ async (page) => {{
                     value = str(cookie_obj.get("value", "")).strip()
                     if not name or not value:
                         continue
+                    if _looks_like_empty_cookie(f"{name}={value}"):
+                        continue
                     f.write(f"{domain}\tFALSE\t{path_value}\t{secure}\t0\t{name}\t{value}\n")
         except Exception as e:
             print(f"{DIM}[EXEC-AGENT] Failed to save structured cookies: {e}{RESET}")
 
     def _save_cookies_file(self, session_cookie: str, path: str | None = None) -> None:
         """Save cookie header text to a Netscape cookie file for curl -b."""
+        if _looks_like_empty_cookie(session_cookie):
+            print(f"{DIM}[EXEC-AGENT] Refusing to save placeholder/empty cookie.{RESET}")
+            return
         cookies_path = path or self._working_cookies_path()
         try:
             domain = urlparse(self.target_url).hostname or "" if self.target_url else ""
