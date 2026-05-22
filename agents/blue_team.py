@@ -92,6 +92,8 @@ Ban KHONG doi viet code/curl, nhung PHAI bat Red cu the hoa endpoint, auth, para
 4. Auth/state logic: Co noi ro user nao, role nao, session nao, state truoc/sau nao can so sanh khong?
 5. Verification: Buoc verify co dung raw evidence, khop verify_method/hypothesis khong?
 6. Shot plan: Co section `EXECUTION SHOT PLAN` phu hop do kho cua bug khong?
+Luu y auth: `AUTH_CONTEXT_AVAILABLE` voi cookie/storage_state/localStorage token la auth evidence hop le.
+Khong reject chi vi thieu HTTP form login neu dossier/Manager cho biet co auth context tai su dung duoc.
 
 === ANTI-OVERFITTING / MINIMUM PROOF ===
 - Khong review theo mot lab cu the. Endpoint, marker, account, payload phai den tu dossier/recon/strategy.

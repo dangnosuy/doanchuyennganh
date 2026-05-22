@@ -330,12 +330,22 @@ class BrowserAgent:
         max_rounds: int = 2,
         max_pages: int = 50,
         initial_cookies: Optional[List[Dict[str, Any]]] = None,
+        storage_state: Optional[str] = None,
     ):
         self.target_domain = domain
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=self.headless)
-            context = await browser.new_context(ignore_https_errors=True)
+            context_kwargs: Dict[str, Any] = {"ignore_https_errors": True}
+            if storage_state:
+                context_kwargs["storage_state"] = storage_state
+            try:
+                context = await browser.new_context(**context_kwargs)
+                if storage_state:
+                    _log(f"[CRAWLER] Loaded Playwright storage_state: {storage_state}")
+            except Exception as e:
+                _log(f"[CRAWLER] Could not load storage_state ({e}); falling back to clean context")
+                context = await browser.new_context(ignore_https_errors=True)
 
             if initial_cookies:
                 await context.add_cookies(initial_cookies)
@@ -393,6 +403,7 @@ class BrowserAgent:
 def run_crawl(
     start_url: str,
     cookies: list[dict] | None = None,
+    storage_state: str | None = None,
     max_rounds: int = 2,
     max_pages: int = 50,
     headless: bool = True,
@@ -416,7 +427,8 @@ def run_crawl(
                 agent = BrowserAgent(headless=headless)
                 result = loop.run_until_complete(
                     agent._crawl_logic(start_url, domain, max_rounds=max_rounds,
-                                       max_pages=max_pages, initial_cookies=cookies)
+                                       max_pages=max_pages, initial_cookies=cookies,
+                                       storage_state=storage_state)
                 )
             finally:
                 loop.close()
@@ -495,6 +507,7 @@ def main():
     parser.add_argument("--max-pages", type=int, default=50, help="Max pages per round (default: 50)")
     parser.add_argument("--max-rounds", type=int, default=2, help="Number of BFS rounds (default: 2)")
     parser.add_argument("--timeout", type=int, default=300, help="Timeout in seconds (default: 300)")
+    parser.add_argument("--storage-state", help="Playwright storage_state JSON file to reuse")
     parser.add_argument("--headless", action="store_true", default=True, help="Run headless (default)")
     parser.add_argument("--no-headless", action="store_true", help="Run with visible browser")
 
@@ -514,11 +527,14 @@ def main():
     if inject_cookies:
         _log(f"[CRAWLER-CLI] Injecting {len(inject_cookies)} cookies: "
              f"{[c['name'] for c in inject_cookies]}")
+    if args.storage_state:
+        _log(f"[CRAWLER-CLI] Using storage_state: {args.storage_state}")
 
     try:
         traffic, cookies, external = run_crawl(
             start_url=args.url,
             cookies=inject_cookies,
+            storage_state=args.storage_state,
             max_rounds=args.max_rounds,
             max_pages=args.max_pages,
             headless=headless,

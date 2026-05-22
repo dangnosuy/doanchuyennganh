@@ -26,6 +26,12 @@ from shared.utils import extract_send_block, truncate
 from shared.memory_store import MemoryStore
 from shared.context_manager import ContextManager
 from shared.bug_dossier import load_and_enrich_risk_bugs
+from shared.auth_context import (
+    bearer_token_from_session,
+    cookie_header_from_cookie_objects,
+    load_auth_context,
+    session_has_auth_material,
+)
 from shared.logger import log
 from agents.policy_agent import PolicyAgent
 from knowledge.bac_blf_playbook import get_playbook_text
@@ -39,7 +45,7 @@ MODEL        = os.environ.get("MARL_MANAGER_MODEL", "ollama/gemma4:31b-cloud")
 MAX_ROUNDS        = 2    # số vòng strategy revision tối đa
 MIN_DEBATE_ROUNDS = 0    # deterministic state machine handles Red -> Blue gating
 MAX_EXEC_RETRIES  = 1    # retry Exec tối đa 1 lần để tránh loop phức tạp
-MAX_TICKS         = 60   # tổng số tick tối đa cho toàn pipeline
+MAX_TICKS         = 60   # base ticks (sẽ tính dynamic theo số bugs trong __init__)
 EXEC_TIMEOUT = 4800  # giây — ExecAgent bị kill sau 80 phút để tránh treo vĩnh viễn
 COMPRESS_TRIGGER_LEN = 20
 COMPRESS_KEEP_RECENT = 6
@@ -150,10 +156,16 @@ Khi Exec that bai, ban PHAI phan tich theo 4 nguyen nhan:
 - Sau Red strategy hop le, phai DEBATE_BLUE truoc khi EXECUTE_BUG.
 - Chi EXECUTE_BUG khi co current workflow va Blue da approve.
 - Exec script tu verify va in FINAL/SUCCESS. Manager doc verdict/evidence de quyet dinh.
+- Auth context co the la cookie, Playwright storage_state, hoac localStorage/JWT token.
+  Neu Auth context da co, dung no de mo rong recon/Exec, khong coi bug auth_required la blocked chi vi khong co HTTP form login.
 - Proof gate bat buoc truoc khi chap nhan EXPLOITED:
   * BAC-01/admin: phai thay control/admin API quyen cao that, khong chi status 200/admin marker/challenge metadata.
+  * BAC-02/privilege escalation: phai chung minh cookie/role tamper DAN TOI truy cap admin/privileged resources. Day la vertical escalation, KHONG phai IDOR.
   * BAC-03/IDOR: phai chung minh object ownership bypass/cross-user access. Public list leak UserId/comment chi la INFO_EXPOSURE_ONLY.
+  * BAC-04+/method bypass: phai chung minh unauthorized action execution hoac admin access qua method switching/override.
   * BLF/stateful: phai co before/after state, non-zero delta, hoac invalid state transition da verify.
+- PROOF_QUALITY_FAIL: cho retry 1 lan voi huong dan cu the truoc khi STOP. Script error cho retry 2 lan.
+- Khi script Exec bao EXPLOITED (FINAL: EXPLOITED, verdict=YES), tin tuong script — KHONG override boi heuristic (WRONG_TARGET, etc.).
 - Khi Exec FAILED/PARTIAL: PHAN TICH nguyen nhan TRUOC. Neu la STRATEGY_GAP → RETRY_RED. Neu NOT_VULNERABLE → STOP_BUG.
 - Neu Exec loi syntax/runtime/script, uu tien RETRY_EXEC de Exec tu sua script.
 - Chi BAC/BLF. Khong brute force, DDoS, SQLi/XSS/SSRF.
@@ -564,7 +576,10 @@ class ManageAgent:
         # Ghi finding recon vào memory ngay khi khởi tạo
         self.memory.add_finding("recon", "recon_content",
                                 truncate(recon_content, 3000), agent="crawl")
+        self.auth_context_summary = self._auth_context_summary()
         self.has_authenticated_context = self._has_authenticated_context()
+        if self.auth_context_summary:
+            self.memory.add_finding("auth", "auth_context", self.auth_context_summary, agent="crawl")
         self._report_state = {
             "verdict": "PENDING",
             "workflow": "",
@@ -572,6 +587,11 @@ class ManageAgent:
             "red_evaluation": "",
             "debate_rounds": 0,
         }
+        # Track tested endpoint+pattern combos to detect duplicate bugs
+        self._tested_endpoints: set[str] = set()
+
+        # Dynamic tick budget: 8 ticks per bug, minimum 60
+        self._max_ticks = max(MAX_TICKS, len(self.risk_bugs) * 8)
 
     @staticmethod
     def _compact_list(values: list[str], limit: int = 5) -> str:
@@ -604,14 +624,20 @@ class ManageAgent:
         exec_status: str,
         retry_count: int,
     ) -> tuple[str, str]:
-        """Phân tích nguyên nhân Exec fail với BAC/BLF knowledge.
+        """Phân tích nguyên nhân Exec fail — intelligent diagnosis.
+
+        Key intelligence:
+        - Detect "all probes same status" = server whitelist → STOP immediately
+        - Detect duplicate endpoint already tested → STOP
+        - Detect auth problem + check if auth available now → suggest auth fix
+        - Count negative probes: 10+ all negative → STOP (not vulnerable)
 
         Returns:
             (action, diagnosis_note): action để _decide routing, note chứa phân tích.
         """
         bug_id = current_bug.get("id", "?")
         bug_label = _bug_label(bug_id)
-        evidence = _summarize_exec_output(exec_result, max_lines=8)
+        evidence = _summarize_exec_output(exec_result, max_lines=12)
         hypothesis = current_bug.get("hypothesis", "")
         pattern_id = current_bug.get("pattern_id", "")
         endpoint = current_bug.get("endpoint", "")
@@ -619,13 +645,47 @@ class ManageAgent:
         auth_required = current_bug.get("auth_required", False)
         exec_reason = current_bug.get("exec_result_reason", "")
 
-        # ── Deterministic diagnosis trước (nhanh, không tốn LLM) ──
-
         lower_evidence = evidence.lower()
         lower_reason = (exec_reason or "").lower()
 
-        # 1. WRONG_TARGET / 404: Exec target sai resource
-        if exec_status == "WRONG_TARGET" or "404" in lower_evidence:
+        # ── Intelligence 1: Detect "all probes same error" pattern ──
+        # If exec ran multiple probes and ALL returned same error status → server is clearly blocking
+        import re as _re
+        status_pattern = _re.findall(r'status[=:]\s*(\d{3})', lower_evidence)
+        if len(status_pattern) >= 5:
+            unique_statuses = set(status_pattern)
+            if len(unique_statuses) == 1 and unique_statuses.pop() in ('400', '401', '403', '500'):
+                return "STOP_BUG", (
+                    f"[PHÂN TÍCH] {bug_label}: INTELLIGENT_STOP — "
+                    f"Exec đã chạy {len(status_pattern)} probes, TẤT CẢ trả cùng status. "
+                    f"Server rõ ràng validate/whitelist fields cho endpoint {endpoint}. "
+                    f"Kết luận: NOT_VULNERABLE — tiếp tục retry là vô ích."
+                )
+
+        # ── Intelligence 2: Detect "no admin marker" mass-assignment dead end ──
+        no_marker_count = lower_evidence.count("no admin marker") + lower_evidence.count("no field")
+        if no_marker_count >= 3:
+            return "STOP_BUG", (
+                f"[PHÂN TÍCH] {bug_label}: INTELLIGENT_STOP — "
+                f"Exec đã thử {no_marker_count}+ probe variants cho mass-assignment trên {endpoint}, "
+                f"tất cả đều bị server ignore/override. "
+                f"Kết luận: Endpoint này KHÔNG có lỗ hổng mass-assignment."
+            )
+
+        # ── Intelligence 3: Check for duplicate endpoint already tested ──
+        if hasattr(self, '_tested_endpoints'):
+            endpoint_key = f"{method}:{endpoint}:{pattern_id}"
+            if endpoint_key in self._tested_endpoints:
+                return "STOP_BUG", (
+                    f"[PHÂN TÍCH] {bug_label}: DUPLICATE_SKIP — "
+                    f"Endpoint {method} {endpoint} với pattern {pattern_id} đã được test "
+                    f"bởi bug trước và fail. Không cần test lại."
+                )
+
+        # ── Deterministic diagnosis (fast, no LLM) ──
+
+        # 1. WRONG_TARGET / 404
+        if exec_status == "WRONG_TARGET" or lower_evidence.count("404") >= 3:
             if retry_count < 1:
                 return "RETRY_RED", (
                     f"[PHÂN TÍCH] {bug_label} thất bại do TARGETING_GAP: "
@@ -637,76 +697,101 @@ class ManageAgent:
                 f"Kết luận: NOT_VULNERABLE — endpoint không tồn tại trên target."
             )
 
-        # 2. Auth required nhưng không có session
-        if auth_required and ("redirect" in lower_evidence or "login" in lower_evidence
-                               or "401" in lower_evidence or "403" in lower_evidence):
+        # 2. Auth required nhưng không có session — check if auth available NOW
+        if auth_required and ("401" in lower_evidence or "403" in lower_evidence):
+            # Re-check auth context (may have been created by Exec for earlier bug)
+            self.has_authenticated_context = self._has_authenticated_context()
+            self.auth_context_summary = self._auth_context_summary()
+            if self.has_authenticated_context:
+                if retry_count < 1:
+                    return "RETRY_EXEC", (
+                        f"[PHÂN TÍCH] {bug_label}: AUTH_NOW_AVAILABLE — "
+                        f"Bug gặp 401/403 nhưng auth_context.json giờ đã có session (từ Exec trước). "
+                        f"Retry Exec để sử dụng session mới."
+                    )
             return "STOP_BUG", (
                 f"[PHÂN TÍCH] {bug_label}: BLOCKED_AUTH — bug yêu cầu authenticated session "
-                f"nhưng Exec/recon không có session hợp lệ (401/403/redirect/login fail). "
-                f"Dừng candidate này để tránh retry Red/Blue không giải quyết được auth."
+                f"nhưng Exec/recon không có session hợp lệ (401/403). Dừng candidate."
             )
 
+        # 3. Metadata-only evidence
         if "metadata_only_proof" in lower_evidence or "challenge metadata" in lower_evidence:
             return "STOP_BUG", (
                 f"[PHÂN TÍCH] {bug_label}: METADATA_ONLY_PROOF — evidence chỉ đến từ "
                 f"metadata/challenge text, không chứng minh được endpoint/chức năng BAC/BLF thực tế."
             )
 
-        if exec_status in {"INFO_EXPOSURE_ONLY", "PROOF_QUALITY_FAIL"}:
+        if exec_status in {"INFO_EXPOSURE_ONLY"}:
             return "STOP_BUG", (
                 f"[PHÂN TÍCH] {bug_label}: {exec_status} — "
                 f"{truncate(exec_reason or evidence, 420)}"
             )
 
-        # 3. Script ran OK nhưng evidence không match hypothesis
+        # PROOF_QUALITY_FAIL: cho retry 1 lần với hướng dẫn cụ thể thay vì STOP ngay
+        if exec_status == "PROOF_QUALITY_FAIL":
+            if retry_count < 1:
+                return "RETRY_RED", (
+                    f"[PHÂN TÍCH] {bug_label}: PROOF_QUALITY_FAIL — evidence chưa đủ mạnh. "
+                    f"Red hãy thiết kế strategy MỚI tập trung vào lấy BẰNG CHỨNG CỤ THỂ: "
+                    f"admin marker, before/after delta, hoặc cross-user access proof. "
+                    f"Reason: {truncate(exec_reason or evidence, 300)}"
+                )
+            return "STOP_BUG", (
+                f"[PHÂN TÍCH] {bug_label}: {exec_status} — "
+                f"{truncate(exec_reason or evidence, 420)}"
+            )
+
+        # 4. Script ran OK nhưng evidence không match hypothesis
         if exec_status == "FAILED" and ("not found" in lower_evidence or "missing" in lower_evidence):
             if retry_count < 1:
                 return "RETRY_RED", (
                     f"[PHÂN TÍCH] {bug_label} thất bại do STRATEGY_GAP: "
                     f"Script chạy OK nhưng evidence không khớp hypothesis '{truncate(hypothesis, 100)}'. "
-                    f"Có thể Red đã chọn sai marker/endpoint. "
-                    f"Red cần xem lại recon và đề xuất approach khác cho pattern {pattern_id}."
+                    f"Red cần xem lại recon và đề xuất approach KHÁC BIỆT HOÀN TOÀN cho pattern {pattern_id}. "
+                    f"KHÔNG được lặp lại approach cũ với cùng endpoint."
                 )
             return "STOP_BUG", (
                 f"[PHÂN TÍCH] {bug_label}: Strategy đã retry nhưng vẫn fail. "
                 f"Kết luận: NOT_VULNERABLE — endpoint {endpoint} không có lỗ hổng {pattern_id}."
             )
 
-        # 4. SCRIPT_ERROR — lỗi code
+        # 5. SCRIPT_ERROR — cho phép 2 lần retry (syntax error là lỗi kỹ thuật, không phải exploit fail)
         if exec_status == "SCRIPT_ERROR":
-            if retry_count < 1:
+            if retry_count < 2:
                 return "RETRY_EXEC", (
-                    f"[PHÂN TÍCH] {bug_label}: Lỗi script/runtime — "
+                    f"[PHÂN TÍCH] {bug_label}: Lỗi script/runtime (lần {retry_count + 1}) — "
                     f"Exec cần sửa code và chạy lại."
                 )
             return "STOP_BUG", (
-                f"[PHÂN TÍCH] {bug_label}: Script vẫn lỗi sau retry. STOP bug."
+                f"[PHÂN TÍCH] {bug_label}: Script vẫn lỗi sau 2 lần retry. STOP bug."
             )
 
-        # 5. PARTIAL — có signal nhưng chưa đủ
+        # 6. PARTIAL — kiểm tra có tín hiệu thực sự hay chỉ là "partial vì retry hết"
         if exec_status == "PARTIAL":
+            # Intelligence: nếu evidence chứa "all probes negative" / "no marker" → treat as FAILED
+            if ("all probe" in lower_evidence and "negative" in lower_evidence) \
+                    or "server likely validates" in lower_evidence \
+                    or "server whitelists" in lower_evidence:
+                return "STOP_BUG", (
+                    f"[PHÂN TÍCH] {bug_label}: PARTIAL nhưng TẤT CẢ probes negative — "
+                    f"thực chất là NOT_VULNERABLE. Server rõ ràng chặn approach này. Dừng bug."
+                )
             if retry_count < 1:
                 return "RETRY_EXEC", (
                     f"[PHÂN TÍCH] {bug_label}: PARTIAL — có tín hiệu nhưng chưa đủ evidence. "
                     f"Exec retry 1 lần để chốt."
                 )
-            # Sau retry PARTIAL, thử Red viết lại nếu chưa thử
-            if retry_count < 2:
-                return "RETRY_RED", (
-                    f"[PHÂN TÍCH] {bug_label}: Vẫn PARTIAL sau exec retry. "
-                    f"STRATEGY_GAP có thể — Red hãy thử approach khác cho {pattern_id}."
-                )
             return "STOP_BUG", (
-                f"[PHÂN TÍCH] {bug_label}: PARTIAL sau nhiều lần thử. "
-                f"Kết luận: Có tín hiệu nhưng không đủ chứng minh — dừng bug."
+                f"[PHÂN TÍCH] {bug_label}: PARTIAL sau nhiều lần thử. Dừng bug."
             )
 
-        # 6. Default FAILED — generic
+        # 7. Default FAILED
         if retry_count < 1:
             return "RETRY_RED", (
                 f"[PHÂN TÍCH] {bug_label} FAILED. Manager yêu cầu Red phân tích lại: "
                 f"Evidence cho thấy: '{truncate(evidence, 150)}'. "
-                f"Red hãy đổi approach cho pattern {pattern_id} trên endpoint {method} {endpoint}."
+                f"Red hãy đổi approach HOÀN TOÀN KHÁC cho pattern {pattern_id} trên endpoint {method} {endpoint}. "
+                f"KHÔNG lặp lại cùng mass-assignment/probe approach nếu đã thất bại."
             )
 
         return "STOP_BUG", (
@@ -771,6 +856,7 @@ class ManageAgent:
             f"Function: {truncate(str(bug.get('endpoint_function', '-') or '-'), 220)}\n"
             f"Auth: required={bug.get('auth_required', False)} | observation={truncate(str(bug.get('auth_observation', '-') or '-'), 180)}\n"
             f"Authenticated recon available: {self.has_authenticated_context}\n"
+            f"Auth context summary: {truncate(self.auth_context_summary or '-', 260)}\n"
             f"Params: {self._compact_list(bug.get('request_params') or [])}\n"
             f"Form fields: {self._compact_list(form_fields)}\n"
             f"Hypothesis: {truncate(str(bug.get('hypothesis', '-') or '-'), 260)}\n"
@@ -857,7 +943,7 @@ class ManageAgent:
 
         self._persist_new_messages(conversation, start_idx=0)
 
-        for tick in range(MAX_TICKS):
+        for tick in range(self._max_ticks):
             tick_start_len = len(conversation)
 
             preflight_result = self._preflight_current_bug(
@@ -1307,6 +1393,12 @@ class ManageAgent:
                 current_bug["PoC"] = current_bug.get("PoC", "")
                 current_bug["failure_reason"] = note or f"Manager stopped bug as {stop_reason}."
                 self._save_risk_bugs()
+                
+                # Ghi nhận endpoint đã test để dedup các bug sau
+                if hasattr(self, '_tested_endpoints') and current_bug.get("endpoint") and current_bug.get("method"):
+                    endpoint_key = f"{current_bug.get('method')}:{current_bug.get('endpoint')}:{current_bug.get('pattern_id', '')}"
+                    self._tested_endpoints.add(endpoint_key)
+                
                 bugs_processed_count += 1
                 log.debug(f"[MANAGER] STOP_BUG — {current_bug.get('id','?')} marked {stop_reason}")
 
@@ -1393,9 +1485,9 @@ class ManageAgent:
                 keep_recent=COMPRESS_KEEP_RECENT,
             )
 
-        # MAX_TICKS exhausted
-        log.warn(f"Hết {MAX_TICKS} ticks — REPORT_FAIL")
-        self._write_report_fail(f"Hết giới hạn {MAX_TICKS} ticks.")
+        # _max_ticks exhausted
+        log.warn(f"Hết {self._max_ticks} ticks — REPORT_FAIL")
+        self._write_report_fail(f"Hết giới hạn {self._max_ticks} ticks.")
 
     def _advance_bug(
         self,
@@ -1458,6 +1550,23 @@ class ManageAgent:
 
         bug_id = current_bug.get("id", "?")
         http_examples = current_bug.get("http_examples") or []
+        
+        # ── Re-evaluate auth context dynamically ──
+        # Exec-Agent may have successfully logged in during a prior bug.
+        self.has_authenticated_context = self._has_authenticated_context()
+        self.auth_context_summary = self._auth_context_summary()
+        
+        if current_bug.get("auth_required") and self.has_authenticated_context:
+            current_bug["auth_context_available"] = True
+            existing_auth_evidence = str(current_bug.get("auth_evidence") or "").upper()
+            if (
+                not existing_auth_evidence
+                or "NO_VERIFIED_AUTH_CONTEXT" in existing_auth_evidence
+                or "BLOCKED_AUTH" in existing_auth_evidence
+                or "AUTH_REQUIRED_WITH_LIMITED_EVIDENCE" in existing_auth_evidence
+            ):
+                current_bug["auth_evidence"] = f"AUTH_CONTEXT_AVAILABLE: {self.auth_context_summary or 'authenticated material captured'}"
+                self._save_risk_bugs()
         if current_bug.get("auth_required") and not self.has_authenticated_context and not http_examples:
             reason = (
                 "BLOCKED_AUTH: candidate yêu cầu authenticated context nhưng crawl không có "
@@ -1489,7 +1598,15 @@ class ManageAgent:
         return ""
 
     def _has_authenticated_context(self) -> bool:
-        """Return True only when crawl captured a non-placeholder authenticated session."""
+        """Return True when crawl captured reusable auth material, including SPA storage_state."""
+        try:
+            context = load_auth_context(self.run_dir)
+            for session in context.get("sessions", []) or []:
+                if session_has_auth_material(session):
+                    return True
+        except Exception:
+            pass
+
         path = Path(self.run_dir) / "crawl_raw.json"
         if not path.is_file():
             return False
@@ -1513,7 +1630,71 @@ class ManageAgent:
             )
             if header and "<value>" not in header and "placeholder" not in header.lower():
                 return True
+            token = bearer_token_from_session(entry)
+            if token:
+                return True
+            storage_path = entry.get("storage_state_path")
+            if storage_path and Path(str(storage_path)).is_file():
+                return True
         return False
+
+    def _auth_context_summary(self) -> str:
+        """Compact auth context summary for Manager/Red/Blue routing decisions."""
+        try:
+            context = load_auth_context(self.run_dir)
+        except Exception:
+            context = {}
+        sessions = []
+        for session in context.get("sessions", []) or []:
+            if not isinstance(session, dict):
+                continue
+            material = []
+            header = cookie_header_from_cookie_objects(session.get("cookies") or [])
+            if header:
+                cookie_names = [
+                    part.split("=", 1)[0]
+                    for part in header.split("; ")
+                    if "=" in part
+                ][:5]
+                material.append(f"cookies={','.join(cookie_names)}")
+            if session.get("storage_state_path"):
+                material.append("storage_state")
+            if bearer_token_from_session(session):
+                material.append("token")
+            if not material and not session_has_auth_material(session):
+                continue
+            sessions.append(
+                f"{session.get('label', 'authenticated')}("
+                f"verified={bool(session.get('auth_verified'))}; "
+                f"source={session.get('created_by', '?')}; "
+                f"{'+'.join(material) if material else 'material=unknown'}"
+                f")"
+            )
+        if sessions:
+            return "; ".join(sessions[:4])
+
+        # Backward-compatible fallback from crawl_raw.json.
+        path = Path(self.run_dir) / "crawl_raw.json"
+        if not path.is_file():
+            return ""
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        raw_sessions = []
+        for entry in payload.get("authenticated", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            header = cookie_header_from_cookie_objects(entry.get("cookies") or [])
+            token = bearer_token_from_session(entry)
+            if header or token or entry.get("storage_state_path"):
+                raw_sessions.append(
+                    f"{entry.get('label', 'authenticated')}"
+                    f"(verified={bool(entry.get('auth_verified'))}; "
+                    f"{'cookies' if header else ''}{'+token' if token else ''}"
+                    f"{'+storage_state' if entry.get('storage_state_path') else ''})"
+                )
+        return "; ".join(raw_sessions[:4])
 
     @staticmethod
     def _is_challenge_metadata_candidate(bug: dict) -> bool:
@@ -1863,15 +2044,8 @@ class ManageAgent:
                 "evidence": evidence,
             }
 
-        # ── 2. All 404 = targeting sai resource ID, không phải exploit failed ──
-        if attempt.get("signal") == "WRONG_TARGET":
-            return {
-                "status": "WRONG_TARGET",
-                "reason": evidence or "Tất cả request đều trả 404 — endpoint/resource ID sai.",
-                "evidence": evidence,
-            }
-
-        # ── 3. Script nói rõ EXPLOITED → tin tưởng ──
+        # ── 2. Script nói rõ EXPLOITED → tin tưởng (HIGHEST PRIORITY after errors) ──
+        #    EXPLOITED verdict từ script PHẢI thắng mọi heuristic (WRONG_TARGET, etc.)
         if final_marker == "EXPLOITED" or success_verdict == "YES":
             return self._confirmed_exploit_decision(
                 exec_result,
@@ -1880,6 +2054,14 @@ class ManageAgent:
                 evidence,
                 "Exec reported EXPLOITED.",
             )
+
+        # ── 3. All 404 = targeting sai resource ID (chỉ khi script KHÔNG nói EXPLOITED) ──
+        if attempt.get("signal") == "WRONG_TARGET":
+            return {
+                "status": "WRONG_TARGET",
+                "reason": evidence or "Tất cả request đều trả 404 — endpoint/resource ID sai.",
+                "evidence": evidence,
+            }
 
         # ── 4. Script nói rõ FAILED → tin tưởng, KHÔNG override bởi heuristic ──
         #    Đây là fix chống false positive: khi script in FINAL: FAILED + rc=1,
@@ -1989,6 +2171,7 @@ class ManageAgent:
         exec_text = str(exec_result or "").lower()
         json_text = self._json_text(result_json)
 
+        # ── BAC-01: Admin access — cần admin marker/control ──
         if pattern_id == "BAC-01" or ("admin" in bug_text and "bac" in category):
             if not self._has_concrete_admin_control(exec_text, json_text):
                 reason = (
@@ -1998,7 +2181,23 @@ class ManageAgent:
                 )
                 return {"status": "PROOF_QUALITY_FAIL", "reason": reason, "evidence": reason}
 
-        if pattern_id in {"BAC-02", "BAC-03"} or "idor" in bug_text:
+        # ── BAC-02: Privilege escalation (vertical) — cần admin marker HOẶC
+        #    differential proof (baseline vs probe show different access levels).
+        #    KHÔNG phải IDOR — không yêu cầu ownership bypass. ──
+        if pattern_id == "BAC-02":
+            # Privilege escalation: chấp nhận nếu có admin marker HOẶC role/cookie tamper evidence
+            has_admin = self._has_concrete_admin_control(exec_text, json_text)
+            has_priv_escalation = self._has_privilege_escalation_proof(exec_text, json_text)
+            if not has_admin and not has_priv_escalation:
+                reason = (
+                    "PROOF_QUALITY_FAIL: BAC-02 privilege escalation proof requires "
+                    "demonstrating access to admin/privileged functionality after cookie/role "
+                    "tampering. No admin marker or differential access found."
+                )
+                return {"status": "PROOF_QUALITY_FAIL", "reason": reason, "evidence": reason}
+
+        # ── BAC-03: IDOR (horizontal) — cần ownership bypass ──
+        if pattern_id == "BAC-03" or ("idor" in bug_text and pattern_id != "BAC-02"):
             if not self._has_object_ownership_bypass(result_json, exec_text):
                 if self._has_public_info_exposure_signal(result_json, exec_text):
                     reason = (
@@ -2008,12 +2207,27 @@ class ManageAgent:
                     )
                     return {"status": "INFO_EXPOSURE_ONLY", "reason": reason, "evidence": reason}
                 reason = (
-                    "PROOF_QUALITY_FAIL: BAC/IDOR proof requires accessing an object/data "
+                    "PROOF_QUALITY_FAIL: BAC-03/IDOR proof requires accessing an object/data "
                     "record owned by another user or role. The current evidence does not "
                     "show ownership bypass."
                 )
                 return {"status": "PROOF_QUALITY_FAIL", "reason": reason, "evidence": reason}
 
+        # ── BAC-04+: Method/role bypass — chấp nhận nếu có admin marker hoặc
+        #    script nói EXPLOITED (script tự verify rồi) ──
+        if pattern_id in {"BAC-04", "BAC-05", "BAC-06"}:
+            # Method/role bypass: script nói EXPLOITED → tin tưởng nếu có evidence cụ thể
+            has_admin = self._has_concrete_admin_control(exec_text, json_text)
+            has_state_change = self._has_business_logic_state_change(result_json, exec_text)
+            has_priv = self._has_privilege_escalation_proof(exec_text, json_text)
+            if not has_admin and not has_state_change and not has_priv:
+                reason = (
+                    f"PROOF_QUALITY_FAIL: {pattern_id} proof requires demonstrating "
+                    f"unauthorized action execution or admin access. No concrete evidence found."
+                )
+                return {"status": "PROOF_QUALITY_FAIL", "reason": reason, "evidence": reason}
+
+        # ── BLF: Business logic — cần before/after state change ──
         if pattern_id.startswith("BLF") or "business logic" in category or "blf" in category:
             if not self._has_business_logic_state_change(result_json, exec_text):
                 reason = (
@@ -2190,13 +2404,44 @@ class ManageAgent:
     def _has_concrete_admin_control(exec_text: str, json_text: str) -> bool:
         text = f"{exec_text}\n{json_text}"
         control_markers = (
+            # Dashboard / panel names
             "admin dashboard", "admin panel", "administration dashboard",
+            "admin area", "admin page", "admin section", "admin console",
+            "control panel", "system settings", "configuration panel",
+            "management console", "admin interface", "admin portal",
+            # User/role management actions
             "user management", "manage users", "delete user", "remove user",
             "role management", "change role", "promote user", "demote user",
+            "user list", "users list", "list of users",
+            # API/endpoint markers
             "privileged control", "admin api resource", "admin-only api",
             "all users", "/api/users status=200", "/rest/admin", "/api/admin",
+            "/admin/products", "/admin/users", "/admin/orders",
+            # Action evidence
+            "victim deleted", "user deleted", "role changed",
+            "admin action succeeded", "admin-only action",
         )
         return any(marker in text for marker in control_markers)
+
+    @staticmethod
+    def _has_privilege_escalation_proof(exec_text: str, json_text: str) -> bool:
+        """Detect privilege escalation evidence: cookie/role tamper → access admin resources."""
+        text = f"{exec_text}\n{json_text}"
+        # Evidence of cookie/role tampering combined with successful access
+        tamper_markers = (
+            "cookie tamper", "role=admin", "role=user", "role tampering",
+            "cookie role", "modified cookie", "changed cookie",
+            "privilege escalation", "vertical escalation",
+            "role escalation", "elevated privileges",
+        )
+        access_markers = (
+            "status=200", "status=201", "status=302",
+            "success", "accessed", "visible", "returned",
+            "admin", "dashboard", "panel", "management",
+        )
+        has_tamper = any(marker in text for marker in tamper_markers)
+        has_access = any(marker in text for marker in access_markers)
+        return has_tamper and has_access
 
     @classmethod
     def _has_business_logic_state_change(cls, result_json: dict, exec_text: str) -> bool:

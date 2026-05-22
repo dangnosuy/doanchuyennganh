@@ -50,7 +50,7 @@ RESET = "\033[0m"
 
 # Limits
 MAX_RECON_CHARS = 0  # 0 = doc toan bo recon.md enriched
-MAX_BUGS = 5
+MAX_BUGS = 15
 MAX_HTTP_EXAMPLES_PER_BUG = 2
 MAX_RESPONSE_SNIPPET_CHARS = 200
 MAX_LLM_RETRIES = 3
@@ -82,6 +82,8 @@ MUC TIEU:
 - Neu mot route/endpoint co dau hieu dang nghi thi CU DUA VAO OUTPUT.
 - False positive duoc CHAP NHAN.
 - Red/Blue/Exec se la cac thanh phan xac minh sau. Ban KHONG can confirm 100%.
+- LUON CO GANG GEN IT NHAT 8-10 bug candidates. Moi endpoint/route family nen duoc xem xet it nhat 1 bug.
+- TOI DA {max_bugs} bug candidates. KHONG dung lai o 5 — hay soan tat ca cac dau hieu nghi ngo.
 
 === KIEN THUC VE CAC PATTERN ===
 {playbook}
@@ -105,8 +107,13 @@ MUC TIEU:
    - mutable numeric fields: qty, amount, price, stock, balance
    - profile/order/cart/checkout/transfer workflow
    - role/user_id/client-controlled identity hints
+   - Cookie-based role/auth: role, user_id, session — cookie tampering candidates
+   - Multi-step workflows: cart → checkout → order → payment
+   - HTTP method variations: GET vs POST vs PUT vs DELETE on same endpoint
 3. Khi nghi ngo, cu dua bug candidate vao output. Khong can raw HTML/JSON exact dump.
 4. Moi bug candidate phai noi ro vi sao route do dang nghi va can verify nhu the nao.
+5. MOI ROUTE FAMILY nen co IT NHAT 1 bug candidate. Vi du: neu co /admin, /cart, /order, /profile, /products
+   thi nen co bug candidate cho TUNG nhom route.
 
 === YEU CAU QUAN TRONG ===
 Moi bug candidate nen co:
@@ -119,8 +126,8 @@ Moi bug candidate nen co:
 - confidence: LOW / MEDIUM / HIGH
 
 === OUTPUT FORMAT ===
-CHI TRA VE JSON array hop le, toi da {max_bugs} phan tu. Khong viet markdown,
-khong viet giai thich, khong viet attack surface summary ngoai JSON.
+CHI TRA VE JSON array hop le, TOI DA {max_bugs} phan tu (nhung KHONG DUOI 8 neu recon co du data).
+Khong viet markdown, khong viet giai thich, khong viet attack surface summary ngoai JSON.
 Ky tu dau tien phai la `[` va ky tu cuoi cung phai la `]`.
 Moi phan tu co cau truc:
 {{
@@ -154,6 +161,7 @@ Dong y voi cac quy tac:
 
 Khong can chac chan 100%. Neu thay dang nghi thi cu dua vao output.
 Neu khong co bug hop le → tra ve [].
+NHAN MANH: Hay gen TOI DA cac candidate. 5 bug la QUA IT cho mot ung dung web co nhieu endpoints.
 """
 
 
@@ -326,7 +334,8 @@ class VulnHunterAgent:
                 "Uu tien recall, false positive chap nhan duoc. "
                 "Khong viet markdown, khong giai thich ngoai JSON. "
                 "Output phai bat dau bang '[' va ket thuc bang ']'. "
-                "Dung cac route dossiers va candidate signals trong recon de suy ra bug."
+                "Dung cac route dossiers va candidate signals trong recon de suy ra bug. "
+                "QUAN TRONG: Gen it nhat 8 bug candidates. Moi route family nen co 1 candidate."
             )},
         ]
 

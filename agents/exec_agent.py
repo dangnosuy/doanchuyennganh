@@ -44,6 +44,16 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from mcp_client import MCPManager
+from shared.auth_context import (
+    bearer_token_from_session,
+    choose_auth_session,
+    cookie_header_from_cookie_objects,
+    cookies_from_storage_state_file,
+    load_auth_context,
+    session_has_auth_material,
+    upsert_auth_session,
+    write_netscape_cookie_file,
+)
 from shared.utils import (
     extract_send_block,
     truncate,
@@ -122,7 +132,7 @@ RULES:
     execute_command({"command": "curl -s -b 'session=COOKIE_VALUE' URL"})
     execute_command({"command": "curl -s -b 'session=COOKIE_VALUE' -d 'param=value' URL"})
 - KHONG BAO GIO dung fetch() roi ky vong no co session cua curl. Chung KHONG share cookie.
-- Neu can login: dung browser_navigate + browser_fill_form + browser_click, roi lay cookie bang browser_run_code_unsafe({"code": "(async () => { return await page.context().cookies(); })()"}). Tim cookie co name 'session' trong JSON. KHONG dung document.cookie vi no KHONG thay HttpOnly cookies.
+- Neu can login: dung browser_navigate + browser_fill_form + browser_click, roi lay cookie bang browser_run_code_unsafe({"code": "async (page) => { return JSON.stringify(await page.context().cookies()); }"}). Tim cookie co name 'session' trong JSON. KHONG dung document.cookie vi no KHONG thay HttpOnly cookies.
 - Sau khi co cookie, dung curl cho TAT CA request (ca GET lan POST).
 
 === CSRF TOKEN (CRITICAL) ===
@@ -183,7 +193,7 @@ nghia la fallback dang chay. TUYET DOI KHONG dung document.cookie.
 4. browser_click nut submit.
 5. LAY COOKIE — QUAN TRONG: Session cookie thuong la HttpOnly.
    Dung browser_run_code_unsafe de lay TAT CA cookies (ke ca HttpOnly):
-   browser_run_code_unsafe({{"code": "(async () => {{ return await page.context().cookies(); }})()"}}
+   browser_run_code_unsafe({{"code": "async (page) => {{ return JSON.stringify(await page.context().cookies()); }}"}}
    Tim cookie co name 'session' trong JSON result.
    Bao cao: SESSION_COOKIE: session=<value>
 
@@ -1201,7 +1211,47 @@ class ExecAgent:
         workflow_text: str,
         conversation: list[dict] | None = None,
     ) -> tuple[str, str]:
-        """Import a clean authenticated cookie set from crawl_raw.json when available."""
+        """Import a clean authenticated session from auth_context.json/crawl_raw.json when available."""
+        preferred_label = self._preferred_session_label(workflow_text, conversation).lower()
+        chosen_auth = choose_auth_session(self.working_dir, preferred_label)
+        if chosen_auth and session_has_auth_material(chosen_auth):
+            header = cookie_header_from_cookie_objects(chosen_auth.get("cookies") or [])
+            storage_cookies = []
+            if not header and chosen_auth.get("storage_state_path"):
+                storage_cookies = cookies_from_storage_state_file(
+                    chosen_auth.get("storage_state_path"),
+                    self.target_url,
+                )
+                header = cookie_header_from_cookie_objects(storage_cookies)
+
+            token = bearer_token_from_session(chosen_auth)
+            if not header and token:
+                header = f"token={token}"
+
+            if header and not _looks_like_empty_cookie(header):
+                base_path = self._base_cookies_path(preferred_label or str(chosen_auth.get("label", "")))
+                work_path = self._working_cookies_path()
+                cookies = chosen_auth.get("cookies") or storage_cookies
+                if cookies:
+                    write_netscape_cookie_file(cookies, base_path, self.target_url)
+                else:
+                    self._save_cookies_file(header, path=base_path)
+                self._copy_cookie_file(base_path, work_path)
+                label = str(chosen_auth.get("label", "authenticated")).strip() or "authenticated"
+                verified = bool(chosen_auth.get("auth_verified"))
+                storage_path = chosen_auth.get("storage_state_path", "")
+                summary = _send_block(
+                    "LOGIN_STATUS: IMPORTED_FROM_AUTH_CONTEXT\n"
+                    f"ACCOUNT_LABEL: {label}\n"
+                    f"AUTH_VERIFIED_DURING_CRAWL: {verified}\n"
+                    f"COOKIE_FILE: {work_path}\n"
+                    f"SESSION_COOKIE: {header}\n"
+                    + (f"AUTH_TOKEN: {token}\n" if token else "")
+                    + (f"PLAYWRIGHT_STORAGE_STATE: {storage_path}\n" if storage_path else "")
+                    + "REASON: Reused auth_context.json captured during Playwright/HTTP crawl."
+                )
+                return summary, header
+
         path = Path(self.working_dir) / "crawl_raw.json"
         if not path.is_file():
             return "", ""
@@ -1215,7 +1265,6 @@ class ExecAgent:
         if not isinstance(authenticated, list):
             return "", ""
 
-        preferred_label = self._preferred_session_label(workflow_text, conversation).lower()
         chosen: dict | None = None
         for entry in authenticated:
             if not isinstance(entry, dict):
@@ -1348,6 +1397,21 @@ class ExecAgent:
                 self._copy_cookie_file(base_path, work_path)
 
                 verified, verify_note = self._verify_http_login_session(client)
+                try:
+                    upsert_auth_session(self.working_dir, self.target_url, {
+                        "label": preferred_label or username,
+                        "username": username,
+                        "created_by": "exec_http_form",
+                        "auth_verified": verified,
+                        "cookies": cookies,
+                        "cookie_header": header,
+                        "storage_state_path": "",
+                        "storage_state": {},
+                        "bearer_token": "",
+                        "verified_url": verify_note,
+                    })
+                except Exception:
+                    pass
                 summary = _send_block(
                     "LOGIN_STATUS: HTTP_LOGIN_SUCCESS\n"
                     f"USERNAME: {username}\n"
@@ -1410,6 +1474,21 @@ class ExecAgent:
                 work_path = self._working_cookies_path()
                 self._save_cookies_file(header, path=base_path)
                 self._copy_cookie_file(base_path, work_path)
+                try:
+                    upsert_auth_session(self.working_dir, self.target_url, {
+                        "label": preferred_label,
+                        "username": username,
+                        "created_by": "exec_api_login",
+                        "auth_verified": True,
+                        "cookies": cookies,
+                        "cookie_header": header,
+                        "storage_state_path": "",
+                        "storage_state": {},
+                        "bearer_token": token,
+                        "verified_url": url,
+                    })
+                except Exception:
+                    pass
                 summary = _send_block(
                     "LOGIN_STATUS: API_LOGIN_SUCCESS\n"
                     f"USERNAME: {username}\n"
@@ -1441,6 +1520,56 @@ class ExecAgent:
         if self.target_url:
             user_content += f"=== TARGET URL ===\n{self.target_url}\n\n"
         user_content += f"=== WORKSPACE ===\n{self.working_dir}\n\n"
+        auth_context_file = os.path.join(self.working_dir, "auth_context.json")
+        if os.path.isfile(auth_context_file):
+            token_hint_from_context = ""
+            login_discovery_hint = ""
+            try:
+                selected_session = choose_auth_session(
+                    self.working_dir,
+                    self._preferred_session_label(workflow_text, conversation),
+                )
+                token_hint_from_context = bearer_token_from_session(selected_session)
+            except Exception:
+                token_hint_from_context = ""
+            # Extract login discovery info for exploit scripts
+            try:
+                ctx = load_auth_context(self.working_dir)
+                ld = ctx.get("login_discovery", {})
+                if ld and isinstance(ld, dict):
+                    login_discovery_hint = (
+                        f"LOGIN_ENDPOINT: {ld.get('login_endpoint', '?')}\n"
+                        f"LOGIN_METHOD: {ld.get('login_method', 'POST')}\n"
+                        f"LOGIN_CONTENT_TYPE: {ld.get('login_content_type', 'application/json')}\n"
+                        f"LOGIN_BODY_FIELDS: {ld.get('login_body_fields', [])}\n"
+                        f"AUTH_MECHANISM: {ld.get('auth_mechanism', 'unknown')}\n"
+                        f"TOKEN_LOCATION: {ld.get('token_location', 'N/A')}\n"
+                    )
+            except Exception:
+                login_discovery_hint = ""
+            user_content += (
+                "=== AUTH CONTEXT ===\n"
+                f"AUTH_CONTEXT_FILE: {auth_context_file}\n"
+                + (f"AUTH_TOKEN_HINT: {token_hint_from_context}\n" if token_hint_from_context else "")
+                + (f"\n=== LOGIN DISCOVERY (from auth fingerprint) ===\n{login_discovery_hint}"
+                   "IMPORTANT: If script needs to login (e.g. to create user then login as that user), "
+                   "use the LOGIN_ENDPOINT above with the correct Content-Type and body fields. "
+                   "If AUTH_MECHANISM is jwt_bearer, extract token from TOKEN_LOCATION in response JSON "
+                   "and use `Authorization: Bearer <token>` header for subsequent requests.\n\n"
+                   if login_discovery_hint else "")
+                + "File nay co the chua cookies, Playwright storage_state_path, localStorage/JWT token "
+                "duoc Crawl/Exec login truoc do ghi lai. Neu COOKIE_FILE khong du auth cho API SPA, "
+                "doc AUTH_CONTEXT_FILE de lay bearer_token hoac localStorage token va dung "
+                "`Authorization: Bearer <token>` khi phu hop.\n"
+                "CRITICAL: If AUTH_TOKEN_HINT or login_discovery is present, your python script MUST explicitly "
+                "add `headers={'Authorization': f'Bearer {token}'}` to EVERY `requests.get/post/put/delete` call! "
+                "Do not rely solely on cookies for SPA/API targets.\n"
+                "To parse the token from AUTH_CONTEXT_FILE in python, use this exact snippet:\n"
+                "```python\n"
+                "ctx = json.load(open(AUTH_CONTEXT_FILE))\n"
+                "token = ctx.get('sessions', [{}])[0].get('bearer_token', '')\n"
+                "```\n\n"
+            )
         user_content += f"=== SCRIPT SHOT ===\nShot {shot_index}/{total_shots}\n\n"
         safe_prefix = self._safe_artifact_prefix(artifact_prefix or "bug-unknown")
         state_dir = os.path.join(self.working_dir, "exploit_state", safe_prefix)
@@ -1598,6 +1727,7 @@ class ExecAgent:
             f"WORKDIR={shlex.quote(self.working_dir)} "
             f"BUG_ID={shlex.quote(safe_prefix)} "
             f"STATE_DIR={shlex.quote(str(state_dir))} "
+            f"AUTH_CONTEXT_FILE={shlex.quote(os.path.join(self.working_dir, 'auth_context.json'))} "
             f"TARGET={shlex.quote(self.target_url)}"
         )
         runtime_cmd = (
@@ -2363,13 +2493,50 @@ class ExecAgent:
 
         result_text = str(result)
         cookie = self._extract_cookie_from_result(result_text)
+        payload = self._extract_browser_json_payload(result_text)
+        storage_path = ""
+        token = ""
+        if payload:
+            storage_state = payload.get("storageState") or payload.get("storage_state") or {}
+            cookies = payload.get("cookies") or (storage_state.get("cookies") if isinstance(storage_state, dict) else []) or []
+            token = bearer_token_from_session({"storage_state": storage_state}) if isinstance(storage_state, dict) else ""
+            if storage_state or cookies or token:
+                label = username
+                storage_path = os.path.join(
+                    self.working_dir,
+                    f"auth_state_{re.sub(r'[^A-Za-z0-9_.-]+', '_', label).strip('._-') or 'authenticated'}.json",
+                )
+                try:
+                    if isinstance(storage_state, dict) and storage_state:
+                        Path(storage_path).write_text(json.dumps(storage_state, ensure_ascii=False, indent=2), encoding="utf-8")
+                    session = {
+                        "label": label,
+                        "username": username,
+                        "created_by": "exec_browser",
+                        "auth_verified": bool(cookie or token),
+                        "cookies": cookies,
+                        "cookie_header": cookie_header_from_cookie_objects(cookies),
+                        "storage_state_path": storage_path if storage_state else "",
+                        "storage_state": storage_state if isinstance(storage_state, dict) else {},
+                        "bearer_token": token,
+                        "verified_url": payload.get("finalUrl", ""),
+                    }
+                    upsert_auth_session(self.working_dir, self.target_url, session)
+                except Exception as e:
+                    print(f"{DIM}[EXEC-AGENT] Could not persist browser auth context: {e}{RESET}")
+            if not cookie and cookies:
+                cookie = cookie_header_from_cookie_objects(cookies)
+            if not cookie and token:
+                cookie = f"token={token}"
         status = "SUCCESS" if cookie else "FAIL"
         summary = (
             "=========SEND=========\n"
             f"LOGIN_STATUS: {status}\n"
             f"USERNAME: {username}\n"
             f"SESSION_COOKIE: {cookie or '(not found)'}\n"
-            f"RAW_BROWSER_RESULT:\n{truncate(result_text, 3000)}\n"
+            + (f"AUTH_TOKEN: {token}\n" if token else "")
+            + (f"PLAYWRIGHT_STORAGE_STATE: {storage_path}\n" if storage_path else "")
+            + f"RAW_BROWSER_RESULT:\n{truncate(result_text, 3000)}\n"
             "=========END-SEND========="
         )
         return summary, cookie
@@ -2379,18 +2546,28 @@ class ExecAgent:
         candidates: list[str] = []
 
         def add(path_or_url: str) -> None:
-            full = urljoin(self.target_url, path_or_url)
+            if path_or_url.startswith(("http://", "https://")):
+                full = path_or_url
+            elif path_or_url.startswith("#"):
+                full = self.target_url.rstrip("/") + "/" + path_or_url
+            else:
+                full = urljoin(self.target_url.rstrip("/") + "/", path_or_url)
             if full not in candidates:
                 candidates.append(full)
 
         for match in re.findall(r"https?://[^\s`'\")]+/[^ \n`'\")]*login[^ \n`'\")]*", self.recon_context, re.I):
             add(match)
-        for match in re.findall(r"(?<![\w.-])/(?:login|my-account|account/login|signin)[^\s`'\")]?", self.recon_context, re.I):
+        for match in re.findall(r"(?<![\w.-])/(?:login|my-account|account/login|signin|account)[^\s`'\")]?", self.recon_context, re.I):
             add(match)
-        for path in ("/login", "/my-account", "/account/login", "/signin"):
+        for match in re.findall(r"(#[^ \n`'\")]*?(?:login|signin|account)[^ \n`'\")]*)", self.recon_context, re.I):
+            add(match)
+        for path in (
+            "/login", "/my-account", "/account/login", "/signin", "/account",
+            "/#/login", "/#/signin", "/#/account", "#/login", "#/signin",
+        ):
             add(path)
 
-        return candidates[:8]
+        return candidates[:14]
 
     @staticmethod
     def _extract_login_form(html: str, current_url: str) -> dict | None:
@@ -2542,7 +2719,7 @@ async (page) => {{
   const loginUrls = {json.dumps(login_urls)};
   const username = {json.dumps(username)};
   const password = {json.dumps(password)};
-  const out = {{tried: [], finalUrl: "", title: "", cookies: [], body: ""}};
+	  const out = {{tried: [], finalUrl: "", title: "", cookies: [], storageState: {{}}, body: ""}};
 
   async function firstVisible(selectors) {{
     for (const sel of selectors) {{
@@ -2608,13 +2785,46 @@ async (page) => {{
   }}
   await page.waitForTimeout(1000);
 
-  out.finalUrl = page.url();
-  out.title = await page.title().catch(() => "");
-  out.cookies = await page.context().cookies();
-  out.body = await page.locator("body").innerText({{timeout: 3000}}).catch(() => "");
-  return JSON.stringify(out);
-}}
-"""
+	  out.finalUrl = page.url();
+	  out.title = await page.title().catch(() => "");
+	  out.cookies = await page.context().cookies();
+	  out.storageState = await page.context().storageState().catch(() => ({{}}));
+	  out.body = await page.locator("body").innerText({{timeout: 3000}}).catch(() => "");
+	  return JSON.stringify(out);
+	}}
+	"""
+
+    @staticmethod
+    def _extract_browser_json_payload(result: str) -> dict:
+        """Extract the JSON object returned by browser_run_code_unsafe, even if wrapped."""
+        text = str(result or "")
+        decoder = json.JSONDecoder()
+        for idx, char in enumerate(text):
+            if char not in "{[":
+                continue
+            try:
+                value, _end = decoder.raw_decode(text[idx:])
+            except Exception:
+                continue
+            if isinstance(value, dict):
+                if isinstance(value.get("content"), str):
+                    nested = ExecAgent._extract_browser_json_payload(value["content"])
+                    if nested:
+                        return nested
+                if any(key in value for key in ("cookies", "storageState", "finalUrl", "body")):
+                    return value
+            if isinstance(value, list):
+                return {"cookies": value}
+
+        escaped_match = re.search(r'"(?:output|content|result)"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', text, re.DOTALL)
+        if escaped_match:
+            try:
+                decoded = escaped_match.group(1).encode().decode("unicode_escape", errors="ignore")
+            except Exception:
+                decoded = escaped_match.group(1)
+            if decoded != text:
+                return ExecAgent._extract_browser_json_payload(decoded)
+        return {}
 
     @staticmethod
     def _extract_cookie_from_result(result: str) -> str:
@@ -2634,6 +2844,17 @@ async (page) => {{
             cookie = m.group(1).strip()
             if not _looks_like_empty_cookie(cookie):
                 return cookie
+
+        payload = ExecAgent._extract_browser_json_payload(result)
+        if payload:
+            storage_state = payload.get("storageState") or payload.get("storage_state") or {}
+            cookies = payload.get("cookies") or (storage_state.get("cookies") if isinstance(storage_state, dict) else []) or []
+            cookie_header = cookie_header_from_cookie_objects(cookies)
+            if cookie_header and not _looks_like_empty_cookie(cookie_header):
+                return cookie_header
+            token = bearer_token_from_session({"storage_state": storage_state}) if isinstance(storage_state, dict) else ""
+            if token:
+                return f"token={token}"
 
         # 2. JSON cookies array from browser_run_code_unsafe (CDP via Playwright)
         # Use proper JSON parsing instead of fragile regex
@@ -2717,7 +2938,7 @@ async (page) => {{
         # Primary: use browser_run_code_unsafe to call CDP for all cookies
         try:
             result = self.mcp.execute_tool("browser_run_code_unsafe", {
-                "code": "(async () => { return await page.context().cookies(); })()"
+                "code": "async (page) => { return JSON.stringify(await page.context().cookies()); }"
             })
             result_text = str(result)
             print(f"{DIM}[EXEC-AGENT] CDP cookies raw: {result_text[:300]}{RESET}")

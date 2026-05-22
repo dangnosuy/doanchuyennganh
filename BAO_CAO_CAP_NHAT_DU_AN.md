@@ -1,6 +1,6 @@
 # Báo cáo cập nhật dự án MARL Pentest Agent
 
-Ngày cập nhật: 09/05/2026
+Ngày cập nhật: 23/05/2026
 
 ## 1. Tóm tắt hiện trạng
 
@@ -500,8 +500,222 @@ Có thể trình bày dự án theo 5 ý chính:
 4. Chứng minh kết quả: PoC Python script, request/response artifact, `result.json`, `report_final_vi.md`.
 5. Đánh giá: hệ thống chạy được ở mức prototype, có khả năng tìm/khai thác/ghi báo cáo, nhưng phụ thuộc model và cần benchmark thêm.
 
-## 18. Kết luận
+## 18. Cập nhật ngày 23/05/2026 — Sửa chữa cơ chế Proof Quality Gate và tối ưu pipeline
 
-Tại thời điểm hiện tại, dự án đã có hình dạng rõ ràng của một hệ thống multi-agent pentest cho BAC/BLF. Phần quan trọng nhất của đồ án là Red/Blue debate vẫn được giữ lại: Red viết chiến lược, Blue phản biện trước khi Exec thực thi. Sau khi Exec chạy, hệ thống đi theo hướng đơn giản và dễ demo hơn: Exec tự verify trong Python exploit, còn Manager đọc verdict/evidence để quyết định exploited, retry hoặc stop.
+### 18.1. Bối cảnh
 
-Với trạng thái hiện tại, dự án đủ cơ sở để báo cáo như một prototype có kiến trúc hoàn chỉnh, có pipeline chạy thật, có artifact chứng minh và có hướng phát triển rõ ràng cho giai đoạn sau.
+Sau các lần sửa trước (mục 8.1–8.8), pipeline đã **hoạt động đúng luồng từ đầu đến cuối**:
+
+- CrawlAgent crawl thành công: 32 pages, 142 requests, tạo `recon.md` enriched (12927 bytes).
+- VulnHunterAgent sinh 10 bug candidates (3 CRITICAL, 7 HIGH).
+- ManageAgent điều phối Red → Blue → Exec đúng per-bug pipeline.
+- ExecAgent tự sinh Python exploit, chạy script, tự verify verdict.
+- Report được sinh ra cuối pipeline.
+
+**Vấn đề phát hiện**: Exec script **tự xác nhận EXPLOITED** cho 4 bugs (BUG-001, BUG-003, BUG-008, BUG-010), nhưng Manager **chặn 3/4** qua các cơ chế proof quality gate quá nghiêm ngặt, dẫn đến `REPORT_FAIL` dù thực tế có 4 lỗ hổng đã khai thác thành công.
+
+### 18.2. Trace pipeline đầy đủ — Log phiên `localhost_20260523_000609`
+
+```text
+Phase 1: RECON
+  ├── CrawlAgent → anonymous crawl: 32 pages, 142 requests
+  ├── CrawlAgent → login: POST /login status=302 → 3 cookies set
+  ├── CrawlAgent → authenticated crawl: bổ sung endpoints
+  ├── recon.md enriched: 12927 bytes, 15+ endpoints
+  └── VulnHunterAgent → 10 bug candidates
+
+Phase 2: PER-BUG PIPELINE (ManageAgent điều phối)
+  ├── BUG-001 [BAC-02/CRITICAL] Cookie role tamper → /admin
+  │     Red → strategy ✓ → Blue → APPROVED → Exec → EXPLOITED ✓
+  │     ⚠ Manager → PROOF_QUALITY_FAIL (yêu cầu IDOR ownership bypass)
+  │     ✗ BỊ CHẶN SAI → vì BAC-02 là privilege escalation, KHÔNG phải IDOR
+  │
+  ├── BUG-002 [BAC-01/CRITICAL] Mass-assignment role parameter
+  │     Red → strategy ✓ → Blue → APPROVED → Exec → FAILED
+  │     ✓ Đúng: server validate/whitelist fields → NOT_VULNERABLE
+  │
+  ├── BUG-003 [BAC-03/HIGH] IDOR on /profile
+  │     Red → strategy ✓ → Blue → APPROVED → Exec → EXPLOITED ✓
+  │     ✓ Đúng: ownership bypass chứng minh → EXPLOITED
+  │
+  ├── BUG-004 [BLF-01/HIGH] Negative quantity in cart
+  │     Red → strategy ✓ → Blue → APPROVED → Exec → FAILED
+  │     ✓ Đúng: server validate qty → NOT_VULNERABLE
+  │
+  ├── BUG-005 [BLF-03/HIGH] Price tampering checkout
+  │     Red → strategy ✓ → Blue → APPROVED → Exec → FAILED
+  │     ✓ Đúng: server recalculate price → NOT_VULNERABLE
+  │
+  ├── BUG-006 [BLF-05/HIGH] Race condition on /transfer
+  │     Red → strategy ✓ → Blue → APPROVED → Exec → SCRIPT_ERROR (2 lần)
+  │     ⚠ Script phức tạp → syntax error lặp lại → STOP (chỉ 1 retry)
+  │
+  ├── BUG-007 [BLF-07/HIGH] Multi-step checkout bypass
+  │     Red → strategy ✓ → Blue → APPROVED → Exec → FAILED
+  │     ✓ Đúng: POST /order status=404 → endpoint không tồn tại
+  │
+  ├── BUG-008 [BAC-04/HIGH] HTTP method bypass on /admin/users
+  │     Red → strategy ✓ → Blue → APPROVED → Exec → EXPLOITED ✓
+  │     ⚠ Manager → WRONG_TARGET override EXPLOITED
+  │     ✗ BỊ CHẶN SAI → WRONG_TARGET priority cao hơn EXPLOITED
+  │
+  ├── BUG-009 [BAC-03/HIGH] IDOR on /order
+  │     ⚠ Hết tick budget trước khi xử lý
+  │
+  └── BUG-010 [BAC-01/CRITICAL] Unprotected /admin/products
+        Red → strategy ✓ → Blue → APPROVED → Exec → EXPLOITED ✓
+        ✓ Đúng: admin marker tìm thấy → EXPLOITED
+
+  TỔNG: 4 EXPLOITED thật, 3 bị chặn sai, 3 đúng FAILED/NOT_VULNERABLE
+  KẾT QUẢ CUỐI: REPORT_FAIL (hết 60 ticks, 2 bugs đã bị chặn sai chưa được tính)
+```
+
+### 18.3. Phân tích nguyên nhân gốc — 3 loại lỗi proof gate
+
+#### Lỗi 1 (CRITICAL): BAC-02 bị gộp chung với IDOR check
+
+**Vấn đề**: `_proof_quality_block()` kiểm tra BAC-02 và BAC-03 chung nhau, yêu cầu "ownership bypass" cho cả hai. Nhưng BAC-02 là **privilege escalation (vertical)** — user thường leo lên quyền admin. BAC-03 mới là **IDOR (horizontal)** — user A truy cập data user B.
+
+**Hậu quả**: BUG-001 (cookie `role=user` → `role=admin` → truy cập `/admin`) bị reject vì "không có ownership bypass" — vô lý cho privilege escalation.
+
+**Sửa**: Tách BAC-02 ra gate riêng, chỉ cần chứng minh cookie/role tamper dẫn tới admin access. Thêm method `_has_privilege_escalation_proof()`.
+
+#### Lỗi 2 (CRITICAL): WRONG_TARGET override EXPLOITED
+
+**Vấn đề**: Trong `_exec_decision()`, check `WRONG_TARGET` (priority 2) chạy **trước** check `EXPLOITED` (priority 3). Khi exec output chứa cả status 200 và 404, heuristic kết luận `WRONG_TARGET` → override verdict `EXPLOITED` từ script.
+
+**Hậu quả**: BUG-008 rõ ràng exploit thành công ("victim deleted, admin-only action succeeded"), nhưng bị gán nhãn `WRONG_TARGET`.
+
+**Sửa**: Đảo priority: `EXPLOITED` check chạy TRƯỚC `WRONG_TARGET`. Script nói EXPLOITED → tin tưởng, không bị heuristic override.
+
+#### Lỗi 3 (HIGH): Tick budget cố định và retry quá hạn chế
+
+**Vấn đề**: `MAX_TICKS = 60` cố định, không đủ cho 10 bugs. SCRIPT_ERROR chỉ được retry 1 lần. PROOF_QUALITY_FAIL dừng bug ngay lập tức.
+
+**Sửa**: Dynamic tick budget `max(60, len(bugs) * 8)`. SCRIPT_ERROR cho 2 retry. PROOF_QUALITY_FAIL cho retry Red 1 lần.
+
+### 18.4. Các thay đổi đã thực hiện
+
+#### File: `agents/manage_agent.py`
+
+| # | Thay đổi | Mô tả |
+|---|----------|-------|
+| A | Đảo priority EXPLOITED > WRONG_TARGET | Script nói EXPLOITED (priority 2) thắng heuristic WRONG_TARGET (priority 3). Trước đây ngược lại |
+| B | Tách BAC-02 khỏi IDOR check | BAC-02 là privilege escalation, chỉ cần admin marker HOẶC cookie/role tamper evidence. Thêm method `_has_privilege_escalation_proof()` |
+| C | Thêm gate cho BAC-04/05/06 | Method/role bypass bugs giờ có gate phù hợp: admin marker OR state change OR privilege escalation |
+| D | Mở rộng admin control markers | Thêm 15+ markers: "admin area", "admin page", "/admin/products", "victim deleted", "admin-only action", v.v. |
+| E | PROOF_QUALITY_FAIL cho retry | Không STOP ngay — cho RETRY_RED 1 lần với hướng dẫn cụ thể về cần lấy bằng chứng gì |
+| F | SCRIPT_ERROR cho 2 lần retry | Syntax error là lỗi kỹ thuật, không phải exploit fail. Cho 2 retry thay vì 1 |
+| G | Dynamic MAX_TICKS | `self._max_ticks = max(60, len(bugs) * 8)`. 10 bugs = 80 ticks |
+| H | Cập nhật Manager prompt rules | Thêm BAC-02/BAC-04+ rules, ghi rõ EXPLOITED > WRONG_TARGET |
+
+#### File: `agents/vuln_hunter_agent.py`
+
+| # | Thay đổi | Mô tả |
+|---|----------|-------|
+| I | Prompt yêu cầu gen ≥8 bugs | Thêm: "LUON CO GANG GEN IT NHAT 8-10 bug candidates", "MOI ROUTE FAMILY nen co IT NHAT 1 bug candidate" |
+| J | Thêm detection areas | Cookie tampering, multi-step workflows, HTTP method variations |
+| K | User prompt reinforcement | Thêm instruction: "Gen it nhat 8 bug candidates. Moi route family nen co 1 candidate" |
+
+### 18.5. Cập nhật sơ đồ state machine
+
+Thay đổi so với mục 13:
+
+```mermaid
+stateDiagram-v2
+    [*] --> DEBATE_RED
+    DEBATE_RED --> DEBATE_BLUE: Red strategy hợp lệ
+    DEBATE_RED --> STOP_BUG: Red không có strategy / hết budget
+
+    DEBATE_BLUE --> EXECUTE_BUG: Blue APPROVED
+    DEBATE_BLUE --> RETRY_RED: Blue REJECTED
+    DEBATE_BLUE --> STOP_BUG: Blue STOPPED
+
+    RETRY_RED --> DEBATE_BLUE: Red sửa strategy
+    RETRY_RED --> STOP_BUG: hết red attempts (2 lần)
+
+    EXECUTE_BUG --> NEXT_BUG: EXPLOITED (script verdict thắng heuristic)
+    EXECUTE_BUG --> RETRY_EXEC: SCRIPT_ERROR còn retry (tối đa 2 lần)
+    EXECUTE_BUG --> RETRY_RED: PROOF_QUALITY_FAIL (retry 1 lần với hướng dẫn)
+    EXECUTE_BUG --> STOP_BUG: FAILED/NO_SIGNAL hoặc hết retry
+
+    RETRY_EXEC --> NEXT_BUG: EXPLOITED
+    RETRY_EXEC --> RETRY_EXEC: SCRIPT_ERROR lần 2
+    RETRY_EXEC --> STOP_BUG: vẫn SCRIPT_ERROR/PARTIAL/FAILED
+
+    STOP_BUG --> NEXT_BUG
+    NEXT_BUG --> DEBATE_RED: còn bug
+    NEXT_BUG --> REPORT: hết bug
+    REPORT --> [*]
+```
+
+Thay đổi chính so với phiên bản trước:
+- `EXECUTE_BUG → RETRY_RED` khi `PROOF_QUALITY_FAIL` (trước đây → STOP ngay).
+- `RETRY_EXEC` cho phép 2 lần (trước đây 1 lần).
+- `EXPLOITED` verdict từ script **không bị override** bởi `WRONG_TARGET` heuristic.
+
+### 18.6. Cập nhật bảng trạng thái ổn định
+
+| Hạng mục | Trạng thái | Nhận xét |
+|---|---|---|
+| Syntax Python | ✅ Ổn | Đã compile tất cả module thành công |
+| Kiến trúc agent | ✅ Ổn | Manager là router duy nhất, Blue review strategy, proof gates phân biệt BAC pattern |
+| Luồng dữ liệu | ✅ Ổn | recon → risk-bug → Red → Blue → Exec self-verify → proof gate → report đầy đủ |
+| Proof quality gates | ✅ Đã sửa | BAC-02 ≠ IDOR, EXPLOITED thắng WRONG_TARGET, PROOF_QUALITY_FAIL cho retry |
+| VulnHunter coverage | ✅ Cải thiện | Prompt yêu cầu ≥8 candidates, coverage mỗi route family |
+| Tick budget | ✅ Dynamic | `max(60, bugs × 8)` thay vì cố định 60 |
+| Artifact PoC | ✅ Ổn | Script, output, request/response được lưu theo bug |
+| Report | ✅ Ổn | Có raw report, final Vietnamese report, exploited/not-exploited phân loại |
+| E2E runtime | ⚠ Phụ thuộc MT | Cần LLM proxy/token hợp lệ và target đang chạy |
+
+### 18.7. Cập nhật post-exec decision flow
+
+Phần post-exec decision đã thay đổi so với mục 6:
+
+```text
+ManageAgent         ExecAgent
+     |                  |
+     |-- chạy exploit →|
+     |                  |
+     |←-- FINAL verdict + result.json + artifacts
+     |
+     |  Đọc kết quả (priority mới):
+     |    1. SCRIPT_ERROR → retry tối đa 2 lần
+     |    2. EXPLOITED (script verdict) → chấp nhận, KHÔNG bị WRONG_TARGET override
+     |    3. WRONG_TARGET (chỉ khi script KHÔNG nói EXPLOITED) → retry Red hoặc stop
+     |    4. FAILED (script nói FAILED) → tin tưởng
+     |    5. Heuristic fallback → diagnose:
+     |         PROOF_QUALITY_FAIL → retry Red 1 lần (lấy bằng chứng mạnh hơn)
+     |         STRATEGY_GAP → retry Red
+     |         NOT_VULNERABLE → stop bug
+```
+
+### 18.8. Tác động dự kiến
+
+Với cùng target TechShop `localhost:5001`, sau khi sửa:
+
+| Bug | Trước sửa | Sau sửa | Lý do |
+|-----|-----------|---------|-------|
+| BUG-001 (cookie tamper → /admin) | ✗ PROOF_QUALITY_FAIL | ✓ EXPLOITED | BAC-02 giờ không yêu cầu IDOR ownership bypass |
+| BUG-003 (IDOR /profile) | ✓ EXPLOITED | ✓ EXPLOITED | Không thay đổi |
+| BUG-008 (admin/users bypass) | ✗ WRONG_TARGET | ✓ EXPLOITED | EXPLOITED priority cao hơn WRONG_TARGET |
+| BUG-010 (admin products) | ✓ EXPLOITED | ✓ EXPLOITED | Không thay đổi |
+| Pipeline kết quả | REPORT_FAIL | REPORT_SUCCESS | ≥4 findings validated |
+
+### 18.9. Bài học kinh nghiệm
+
+1. **Proof quality gates cần phân biệt theo loại BAC**: vertical (privilege escalation) ≠ horizontal (IDOR) ≠ method bypass. Áp dụng chung 1 gate cho tất cả dẫn đến false negative.
+
+2. **Script tự verify phải được tin tưởng**: khi Exec script đã tự chạy baseline → probe → verify và in `FINAL: EXPLOITED`, Manager không nên dùng heuristic (parse regex) để override. Heuristic chỉ là backup khi script ambiguous.
+
+3. **Syntax error ≠ exploit failure**: script Python bị lỗi cú pháp là vấn đề kỹ thuật, cần retry nhiều hơn trước khi kết luận bug không khai thác được.
+
+4. **VulnHunter cần instruction rõ ràng về số lượng**: LLM có xu hướng gen đúng 5 bugs (con số tròn) nếu prompt không nói rõ "tối thiểu 8-10". Cần explicit instruction.
+
+## 19. Kết luận
+
+Tại thời điểm cập nhật 23/05/2026, dự án đã có hình dạng rõ ràng của một hệ thống multi-agent pentest cho BAC/BLF. Phần quan trọng nhất của đồ án là Red/Blue debate vẫn được giữ lại: Red viết chiến lược, Blue phản biện trước khi Exec thực thi. Sau khi Exec chạy, hệ thống đi theo hướng đơn giản và dễ demo hơn: Exec tự verify trong Python exploit, còn Manager đọc verdict/evidence để quyết định exploited, retry hoặc stop.
+
+Các cải tiến mới nhất tập trung vào **chất lượng quyết định của Manager**: phân biệt đúng loại BAC, tôn trọng verdict từ script tự verify, cho phép retry khi bằng chứng chưa đủ mạnh thay vì dừng ngay, và dynamic tick budget theo số lượng bugs. Những thay đổi này không thay đổi kiến trúc tổng thể mà chỉ tinh chỉnh logic quyết định bên trong `ManageAgent` — đúng vai trò "ông sếp thông thái" điều phối pipeline.
+
+Với trạng thái hiện tại, dự án đủ cơ sở để báo cáo như một prototype có kiến trúc hoàn chỉnh, có pipeline chạy thật, có artifact chứng minh, có cơ chế proof quality gate phân biệt theo loại lỗ hổng, và có hướng phát triển rõ ràng cho giai đoạn sau.

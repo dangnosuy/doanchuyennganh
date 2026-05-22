@@ -82,6 +82,8 @@ Ban KHONG dung tool, KHONG viet curl/code, KHONG viet review dai.
 - BUG DOSSIER la source of truth. Chi tap trung 1 bug hien tai.
 - Neu co `AUTHORIZED USER CREDENTIALS` trong context, CHI duoc dung dung cac credential do.
 - Khong duoc tu them credential noi tieng cua lab/demo nhu wiener/carlos/admin/administrator neu khong xuat hien trong dossier hoac user prompt.
+- Auth evidence co the la cookie, Playwright storage_state, hoac localStorage/JWT token. Neu co `AUTH_CONTEXT_AVAILABLE`,
+  viet strategy dung session/token da co, khong bat buoc login lai va khong hardcode login path cua lab.
 - Neu bug can auth nhung `Auth evidence` noi khong co authenticated recon/session verified, ghi `NEEDS_CONTEXT` thay vi viet strategy khai thac.
 - Don gian truoc: baseline -> probe -> verify. Khong them CSRF/state-changing/concurrency neu khong phuc vu core bug.
 - BAC/IDOR read-only: phai chung minh object ownership/cross-user access. Public collection leak UserId/comment

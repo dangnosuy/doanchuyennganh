@@ -31,6 +31,17 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from mcp_client import MCPManager
+from shared.auth_context import (
+    auth_context_path,
+    bearer_token_from_session,
+    cookie_header_from_cookie_objects,
+    load_auth_context,
+    normalize_cookie_objects,
+    save_auth_context,
+    storage_state_path,
+    storage_state_has_material,
+    upsert_auth_session,
+)
 from shared.utils import (
     truncate, parse_prompt_llm,
 )
@@ -248,6 +259,7 @@ class CrawlAgent:
         self.tools = self.mcp.get_openai_tools()
         print(f"{YELLOW}[CRAWL-AGENT] Da san sang — {len(self.tools)} tools{RESET}")
         self.mcp.display_tools()
+        self._auth_fingerprint: list[dict] = []  # Auth endpoint probing results
         print()
 
     # ─── Public API ──────────────────────────────────────────────
@@ -319,22 +331,42 @@ class CrawlAgent:
         for idx, cred in enumerate(credentials_list):
             label = cred["label"]
             print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 2: Login [{label}]...{RESET}")
-            login_cookies = self._login(url, cred)
+            login_context = self._login_context(url, cred)
+            login_cookies = login_context.get("cookies", []) if login_context else []
 
-            if login_cookies:
-                print(f"{GREEN}[CRAWL-AGENT] Login [{label}] OK — {len(login_cookies)} cookies{RESET}")
+            if login_context:
+                storage_state = login_context.get("storage_state_path") or ""
+                auth_material_bits = []
+                if login_cookies:
+                    auth_material_bits.append(f"{len(login_cookies)} cookies")
+                if storage_state:
+                    auth_material_bits.append("Playwright storage_state")
+                if login_context.get("bearer_token"):
+                    auth_material_bits.append("bearer/localStorage token")
+                material_note = ", ".join(auth_material_bits) if auth_material_bits else "auth context"
+                print(f"{GREEN}[CRAWL-AGENT] Login [{label}] OK — {material_note}{RESET}")
                 print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 3: Authenticated crawl [{label}]...{RESET}")
-                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in login_cookies)
+                cookie_str = cookie_header_from_cookie_objects(login_cookies)
                 _debug(f"[{label}] Injecting {len(login_cookies)} cookies: {cookie_str[:100]}...")
-                data = self._run_crawler(url, cookie_header=cookie_str, max_pages=25, max_rounds=1, timeout=180)
+                data = self._run_crawler(
+                    url,
+                    cookie_header=cookie_str or None,
+                    storage_state_path=storage_state or None,
+                    max_pages=25,
+                    max_rounds=1,
+                    timeout=180,
+                )
                 if data:
-                    auth_verified = self._auth_crawl_verified(anon_data, data)
-                    auth_sessions.append({
+                    auth_verified = self._auth_crawl_verified(anon_data, data) or bool(login_context.get("auth_verified"))
+                    session_record = {
+                        **login_context,
                         "label": label,
                         "cookies": login_cookies,
                         "data": data,
                         "auth_verified": auth_verified,
-                    })
+                    }
+                    auth_sessions.append(session_record)
+                    self._persist_auth_context(url, session_record)
                     _debug(f"[{label}] Auth crawl done: {len(data.get('http_traffic', []))} requests")
 
                     # ── Verify authenticated crawl actually differs from anonymous ──
@@ -528,6 +560,7 @@ class CrawlAgent:
         self,
         url: str,
         cookie_header: str | None = None,
+        storage_state_path: str | None = None,
         max_pages: int = 50,
         max_rounds: int = 2,
         timeout: int = 300,
@@ -543,10 +576,14 @@ class CrawlAgent:
         ]
         if cookie_header:
             cmd.extend(["-H", f"Cookie: {cookie_header}"])
+        if storage_state_path:
+            cmd.extend(["--storage-state", storage_state_path])
 
         _debug(f"Full crawler command: {' '.join(cmd)}")
         if cookie_header:
             _debug(f"Cookie header: {cookie_header[:80]}...")
+        if storage_state_path:
+            _debug(f"Storage state path: {storage_state_path}")
         print(f"{DIM}[CRAWL-AGENT] Running: {' '.join(cmd[:6])}...{RESET}")
 
         try:
@@ -775,11 +812,169 @@ class CrawlAgent:
         print(f"{GREEN}[CRAWL-AGENT] API fallback: {len(useful_traffic)} live endpoints found "
               f"(out of {len(traffic)} probed){RESET}")
 
+        # ── Auth endpoint probing: fingerprint login/register mechanisms ──
+        auth_fingerprint = self._probe_auth_endpoints(url, useful_traffic)
+        if auth_fingerprint:
+            self._auth_fingerprint = auth_fingerprint
+            print(f"{GREEN}[CRAWL-AGENT] Auth fingerprint: {len(auth_fingerprint)} auth endpoint(s) probed{RESET}")
+
         return {
             "http_traffic": useful_traffic,
             "cookies": cookies,
             "external_links": [],
         }
+
+    def _probe_auth_endpoints(self, base_url: str, traffic: list[dict]) -> list[dict]:
+        """Actively probe auth-related endpoints to fingerprint login/register mechanisms.
+
+        For each login/register/auth endpoint found, send test POST requests with
+        dummy JSON/form payloads and record raw request/response to understand:
+        - Correct endpoint path and method
+        - Required Content-Type (JSON vs form)
+        - Expected body fields (email vs username)
+        - Response structure (JWT token location, Set-Cookie, error format)
+
+        Returns list of auth fingerprint dicts.
+        """
+        # Identify auth-related endpoints from traffic
+        auth_keywords = re.compile(
+            r"(?:login|signin|sign-in|auth|session|register|signup|sign-up|token|user/login)",
+            re.IGNORECASE,
+        )
+        auth_urls: list[str] = []
+        for entry in traffic:
+            ep_url = entry.get("url", "")
+            if auth_keywords.search(ep_url):
+                if ep_url not in auth_urls:
+                    auth_urls.append(ep_url)
+
+        # Also probe common REST login paths that may not have been in GET traffic
+        common_auth_paths = [
+            "/rest/user/login", "/api/Users/login", "/api/login",
+            "/api/auth/login", "/api/auth/signin", "/auth/login",
+            "/rest/user/register", "/api/Users",
+        ]
+        for path in common_auth_paths:
+            full = urljoin(base_url, path)
+            if full not in auth_urls:
+                auth_urls.append(full)
+
+        if not auth_urls:
+            return []
+
+        fingerprints: list[dict] = []
+        dummy_email = "probe-test@example.com"
+        dummy_password = "ProbeTest123!"
+
+        # Body variants to try for each endpoint
+        body_variants = [
+            ("json_email", "application/json", {"email": dummy_email, "password": dummy_password}),
+            ("json_username", "application/json", {"username": dummy_email, "password": dummy_password}),
+            ("form_email", "application/x-www-form-urlencoded", {"email": dummy_email, "password": dummy_password}),
+        ]
+
+        try:
+            with httpx.Client(timeout=8, follow_redirects=True, verify=False) as client:
+                for probe_url in auth_urls[:12]:  # Limit to 12 endpoints
+                    fp: dict = {
+                        "url": probe_url,
+                        "path": urlparse(probe_url).path,
+                        "is_login": bool(re.search(r"login|signin|auth|session|token", probe_url, re.I)),
+                        "is_register": bool(re.search(r"register|signup|sign-up", probe_url, re.I)),
+                        "probes": [],
+                    }
+
+                    for variant_name, content_type, body in body_variants:
+                        try:
+                            if "json" in content_type:
+                                resp = client.post(
+                                    probe_url,
+                                    json=body,
+                                    headers={"Content-Type": content_type, "Accept": "application/json"},
+                                )
+                            else:
+                                resp = client.post(
+                                    probe_url,
+                                    data=body,
+                                    headers={"Accept": "application/json"},
+                                )
+
+                            resp_body = resp.text[:2000] if resp.text else ""
+
+                            # Analyze response for auth clues
+                            has_token = False
+                            token_location = ""
+                            try:
+                                resp_json = resp.json() if resp_body.strip().startswith("{") else {}
+                                if isinstance(resp_json, dict):
+                                    # Check common token locations
+                                    if resp_json.get("authentication", {}).get("token"):
+                                        has_token = True
+                                        token_location = "body.authentication.token"
+                                    elif resp_json.get("token"):
+                                        has_token = True
+                                        token_location = "body.token"
+                                    elif resp_json.get("access_token"):
+                                        has_token = True
+                                        token_location = "body.access_token"
+                            except Exception:
+                                resp_json = {}
+
+                            has_set_cookie = bool(resp.headers.get("set-cookie"))
+
+                            probe_result = {
+                                "variant": variant_name,
+                                "content_type": content_type,
+                                "body_fields": list(body.keys()),
+                                "status": resp.status_code,
+                                "response_content_type": resp.headers.get("content-type", ""),
+                                "response_body_preview": resp_body[:500],
+                                "has_token_in_body": has_token,
+                                "token_location": token_location,
+                                "has_set_cookie": has_set_cookie,
+                                "set_cookie_header": resp.headers.get("set-cookie", "")[:200],
+                                "raw_request": f"POST {probe_url}\nContent-Type: {content_type}\nBody: {json.dumps(body)}",
+                                "raw_response": f"HTTP {resp.status_code}\nContent-Type: {resp.headers.get('content-type', '')}\n\n{resp_body[:500]}",
+                            }
+                            fp["probes"].append(probe_result)
+
+                            # If we got a meaningful response (not 404/405), mark endpoint as accepting POST
+                            if resp.status_code not in (404, 405, 501):
+                                fp["accepts_post"] = True
+                                fp[f"status_{variant_name}"] = resp.status_code
+
+                        except Exception as e:
+                            _debug(f"Auth probe {variant_name} on {probe_url} failed: {e}")
+                            continue
+
+                    # Determine best auth approach for this endpoint
+                    if fp.get("probes"):
+                        # Find the probe that got the most useful response
+                        best = None
+                        for p in fp["probes"]:
+                            if p["has_token_in_body"]:
+                                best = p
+                                break
+                            if p["has_set_cookie"] and p["status"] in (200, 201, 401):
+                                best = p
+                            elif not best and p["status"] not in (404, 405, 501):
+                                best = p
+                        if best:
+                            fp["recommended_content_type"] = best["content_type"]
+                            fp["recommended_body_fields"] = best["body_fields"]
+                            fp["token_location"] = best.get("token_location", "")
+                            fp["auth_mechanism"] = (
+                                "jwt_bearer" if best["has_token_in_body"]
+                                else "cookie_session" if best["has_set_cookie"]
+                                else "unknown"
+                            )
+
+                    fingerprints.append(fp)
+
+        except Exception as e:
+            print(f"{YELLOW}[CRAWL-AGENT] Auth probing error: {e}{RESET}")
+
+        return fingerprints
 
     @staticmethod
     def _auth_crawl_verified(anon_data: dict | None, auth_data: dict | None) -> bool:
@@ -847,6 +1042,458 @@ class CrawlAgent:
                         return True
 
         return False
+
+    # ─── Internal: Login context orchestration ───────────────────────
+
+    def _login_context(self, target_url: str, credentials: dict) -> dict | None:
+        """Create a reusable auth context using REST API first, then HTTP form, then Playwright."""
+        label = credentials.get("label") or credentials.get("username") or "authenticated"
+        username = credentials.get("username", "")
+        password = credentials.get("password", "")
+
+        # ── Step 0: Try REST API (JWT) login first using auth fingerprint ──
+        api_session = self._login_rest_api(target_url, credentials)
+        if api_session:
+            api_session["label"] = label
+            self._persist_auth_context(target_url, api_session)
+            return api_session
+
+        # ── Step 1: HTML form login ──
+        http_cookies = self._login(target_url, credentials)
+        if http_cookies:
+            session = {
+                "label": label,
+                "username": credentials.get("username", ""),
+                "created_by": "crawl_httpx",
+                "auth_verified": False,
+                "cookies": normalize_cookie_objects(http_cookies, target_url),
+                "cookie_header": cookie_header_from_cookie_objects(http_cookies),
+                "storage_state_path": "",
+                "storage_state": {},
+                "bearer_token": "",
+                "verified_url": "",
+                "notes": "HTTP form login returned auth material; auth crawl will verify response difference.",
+            }
+            self._persist_auth_context(target_url, session)
+            return session
+
+        print(f"{YELLOW}[LOGIN] HTTP login did not produce reusable cookies — trying Playwright login{RESET}")
+        browser_session = self._login_playwright(target_url, credentials)
+        if browser_session:
+            self._persist_auth_context(target_url, browser_session)
+            return browser_session
+        return None
+
+    def _login_rest_api(self, target_url: str, credentials: dict) -> dict | None:
+        """Try REST API login endpoints (JSON POST) to get JWT/cookie session.
+
+        Uses auth fingerprint from _probe_auth_endpoints if available,
+        otherwise tries common REST login patterns.
+        """
+        username = credentials.get("username", "")
+        password = credentials.get("password", "")
+        label = credentials.get("label") or username or "authenticated"
+        if not username or not password:
+            return None
+
+        domain = urlparse(target_url).netloc
+
+        # Build candidate list: fingerprinted endpoints first, then common paths
+        candidates: list[tuple[str, str, dict]] = []
+
+        # Prioritize fingerprinted login endpoints
+        for fp in getattr(self, "_auth_fingerprint", []):
+            if not fp.get("is_login"):
+                continue
+            ep_url = fp["url"]
+            ct = fp.get("recommended_content_type", "application/json")
+            fields = fp.get("recommended_body_fields", ["email", "password"])
+            body: dict = {"password": password}
+            if "email" in fields:
+                body["email"] = username
+            else:
+                body["username"] = username
+            candidates.append((ep_url, ct, body))
+
+        # Fallback: common REST login paths
+        common_logins = [
+            ("/rest/user/login", {"email": username, "password": password}),
+            ("/api/Users/login", {"email": username, "password": password}),
+            ("/api/login", {"email": username, "password": password}),
+            ("/api/login", {"username": username, "password": password}),
+            ("/api/auth/login", {"email": username, "password": password}),
+            ("/api/auth/login", {"username": username, "password": password}),
+            ("/auth/login", {"email": username, "password": password}),
+        ]
+        for path, body in common_logins:
+            full_url = urljoin(target_url, path)
+            # Don't duplicate fingerprinted entries
+            if not any(c[0] == full_url and c[2] == body for c in candidates):
+                candidates.append((full_url, "application/json", body))
+
+        if not candidates:
+            return None
+
+        print(f"{DIM}[LOGIN] Trying {len(candidates)} REST API login endpoints...{RESET}")
+
+        try:
+            with httpx.Client(timeout=12, follow_redirects=True, verify=False) as client:
+                for login_url, content_type, body in candidates:
+                    try:
+                        _debug(f"[REST LOGIN] POST {login_url} ct={content_type} fields={list(body.keys())}")
+                        if "json" in content_type:
+                            resp = client.post(
+                                login_url,
+                                json=body,
+                                headers={"Content-Type": content_type, "Accept": "application/json"},
+                            )
+                        else:
+                            resp = client.post(login_url, data=body)
+
+                        _debug(f"[REST LOGIN] → status={resp.status_code}")
+
+                        if resp.status_code not in (200, 201):
+                            continue
+
+                        # Try to extract JWT token from response body
+                        token = ""
+                        token_location = ""
+                        try:
+                            data = resp.json()
+                            if isinstance(data, dict):
+                                # Juice Shop style: {"authentication": {"token": "..."}}
+                                auth_obj = data.get("authentication")
+                                if isinstance(auth_obj, dict) and auth_obj.get("token"):
+                                    token = str(auth_obj["token"])
+                                    token_location = "body.authentication.token"
+                                # Generic: {"token": "..."}
+                                elif data.get("token"):
+                                    token = str(data["token"])
+                                    token_location = "body.token"
+                                # OAuth style: {"access_token": "..."}
+                                elif data.get("access_token"):
+                                    token = str(data["access_token"])
+                                    token_location = "body.access_token"
+                        except Exception:
+                            pass
+
+                        # Extract cookies
+                        cookies = []
+                        for cookie in client.cookies.jar:
+                            cookies.append({
+                                "name": cookie.name,
+                                "value": cookie.value,
+                                "domain": domain,
+                                "path": cookie.path or "/",
+                            })
+
+                        has_set_cookie = bool(resp.headers.get("set-cookie"))
+
+                        if token or has_set_cookie or cookies:
+                            auth_mechanism = "jwt_bearer" if token else "cookie_session"
+                            print(f"{GREEN}[LOGIN] REST API login SUCCESS — {login_url} "
+                                  f"(mechanism={auth_mechanism}, token={'yes' if token else 'no'}, "
+                                  f"cookies={len(cookies)}){RESET}")
+
+                            # Save login discovery info for downstream agents
+                            login_discovery = {
+                                "login_endpoint": urlparse(login_url).path,
+                                "login_method": "POST",
+                                "login_content_type": content_type,
+                                "login_body_fields": list(body.keys()),
+                                "auth_mechanism": auth_mechanism,
+                                "token_location": token_location,
+                            }
+                            # Write login discovery to auth_fingerprint
+                            self._auth_fingerprint.insert(0, {
+                                **login_discovery,
+                                "url": login_url,
+                                "path": urlparse(login_url).path,
+                                "is_login": True,
+                                "login_success": True,
+                            })
+
+                            session = {
+                                "label": label,
+                                "username": username,
+                                "created_by": "crawl_rest_api",
+                                "auth_verified": True,
+                                "cookies": normalize_cookie_objects(cookies, target_url),
+                                "cookie_header": cookie_header_from_cookie_objects(cookies),
+                                "storage_state_path": "",
+                                "storage_state": {},
+                                "bearer_token": token,
+                                "verified_url": login_url,
+                                "notes": (
+                                    f"REST API login via {login_url}. "
+                                    f"Mechanism: {auth_mechanism}. "
+                                    f"Token location: {token_location or 'N/A'}. "
+                                    f"Body fields: {list(body.keys())}."
+                                ),
+                                "login_discovery": login_discovery,
+                            }
+                            return session
+
+                    except Exception as e:
+                        _debug(f"[REST LOGIN] POST {login_url} error: {e}")
+                        continue
+
+        except Exception as e:
+            print(f"{YELLOW}[LOGIN] REST API login error: {e}{RESET}")
+
+        _debug("[REST LOGIN] No REST API login succeeded")
+        return None
+
+
+    def _persist_auth_context(self, target_url: str, session: dict) -> None:
+        """Persist reusable session metadata for Manager/Exec without raw response bloat."""
+        if not session:
+            return
+        clean = {
+            "label": session.get("label") or "authenticated",
+            "username": session.get("username", ""),
+            "created_by": session.get("created_by", "crawl"),
+            "auth_verified": bool(session.get("auth_verified", False)),
+            "cookies": normalize_cookie_objects(session.get("cookies") or [], target_url),
+            "cookie_header": cookie_header_from_cookie_objects(session.get("cookies") or []),
+            "storage_state_path": session.get("storage_state_path", ""),
+            "storage_state": session.get("storage_state") or {},
+            "bearer_token": session.get("bearer_token", ""),
+            "verified_url": session.get("verified_url", ""),
+            "notes": session.get("notes", ""),
+        }
+        token = clean["bearer_token"] or bearer_token_from_session(clean)
+        if token:
+            clean["bearer_token"] = token
+        try:
+            path = upsert_auth_session(self.working_dir, target_url, clean)
+            _debug(f"Auth context saved: {path}")
+        except Exception as e:
+            print(f"{YELLOW}[CRAWL-AGENT] Could not save auth_context.json: {e}{RESET}")
+
+    def _login_playwright(self, target_url: str, credentials: dict) -> dict | None:
+        """Generic Playwright login that preserves cookies + localStorage storage_state."""
+        username = credentials.get("username", "")
+        password = credentials.get("password", "")
+        label = credentials.get("label") or username or "authenticated"
+        if not username or not password:
+            return None
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as e:
+            print(f"{YELLOW}[LOGIN] Playwright unavailable: {e}{RESET}")
+            return None
+
+        candidates = self._candidate_login_urls(target_url)
+        state_path = storage_state_path(self.working_dir, label)
+        last_note = ""
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(ignore_https_errors=True)
+                page = context.new_page()
+
+                login_page_found = False
+                for login_url in candidates:
+                    try:
+                        page.goto(login_url, wait_until="domcontentloaded", timeout=20000)
+                        page.wait_for_timeout(800)
+                        self._try_click_login_entry(page)
+                        password_count = page.locator('input[type="password"], input[name*="pass" i]').count()
+                        last_note = f"{login_url}: password_inputs={password_count}"
+                        if password_count > 0:
+                            login_page_found = True
+                            break
+                    except Exception as e:
+                        last_note = f"{login_url}: {type(e).__name__}: {e}"
+                        continue
+
+                if not login_page_found:
+                    print(f"{YELLOW}[LOGIN] Playwright could not find a login form ({last_note}){RESET}")
+                    browser.close()
+                    return None
+
+                user_field = self._first_visible_locator(page, [
+                    'input[type="email"]',
+                    'input[name*="email" i]',
+                    'input[id*="email" i]',
+                    'input[name*="user" i]',
+                    'input[id*="user" i]',
+                    'input[autocomplete="username"]',
+                    'input[type="text"]',
+                ])
+                pass_field = self._first_visible_locator(page, [
+                    'input[type="password"]',
+                    'input[name*="pass" i]',
+                    'input[id*="pass" i]',
+                    'input[autocomplete="current-password"]',
+                ])
+                if not user_field or not pass_field:
+                    print(f"{YELLOW}[LOGIN] Playwright found page but not username/password inputs{RESET}")
+                    browser.close()
+                    return None
+
+                user_field.fill(username, timeout=5000)
+                pass_field.fill(password, timeout=5000)
+
+                submit = self._first_visible_locator(page, [
+                    'button[type="submit"]',
+                    'input[type="submit"]',
+                    'button:has-text("Login")',
+                    'button:has-text("Log in")',
+                    'button:has-text("Sign in")',
+                    'button:has-text("Submit")',
+                    '[role="button"]:has-text("Login")',
+                    '[role="button"]:has-text("Sign in")',
+                    'button',
+                ])
+                if submit:
+                    submit.click(timeout=8000)
+                else:
+                    pass_field.press("Enter", timeout=5000)
+                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_timeout(1000)
+
+                storage_state = context.storage_state(path=str(state_path))
+                cookies = normalize_cookie_objects(storage_state.get("cookies") or context.cookies(), target_url)
+                token = bearer_token_from_session({"storage_state": storage_state})
+                verified, verified_url, verify_note = self._verify_playwright_auth(page, context, target_url, username)
+
+                browser.close()
+
+                if not cookies and not storage_state_has_material(storage_state):
+                    print(f"{YELLOW}[LOGIN] Playwright login produced no cookies/localStorage token{RESET}")
+                    return None
+
+                print(
+                    f"{GREEN}[LOGIN] Playwright login captured auth context — "
+                    f"cookies={len(cookies)}, token={'yes' if token else 'no'}, verified={verified}{RESET}"
+                )
+                return {
+                    "label": label,
+                    "username": username,
+                    "created_by": "crawl_playwright",
+                    "auth_verified": verified,
+                    "cookies": cookies,
+                    "cookie_header": cookie_header_from_cookie_objects(cookies),
+                    "storage_state_path": str(state_path),
+                    "storage_state": storage_state,
+                    "bearer_token": token,
+                    "verified_url": verified_url,
+                    "notes": verify_note,
+                }
+        except Exception as e:
+            print(f"{YELLOW}[LOGIN] Playwright login error: {e}{RESET}")
+            return None
+
+    def _candidate_login_urls(self, target_url: str) -> list[str]:
+        """Build generic login candidates, including hash routes used by SPAs."""
+        candidates: list[str] = []
+
+        def add(path_or_url: str) -> None:
+            if not path_or_url:
+                return
+            if path_or_url.startswith(("http://", "https://")):
+                full = path_or_url
+            elif path_or_url.startswith("#"):
+                full = target_url.rstrip("/") + "/" + path_or_url
+            else:
+                full = urljoin(target_url.rstrip("/") + "/", path_or_url)
+            if full not in candidates:
+                candidates.append(full)
+
+        try:
+            resp = httpx.get(target_url, timeout=10, follow_redirects=True, verify=False)
+            hrefs = re.findall(r'href=["\']([^"\']+)["\']', resp.text, re.IGNORECASE)
+            hrefs += re.findall(r'["\'](#[^"\']*(?:login|signin|account)[^"\']*)["\']', resp.text, re.IGNORECASE)
+            login_keywords = re.compile(r"(?:log.?in|sign.?in|auth|account|session)", re.IGNORECASE)
+            for href in hrefs:
+                if login_keywords.search(href):
+                    add(href)
+        except Exception as e:
+            _debug(f"Playwright login candidate discovery failed: {e}")
+
+        for path in (
+            "/login", "/signin", "/account/login", "/my-account", "/account",
+            "/#/login", "/#/signin", "/#/account", "/#/user/login", "#/login", "#/signin",
+        ):
+            add(path)
+        return candidates[:14]
+
+    @staticmethod
+    def _first_visible_locator(page, selectors: list[str]):
+        for selector in selectors:
+            try:
+                loc = page.locator(selector).first
+                if loc.count() > 0 and loc.is_visible(timeout=1200) and loc.is_enabled(timeout=1200):
+                    return loc
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _try_click_login_entry(page) -> None:
+        """On SPA homepages, click a login/account entry before looking for fields."""
+        selectors = [
+            'a:has-text("Login")', 'button:has-text("Login")',
+            'a:has-text("Log in")', 'button:has-text("Log in")',
+            'a:has-text("Sign in")', 'button:has-text("Sign in")',
+            'a:has-text("Account")', 'button:has-text("Account")',
+            '[aria-label*="login" i]', '[aria-label*="account" i]',
+        ]
+        for selector in selectors:
+            try:
+                loc = page.locator(selector).first
+                if loc.count() > 0 and loc.is_visible(timeout=700) and loc.is_enabled(timeout=700):
+                    loc.click(timeout=2500)
+                    page.wait_for_timeout(700)
+                    return
+            except Exception:
+                continue
+
+    @staticmethod
+    def _verify_playwright_auth(page, context, target_url: str, username: str) -> tuple[bool, str, str]:
+        """Best-effort generic auth verification for pages and SPA API endpoints."""
+        markers = (
+            "logout", "log out", "sign out", "my account", "profile", "dashboard",
+            "orders", "basket", "cart", "account", username.lower(),
+        )
+        error_markers = (
+            "invalid email", "invalid username", "invalid password", "incorrect",
+            "login failed", "authentication failed", "wrong password",
+        )
+
+        try:
+            body = page.locator("body").inner_text(timeout=2500).lower()
+            if any(marker in body for marker in error_markers):
+                return False, page.url, "login error marker visible after submit"
+            if any(marker in body for marker in markers) and page.locator('input[type="password"]').count() == 0:
+                return True, page.url, "authenticated page marker visible"
+        except Exception:
+            pass
+
+        for path in ("/rest/user/whoami", "/api/users/me", "/api/me", "/profile", "/account", "/my-account", "/#/profile", "/#/basket"):
+            verify_url = urljoin(target_url.rstrip("/") + "/", path.lstrip("/"))
+            try:
+                if path.startswith("/#/"):
+                    page.goto(verify_url, wait_until="domcontentloaded", timeout=10000)
+                    page.wait_for_timeout(800)
+                    body = page.locator("body").inner_text(timeout=2500).lower()
+                    if any(marker in body for marker in markers) and "password" not in body[:500]:
+                        return True, verify_url, "SPA authenticated route marker visible"
+                    continue
+                resp = context.request.get(verify_url, timeout=10000)
+                text = (resp.text() or "")[:3000].lower()
+                if resp.status < 400 and (
+                    username.lower() in text
+                    or any(marker in text for marker in ("authenticated", "email", "username", "role", "basket", "orders"))
+                ):
+                    return True, verify_url, f"auth probe status={resp.status}"
+            except Exception:
+                continue
+        return False, page.url, "auth material captured but no generic verify endpoint confirmed"
 
     # ─── Internal: Login via httpx ───────────────────────────────
 
@@ -1118,6 +1765,7 @@ class CrawlAgent:
         recon_path = os.path.join(self.working_dir, "recon.md")
         raw_crawl_path = os.path.join(self.working_dir, "crawl_raw.json")
         crawl_data_path = os.path.join(self.working_dir, "crawl_data.txt")
+        auth_ctx_path = auth_context_path(self.working_dir)
 
         # Build a compact manifest and let the agent read the full crawl files directly.
         parts = []
@@ -1127,6 +1775,7 @@ class CrawlAgent:
         parts.append(f"OUTPUT FILE: {recon_path}")
         parts.append(f"CRAWL DATA FILE: {crawl_data_path}")
         parts.append(f"RAW CRAWL JSON FILE: {raw_crawl_path}")
+        parts.append(f"AUTH CONTEXT FILE: {auth_ctx_path}")
         if focus:
             parts.append(f"FOCUS: {focus}")
         if anon_data:
@@ -1139,7 +1788,9 @@ class CrawlAgent:
             auth_verified = session.get("auth_verified", False)
             req_count = len(session.get("data", {}).get("http_traffic", []))
             parts.append(
-                f"- session={label} requests={req_count} auth_verified={auth_verified}"
+                f"- session={label} requests={req_count} auth_verified={auth_verified} "
+                f"storage_state={bool(session.get('storage_state_path'))} "
+                f"token={bool(session.get('bearer_token') or bearer_token_from_session(session))}"
             )
 
         if not anon_data and not auth_sessions:
@@ -1153,6 +1804,13 @@ class CrawlAgent:
         parts.append("5. Pay special attention to client-controlled cookies/state such as role, user_id, is_admin, account_id.")
         parts.append("6. Do not call shell commands such as cat, wc, jq, grep, sed. Use read_text_file/write_file only.")
         parts.append("7. Read each crawl artifact at most once, then write recon.md and finish with [DONE].")
+        parts.append("8. CRITICAL: If AUTH ENDPOINT FINGERPRINT section exists in crawl_data.txt, include a "
+                     "'## Auth Mechanism Discovery' section in recon.md with: "
+                     "(a) verified login endpoint path, method, Content-Type, body fields; "
+                     "(b) auth mechanism type (JWT bearer vs cookie session); "
+                     "(c) token extraction location (e.g. body.authentication.token); "
+                     "(d) raw request/response examples for login and register endpoints. "
+                     "This is ESSENTIAL for exploit agents to authenticate correctly.")
         parts.append("")
         parts.append("Quick preview from crawl_data.txt:")
         try:
@@ -1235,6 +1893,21 @@ class CrawlAgent:
         if auth_sessions:
             label_list = ", ".join(s["label"] for s in auth_sessions)
             parts.append(f"SESSIONS: anonymous + {len(auth_sessions)} authenticated ({label_list})")
+            parts.append(f"AUTH CONTEXT FILE: {auth_context_path(self.working_dir)}")
+            for session in auth_sessions:
+                material = []
+                if session.get("cookies"):
+                    material.append(f"cookies={len(session.get('cookies') or [])}")
+                if session.get("storage_state_path"):
+                    material.append("playwright_storage_state=yes")
+                if session.get("bearer_token") or bearer_token_from_session(session):
+                    material.append("bearer_or_localStorage_token=yes")
+                parts.append(
+                    f"- AUTH SESSION {session.get('label', '?')}: "
+                    f"verified={bool(session.get('auth_verified'))}; "
+                    f"source={session.get('created_by', '?')}; "
+                    f"{', '.join(material) if material else 'auth_material=unknown'}"
+                )
         else:
             parts.append("SESSIONS: anonymous")
         parts.append("")
@@ -1261,6 +1934,51 @@ class CrawlAgent:
         if not anon_data and not auth_sessions:
             parts.append("WARNING: No crawl data available.")
 
+        # ── Auth Fingerprint Evidence (raw request/response for auth endpoints) ──
+        auth_fp = getattr(self, "_auth_fingerprint", [])
+        if auth_fp:
+            parts.append("")
+            parts.append("=" * 60)
+            parts.append("AUTH ENDPOINT FINGERPRINT (Critical for BAC/BLF exploitation)")
+            parts.append("=" * 60)
+            parts.append("")
+            parts.append("These are raw request/response captures from actively probing")
+            parts.append("login, register, and auth-related endpoints. Use this data to")
+            parts.append("understand the EXACT auth mechanism, body format, and token location.")
+            parts.append("")
+            for fp_entry in auth_fp:
+                ep_path = fp_entry.get("path", fp_entry.get("url", "?"))
+                parts.append(f"--- Endpoint: {ep_path} ---")
+                parts.append(f"  URL: {fp_entry.get('url', '?')}")
+                parts.append(f"  Is Login: {fp_entry.get('is_login', False)}")
+                parts.append(f"  Is Register: {fp_entry.get('is_register', False)}")
+                if fp_entry.get("login_success"):
+                    parts.append(f"  ★ LOGIN SUCCESS — use this endpoint for authentication")
+                    parts.append(f"    Method: {fp_entry.get('login_method', 'POST')}")
+                    parts.append(f"    Content-Type: {fp_entry.get('login_content_type', '?')}")
+                    parts.append(f"    Body Fields: {fp_entry.get('login_body_fields', [])}")
+                    parts.append(f"    Auth Mechanism: {fp_entry.get('auth_mechanism', '?')}")
+                    parts.append(f"    Token Location: {fp_entry.get('token_location', 'N/A')}")
+                if fp_entry.get("recommended_content_type"):
+                    parts.append(f"  Recommended Content-Type: {fp_entry['recommended_content_type']}")
+                    parts.append(f"  Recommended Body Fields: {fp_entry.get('recommended_body_fields', [])}")
+                    parts.append(f"  Auth Mechanism: {fp_entry.get('auth_mechanism', '?')}")
+                    if fp_entry.get("token_location"):
+                        parts.append(f"  Token Location: {fp_entry['token_location']}")
+                for probe in fp_entry.get("probes", []):
+                    parts.append(f"")
+                    parts.append(f"  [Probe: {probe.get('variant', '?')}]")
+                    parts.append(f"  == Raw Request ==")
+                    parts.append(f"  {probe.get('raw_request', 'N/A')}")
+                    parts.append(f"  == Raw Response ==")
+                    parts.append(f"  {probe.get('raw_response', 'N/A')}")
+                    parts.append(f"  Status: {probe.get('status', '?')}")
+                    if probe.get("has_token_in_body"):
+                        parts.append(f"  ★ TOKEN FOUND in response body at: {probe.get('token_location', '?')}")
+                    if probe.get("has_set_cookie"):
+                        parts.append(f"  ★ SET-COOKIE: {probe.get('set_cookie_header', '?')}")
+                parts.append("")
+
         formatted_text = "\n".join(parts)
 
         # Save crawl_raw.json
@@ -1274,16 +1992,71 @@ class CrawlAgent:
                         "label": s["label"],
                         "auth_verified": s.get("auth_verified", False),
                         "cookies": s.get("cookies", []),
+                        "cookie_header": cookie_header_from_cookie_objects(s.get("cookies", [])),
+                        "storage_state_path": s.get("storage_state_path", ""),
+                        "storage_state": s.get("storage_state", {}),
+                        "bearer_token": s.get("bearer_token", "") or bearer_token_from_session(s),
+                        "created_by": s.get("created_by", ""),
+                        "verified_url": s.get("verified_url", ""),
+                        "notes": s.get("notes", ""),
                         "data": s.get("data", {}),
                     }
                     for s in auth_sessions
                 ],
+                "auth_context_file": str(auth_context_path(self.working_dir)),
+                "auth_fingerprint": auth_fp,
             }
             with open(raw_crawl_path, "w", encoding="utf-8") as f:
                 json.dump(raw_payload, f, ensure_ascii=False, indent=2)
             print(f"{GREEN}[CRAWL-AGENT] Raw crawl JSON saved: {raw_crawl_path}{RESET}")
         except Exception as e:
             print(f"{YELLOW}[CRAWL-AGENT] Could not save crawl_raw.json: {e}{RESET}")
+
+        # Save compact auth_context.json as the source of truth for Manager/Exec.
+        try:
+            if auth_sessions:
+                for session in auth_sessions:
+                    self._persist_auth_context(url, session)
+            # Enrich auth_context.json with login discovery from fingerprint
+            if auth_fp:
+                ctx = load_auth_context(self.working_dir)
+                login_discovery = {}
+                for fp_entry in auth_fp:
+                    if fp_entry.get("login_success"):
+                        login_discovery = {
+                            "login_endpoint": fp_entry.get("login_endpoint") or fp_entry.get("path", ""),
+                            "login_method": fp_entry.get("login_method", "POST"),
+                            "login_content_type": fp_entry.get("login_content_type", "application/json"),
+                            "login_body_fields": fp_entry.get("login_body_fields", []),
+                            "auth_mechanism": fp_entry.get("auth_mechanism", "unknown"),
+                            "token_location": fp_entry.get("token_location", ""),
+                        }
+                        break
+                if not login_discovery:
+                    # Use best guess from probes
+                    for fp_entry in auth_fp:
+                        if fp_entry.get("is_login") and fp_entry.get("recommended_content_type"):
+                            login_discovery = {
+                                "login_endpoint": fp_entry.get("path", ""),
+                                "login_method": "POST",
+                                "login_content_type": fp_entry["recommended_content_type"],
+                                "login_body_fields": fp_entry.get("recommended_body_fields", []),
+                                "auth_mechanism": fp_entry.get("auth_mechanism", "unknown"),
+                                "token_location": fp_entry.get("token_location", ""),
+                            }
+                            break
+                if login_discovery:
+                    ctx["login_discovery"] = login_discovery
+                    save_auth_context(self.working_dir, ctx)
+            ctx = load_auth_context(self.working_dir)
+            if ctx.get("sessions") or ctx.get("login_discovery"):
+                print(
+                    f"{GREEN}[CRAWL-AGENT] Auth context saved: {auth_context_path(self.working_dir)} "
+                    f"({len(ctx.get('sessions', []))} session(s), "
+                    f"login_discovery={'yes' if ctx.get('login_discovery') else 'no'}){RESET}"
+                )
+        except Exception as e:
+            print(f"{YELLOW}[CRAWL-AGENT] Could not persist auth context: {e}{RESET}")
 
         # Save crawl_data.txt
         crawl_data_path = os.path.join(self.working_dir, "crawl_data.txt")
