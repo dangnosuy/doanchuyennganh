@@ -221,6 +221,11 @@ class VulnHunterAgent:
 
         print(f"{GREEN}[VULN-HUNTER] Da doc {len(recon_content)} chars recon dossier{RESET}")
 
+        # ── 1b. Load raw endpoints from crawl_raw.json ──
+        raw_endpoints = self._load_raw_endpoints()
+        if raw_endpoints:
+            print(f"{GREEN}[VULN-HUNTER] Loaded {len(raw_endpoints)} raw endpoints from crawl_raw.json{RESET}")
+
         # ── 2. Call LLM ──
         print(f"{YELLOW}[VULN-HUNTER] Goi LLM phan tich... (model={MODEL}, max_tokens=16384){RESET}")
         raw_json = self._call_llm(recon_content)
@@ -229,9 +234,13 @@ class VulnHunterAgent:
             self._write_bugs([])
             return []
 
-        # ── 3. Parse + validate ──
-        bugs = self._parse_bugs(raw_json)
+        # ── 3. Parse + validate + enrich ──
+        bugs = self._parse_bugs(raw_json, raw_endpoints=raw_endpoints)
         print(f"{GREEN}[VULN-HUNTER] Tim thay {len(bugs)} vulnerability hypotheses{RESET}")
+
+        # ── 3b. Filter challenge metadata bugs ──
+        bugs = self._filter_challenge_metadata_bugs(bugs)
+        print(f"{GREEN}[VULN-HUNTER] Sau filter challenge metadata: {len(bugs)} bugs{RESET}")
 
         # ── 4. Write output ──
         self._write_bugs(bugs)
@@ -361,7 +370,7 @@ class VulnHunterAgent:
                 )
         return ""
 
-    def _parse_bugs(self, raw_text: str) -> list[dict]:
+    def _parse_bugs(self, raw_text: str, *, raw_endpoints: list[dict] | None = None) -> list[dict]:
         """
         Parse raw LLM output into bug entries.
         Tries to extract a JSON array from the response.
@@ -515,6 +524,17 @@ class VulnHunterAgent:
                 "attempt_count": 0,
                 "debate_rounds": 0,
             }
+
+            # ── Inject http_examples from raw_endpoints if LLM didn't provide ──
+            if not enriched_bug["http_examples"] and raw_endpoints:
+                endpoint_path = enriched_bug["endpoint"]
+                bug_method = enriched_bug["method"].upper()
+                matched_examples = self._match_raw_endpoints(
+                    endpoint_path, bug_method, raw_endpoints,
+                )
+                if matched_examples:
+                    enriched_bug["http_examples"] = matched_examples[:MAX_HTTP_EXAMPLES_PER_BUG]
+
             enriched.append(enriched_bug)
 
         # Sort by risk_level severity
@@ -544,6 +564,135 @@ class VulnHunterAgent:
                   f"{bug['method']} | {auth}{cred_str} | {n_examples} http_examples{RESET}")
 
         return output_path
+
+    def _load_raw_endpoints(self) -> list[dict]:
+        """Load raw_endpoints from crawl_raw.json if available."""
+        raw_path = os.path.join(self.run_dir, "crawl_raw.json")
+        try:
+            if not os.path.isfile(raw_path):
+                return []
+            with open(raw_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            endpoints = data.get("raw_endpoints", [])
+            if isinstance(endpoints, list):
+                return endpoints
+        except Exception as e:
+            print(f"{YELLOW}[VULN-HUNTER] Could not load crawl_raw.json: {e}{RESET}")
+        return []
+
+    @staticmethod
+    def _match_raw_endpoints(
+        endpoint_path: str,
+        bug_method: str,
+        raw_endpoints: list[dict],
+    ) -> list[dict]:
+        """Find raw endpoint examples that match a bug's endpoint path.
+
+        Matching strategy:
+        1. Exact path match
+        2. Template match (e.g. /api/Users/{id} matches /api/Users/1)
+        3. Prefix match (e.g. /api/Products matches /api/Products/search)
+
+        Returns list of http_example dicts suitable for risk-bug.json.
+        """
+        if not endpoint_path or not raw_endpoints:
+            return []
+
+        # Normalize endpoint: remove template vars like {id}, {{id}}
+        clean_endpoint = re.sub(r'\{+\w+\}+', '', endpoint_path).rstrip('/')
+        if not clean_endpoint:
+            clean_endpoint = endpoint_path.split('/')[1] if '/' in endpoint_path else endpoint_path
+
+        matched = []
+        for ep in raw_endpoints:
+            ep_path = ep.get("path", "")
+            ep_method = ep.get("method", "GET")
+            ep_status = ep.get("status", 0)
+
+            # Skip non-live endpoints
+            if ep_status >= 404:
+                continue
+
+            # Match logic
+            is_match = False
+            # 1. Exact match
+            if ep_path.rstrip('/') == endpoint_path.rstrip('/'):
+                is_match = True
+            # 2. Path starts with the clean endpoint (prefix)
+            elif ep_path.startswith(clean_endpoint):
+                is_match = True
+            # 3. Bug endpoint is a template and raw path matches the base
+            elif clean_endpoint and ep_path.startswith(clean_endpoint.rstrip('/')):
+                is_match = True
+
+            if is_match:
+                example = {
+                    "method": ep_method,
+                    "path": ep_path,
+                    "status": ep_status,
+                    "request_body": ep.get("request", {}).get("body"),
+                    "response_snippet": ep.get("response", {}).get("body_snippet", ""),
+                    "content_type": ep.get("response", {}).get("headers", {}).get("content-type", ""),
+                    "auth_session": ep.get("auth_session", "anonymous"),
+                }
+                matched.append(example)
+
+        return matched
+
+    @staticmethod
+    def _filter_challenge_metadata_bugs(bugs: list[dict]) -> list[dict]:
+        """Filter out bugs that are purely based on challenge/lab metadata.
+
+        These bugs rely on endpoints like /api/Challenges which are lab-specific
+        metadata and don't represent real BAC/BLF vulnerabilities.
+
+        Keeps bugs where:
+        - The endpoint is NOT exclusively /api/Challenges or similar metadata
+        - The hypothesis mentions actual functionality (not just "challenge name contains admin")
+        """
+        METADATA_ENDPOINTS = {
+            "/api/challenges", "/api/Challenges",
+            "/rest/admin/application-version",
+            "/rest/admin/application-configuration",
+        }
+
+        METADATA_KEYWORDS = (
+            "challenge metadata", "challenge name", "challenge text",
+            "tên challenge", "metadata lab", "challenge list",
+            "application-version", "application-configuration",
+        )
+
+        filtered = []
+        removed_count = 0
+        for bug in bugs:
+            endpoint = bug.get("endpoint", "").strip()
+            hypothesis = str(bug.get("hypothesis", "")).lower()
+            title = str(bug.get("title", "")).lower()
+
+            # Check if this is a pure metadata bug
+            is_metadata = False
+
+            # 1. Endpoint is a known metadata-only endpoint
+            if endpoint in METADATA_ENDPOINTS:
+                # Check if the hypothesis ALSO mentions metadata
+                if any(kw in hypothesis or kw in title for kw in METADATA_KEYWORDS):
+                    is_metadata = True
+
+            # 2. Hypothesis is purely about challenge metadata
+            if not is_metadata and all(kw in hypothesis for kw in ("challenge", "metadata")):
+                is_metadata = True
+
+            if is_metadata:
+                removed_count += 1
+                print(f"  {DIM}[VULN-HUNTER] Filtered: {bug.get('id', '?')} — "
+                      f"{bug.get('title', '?')} (challenge metadata){RESET}")
+            else:
+                filtered.append(bug)
+
+        if removed_count > 0:
+            print(f"{YELLOW}[VULN-HUNTER] Removed {removed_count} challenge metadata bug(s){RESET}")
+
+        return filtered
 
 
 # ═══════════════════════════════════════════════════════════════════════

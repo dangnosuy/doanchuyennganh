@@ -304,7 +304,11 @@ class CrawlAgent:
         _debug(f"Working dir: {self.working_dir}")
 
         # ── Phase 1: Anonymous crawl ──
-        print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 1: Anonymous crawl...{RESET}")
+        print(f"\n{YELLOW}{BOLD}══════════════════════════════════════════════════{RESET}")
+        print(f"{YELLOW}{BOLD}[CRAWL-AGENT] Phase 1: ANONYMOUS CRAWL{RESET}")
+        print(f"{YELLOW}{BOLD}══════════════════════════════════════════════════{RESET}")
+        print(f"{DIM}[CRAWL-AGENT] Target: {url}{RESET}")
+        print(f"{DIM}[CRAWL-AGENT] Mode: Unauthenticated — no cookies/tokens{RESET}")
 
         # Detect SPA targets → reduce page limit to avoid timeout
         is_spa, spa_framework = self._detect_spa(url)
@@ -326,11 +330,29 @@ class CrawlAgent:
                 print(f"{YELLOW}[CRAWL-AGENT] Retry crawler (max_pages=5, 1 round)...{RESET}")
                 anon_data = self._run_crawler(url, max_pages=5, max_rounds=1, timeout=60)
 
+        # ── Tóm tắt Anonymous crawl ──
+        anon_request_count = len(anon_data.get("http_traffic", [])) if anon_data else 0
+        anon_page_count = len(anon_data.get("pages", [])) if anon_data else 0
+        print(f"\n{GREEN}[CRAWL-AGENT] ── Anonymous Crawl Summary ──{RESET}")
+        print(f"{GREEN}[CRAWL-AGENT]   Requests captured: {anon_request_count}{RESET}")
+        print(f"{GREEN}[CRAWL-AGENT]   Pages visited: {anon_page_count}{RESET}")
+        if anon_data:
+            anon_endpoints = set()
+            for r in anon_data.get("http_traffic", []):
+                if r.get("resource_type") in ("document", "xhr", "fetch"):
+                    anon_endpoints.add(f"{r.get('method', '?')} {urlparse(r.get('url', '')).path}")
+            print(f"{GREEN}[CRAWL-AGENT]   Unique endpoints: {len(anon_endpoints)}{RESET}")
+            for ep in sorted(anon_endpoints)[:15]:
+                print(f"{DIM}[CRAWL-AGENT]     {ep}{RESET}")
+
         # ── Phase 2+3: Loop qua từng account ──
         auth_sessions: list[dict] = []
         for idx, cred in enumerate(credentials_list):
             label = cred["label"]
-            print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 2: Login [{label}]...{RESET}")
+            print(f"\n{YELLOW}{BOLD}══════════════════════════════════════════════════{RESET}")
+            print(f"{YELLOW}{BOLD}[CRAWL-AGENT] Phase 2: LOGIN [{label}]{RESET}")
+            print(f"{YELLOW}{BOLD}══════════════════════════════════════════════════{RESET}")
+            print(f"{DIM}[CRAWL-AGENT] Credentials: {cred.get('username', '?')} / {'*' * len(cred.get('password', ''))}{RESET}")
             login_context = self._login_context(url, cred)
             login_cookies = login_context.get("cookies", []) if login_context else []
 
@@ -344,8 +366,17 @@ class CrawlAgent:
                 if login_context.get("bearer_token"):
                     auth_material_bits.append("bearer/localStorage token")
                 material_note = ", ".join(auth_material_bits) if auth_material_bits else "auth context"
+                auth_mechanism = login_context.get("login_discovery", {}).get("auth_mechanism", "unknown")
                 print(f"{GREEN}[CRAWL-AGENT] Login [{label}] OK — {material_note}{RESET}")
-                print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 3: Authenticated crawl [{label}]...{RESET}")
+                print(f"{GREEN}[CRAWL-AGENT]   Auth mechanism: {auth_mechanism}{RESET}")
+                print(f"{GREEN}[CRAWL-AGENT]   Created by: {login_context.get('created_by', '?')}{RESET}")
+                if login_context.get("bearer_token"):
+                    token = login_context["bearer_token"]
+                    print(f"{GREEN}[CRAWL-AGENT]   Bearer token: {token[:20]}...{token[-10:]}{RESET}")
+
+                print(f"\n{YELLOW}{BOLD}══════════════════════════════════════════════════{RESET}")
+                print(f"{YELLOW}{BOLD}[CRAWL-AGENT] Phase 3: AUTHENTICATED CRAWL [{label}]{RESET}")
+                print(f"{YELLOW}{BOLD}══════════════════════════════════════════════════{RESET}")
                 cookie_str = cookie_header_from_cookie_objects(login_cookies)
                 _debug(f"[{label}] Injecting {len(login_cookies)} cookies: {cookie_str[:100]}...")
                 data = self._run_crawler(
@@ -369,7 +400,12 @@ class CrawlAgent:
                     self._persist_auth_context(url, session_record)
                     _debug(f"[{label}] Auth crawl done: {len(data.get('http_traffic', []))} requests")
 
-                    # ── Verify authenticated crawl actually differs from anonymous ──
+                    # ── Compare: authenticated vs anonymous ──
+                    auth_request_count = len(data.get("http_traffic", []))
+                    print(f"\n{GREEN}[CRAWL-AGENT] ── Authenticated Crawl Summary [{label}] ──{RESET}")
+                    print(f"{GREEN}[CRAWL-AGENT]   Auth verified: {auth_verified}{RESET}")
+                    print(f"{GREEN}[CRAWL-AGENT]   Requests captured: {auth_request_count}{RESET}")
+
                     if anon_data:
                         anon_urls = set()
                         for r in anon_data.get("http_traffic", []):
@@ -381,24 +417,25 @@ class CrawlAgent:
                                 auth_urls.add(f"{r.get('method', '?')} {r.get('url', '?')}")
 
                         new_urls = auth_urls - anon_urls
+                        print(f"{GREEN}[CRAWL-AGENT]   New endpoints (auth-only): {len(new_urls)}{RESET}")
+                        for u in sorted(new_urls)[:10]:
+                            print(f"{GREEN}[CRAWL-AGENT]     [AUTH-ONLY] {u}{RESET}")
+
                         if auth_verified:
-                            print(f"{GREEN}[CRAWL-AGENT] Auth crawl [{label}] verified — "
-                                  f"authenticated responses differ from anonymous crawl{RESET}")
+                            print(f"{GREEN}[CRAWL-AGENT]   ✓ Authenticated session confirmed{RESET}")
                         elif new_urls:
-                            print(f"{GREEN}[CRAWL-AGENT] Auth crawl [{label}] discovered "
-                                  f"{len(new_urls)} new URL(s) vs anonymous{RESET}")
-                            _debug(f"[{label}] New URLs: {sorted(new_urls)[:10]}")
+                            print(f"{GREEN}[CRAWL-AGENT]   ✓ New URLs discovered — auth likely working{RESET}")
                         elif auth_urls == anon_urls:
-                            print(f"{YELLOW}[CRAWL-AGENT] WARNING: Auth crawl [{label}] returned "
-                                  f"IDENTICAL URLs to anonymous crawl — authentication may have "
-                                  f"failed or cookies were not injected properly{RESET}")
+                            print(f"{YELLOW}[CRAWL-AGENT]   ✗ WARNING: Identical URLs to anonymous — "
+                                  f"auth may have failed{RESET}")
                         else:
-                            print(f"{YELLOW}[CRAWL-AGENT] Auth crawl [{label}]: "
+                            print(f"{YELLOW}[CRAWL-AGENT]   Auth crawl [{label}]: "
                                   f"{len(auth_urls)} URLs (anon had {len(anon_urls)}){RESET}")
                 else:
                     print(f"{YELLOW}[CRAWL-AGENT] Auth crawl [{label}] returned no data{RESET}")
             else:
-                print(f"{YELLOW}[CRAWL-AGENT] Login [{label}] failed, skipping authenticated crawl{RESET}")
+                print(f"{YELLOW}[CRAWL-AGENT] ✗ Login [{label}] FAILED — skipping authenticated crawl{RESET}")
+                print(f"{YELLOW}[CRAWL-AGENT]   Pipeline will only have anonymous endpoints{RESET}")
 
         if not credentials_list:
             print(f"\n{DIM}[CRAWL-AGENT] Phase 2+3: No credentials, skipping login{RESET}")
@@ -1241,7 +1278,70 @@ class CrawlAgent:
         except Exception as e:
             print(f"{YELLOW}[LOGIN] REST API login error: {e}{RESET}")
 
+        # ── Fallback: auto-register then retry login ──
+        if not getattr(self, "_auto_register_attempted", False):
+            self._auto_register_attempted = True
+            print(f"{YELLOW}[LOGIN] REST login failed — trying auto-register then retry...{RESET}")
+            registered = self._auto_register(target_url, credentials)
+            if registered:
+                print(f"{GREEN}[LOGIN] Auto-register succeeded — retrying REST login...{RESET}")
+                return self._login_rest_api(target_url, registered.get("credentials", credentials))
+            else:
+                print(f"{YELLOW}[LOGIN] Auto-register also failed{RESET}")
+
         _debug("[REST LOGIN] No REST API login succeeded")
+        return None
+
+    def _auto_register(self, target_url: str, credentials: dict) -> dict | None:
+        """Auto-register account on target when REST login fails (e.g. account doesn't exist).
+
+        Tries common registration endpoints with the given credentials.
+        Returns dict with 'credentials' key on success, None on failure.
+        """
+        username = credentials.get("username", "")
+        password = credentials.get("password", "")
+        if not username or not password:
+            return None
+
+        register_endpoints = [
+            "/api/Users",
+            "/rest/user/register",
+            "/api/register",
+            "/register",
+            "/api/auth/register",
+            "/api/signup",
+            "/signup",
+        ]
+
+        # Build body variants: email-based and username-based
+        body_variants = [
+            {"email": username, "password": password},
+            {"username": username, "password": password},
+            {"email": username, "password": password, "passwordRepeat": password},
+        ]
+
+        try:
+            with httpx.Client(timeout=10, verify=False) as client:
+                for endpoint in register_endpoints:
+                    reg_url = urljoin(target_url, endpoint)
+                    for body in body_variants:
+                        try:
+                            _debug(f"[AUTO-REGISTER] POST {reg_url} body_keys={list(body.keys())}")
+                            resp = client.post(
+                                reg_url, json=body,
+                                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                            )
+                            _debug(f"[AUTO-REGISTER] → status={resp.status_code}")
+                            if resp.status_code in (200, 201):
+                                print(f"{GREEN}[LOGIN] Auto-registered account via {endpoint} "
+                                      f"(status={resp.status_code}){RESET}")
+                                return {"credentials": credentials, "register_url": reg_url}
+                        except Exception as e:
+                            _debug(f"[AUTO-REGISTER] POST {reg_url} error: {e}")
+                            continue
+        except Exception as e:
+            _debug(f"[AUTO-REGISTER] Error: {e}")
+
         return None
 
 
@@ -1300,7 +1400,11 @@ class CrawlAgent:
                     try:
                         page.goto(login_url, wait_until="domcontentloaded", timeout=20000)
                         page.wait_for_timeout(800)
+                        # Dismiss SPA overlays (popups, banners, cookie consent)
+                        self._dismiss_spa_overlays(page)
                         self._try_click_login_entry(page)
+                        # Re-dismiss in case click_login_entry navigated to a new page with overlays
+                        self._dismiss_spa_overlays(page)
                         password_count = page.locator('input[type="password"], input[name*="pass" i]').count()
                         last_note = f"{login_url}: password_inputs={password_count}"
                         if password_count > 0:
@@ -1432,6 +1536,50 @@ class CrawlAgent:
             except Exception:
                 continue
         return None
+
+    @staticmethod
+    def _dismiss_spa_overlays(page) -> None:
+        """Dismiss common SPA overlays (popups, banners, cookie consent) before interacting.
+
+        Covers: Juice Shop welcome/cookie banners, Angular CDK overlays,
+        generic modals, cookie consent bars, and common close buttons.
+        """
+        dismiss_selectors = [
+            # Juice Shop specific
+            'button.close-dialog',
+            'button[aria-label="Close Welcome Banner"]',
+            'a.cc-dismiss',                       # Cookie consent dismiss
+            'a.cc-btn.cc-dismiss',
+            # Angular CDK / Material overlays
+            '.cdk-overlay-backdrop',
+            'button.mat-focus-indicator.close-dialog',
+            # Generic modals
+            '.modal .close', 'button.modal-close', '.modal-close-btn',
+            'button.btn-close',
+            '[aria-label="Close"]', '[aria-label="Dismiss"]',
+            '[aria-label="close"]', '[aria-label="dismiss"]',
+            # Cookie consent / GDPR
+            'button:has-text("Accept")',
+            'button:has-text("Got it")',
+            'button:has-text("OK")',
+            'button:has-text("I agree")',
+            'button:has-text("Accept all")',
+            'button:has-text("Agree")',
+            # Generic dismiss
+            '.dismiss', '.close-banner',
+        ]
+        dismissed_count = 0
+        for selector in dismiss_selectors:
+            try:
+                loc = page.locator(selector).first
+                if loc.count() > 0 and loc.is_visible(timeout=400):
+                    loc.click(timeout=1500)
+                    page.wait_for_timeout(250)
+                    dismissed_count += 1
+            except Exception:
+                continue
+        if dismissed_count > 0:
+            _debug(f"Dismissed {dismissed_count} SPA overlay(s)")
 
     @staticmethod
     def _try_click_login_entry(page) -> None:
@@ -1984,8 +2132,12 @@ class CrawlAgent:
         # Save crawl_raw.json
         raw_crawl_path = os.path.join(self.working_dir, "crawl_raw.json")
         try:
+            # Build raw_endpoints: clean HTTP examples for each live endpoint
+            raw_endpoints = self._extract_raw_endpoints(anon_data, auth_sessions)
+
             raw_payload = {
                 "target": url,
+                "raw_endpoints": raw_endpoints,
                 "anonymous": anon_data,
                 "authenticated": [
                     {
@@ -2008,7 +2160,8 @@ class CrawlAgent:
             }
             with open(raw_crawl_path, "w", encoding="utf-8") as f:
                 json.dump(raw_payload, f, ensure_ascii=False, indent=2)
-            print(f"{GREEN}[CRAWL-AGENT] Raw crawl JSON saved: {raw_crawl_path}{RESET}")
+            print(f"{GREEN}[CRAWL-AGENT] Raw crawl JSON saved: {raw_crawl_path} "
+                  f"({len(raw_endpoints)} raw endpoints){RESET}")
         except Exception as e:
             print(f"{YELLOW}[CRAWL-AGENT] Could not save crawl_raw.json: {e}{RESET}")
 
@@ -2561,6 +2714,114 @@ class CrawlAgent:
             lines.append("")
 
         return "\n".join(lines).rstrip() + "\n"
+
+    def _extract_raw_endpoints(
+        self,
+        anon_data: dict | None,
+        auth_sessions: list[dict],
+    ) -> list[dict]:
+        """Extract clean HTTP request/response examples from crawl traffic.
+
+        For each unique endpoint (method + path), saves:
+        - method, path, status
+        - request headers (filtered), body
+        - response headers (filtered), body snippet
+        - auth_session: which session captured it (anonymous or label)
+
+        This data feeds directly into VulnHunter bug candidates and Exec exploit context.
+        """
+        seen: dict[str, dict] = {}  # key: "METHOD /path" → best example
+
+        def _add_traffic(traffic: list[dict], session_label: str) -> None:
+            for req in traffic:
+                if not isinstance(req, dict):
+                    continue
+                method = req.get("method", "GET")
+                url_str = req.get("url", "")
+                if not url_str:
+                    continue
+                # Extract path from URL
+                try:
+                    parsed = urlparse(url_str)
+                    path = parsed.path or "/"
+                except Exception:
+                    path = "/"
+
+                resource_type = req.get("resource_type", "")
+                status = req.get("response_status") or 0
+
+                # Only keep document/xhr/fetch traffic (skip images, css, fonts etc.)
+                if resource_type not in ("document", "xhr", "fetch", ""):
+                    continue
+                # Skip static assets
+                if any(path.endswith(ext) for ext in (".js", ".css", ".png", ".jpg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".map")):
+                    continue
+
+                key = f"{method} {path}"
+                # Keep the best example: prefer 2xx, then auth over anon
+                existing = seen.get(key)
+                if existing:
+                    # Prefer lower status code (2xx > 3xx > 4xx)
+                    if existing.get("status", 999) < status:
+                        continue
+                    # Prefer authenticated over anonymous
+                    if existing.get("auth_session") != "anonymous" and session_label == "anonymous":
+                        continue
+
+                # Extract request body
+                req_body = req.get("postData") or None
+                if isinstance(req_body, str) and len(req_body) > 500:
+                    req_body = req_body[:500] + "..."
+
+                # Extract response body snippet
+                resp_body = req.get("response_body") or ""
+                if isinstance(resp_body, str) and len(resp_body) > 300:
+                    resp_body = resp_body[:300] + "..."
+
+                # Filter headers to useful ones only
+                req_headers = req.get("headers") or {}
+                useful_req_headers = {
+                    k: v for k, v in req_headers.items()
+                    if k.lower() in ("content-type", "authorization", "cookie", "accept", "x-requested-with")
+                }
+
+                resp_headers = req.get("response_headers") or {}
+                useful_resp_headers = {
+                    k: v for k, v in resp_headers.items()
+                    if k.lower() in ("content-type", "set-cookie", "location", "www-authenticate", "x-powered-by")
+                }
+
+                seen[key] = {
+                    "method": method,
+                    "path": path,
+                    "status": status,
+                    "request": {
+                        "headers": useful_req_headers,
+                        "body": req_body,
+                    },
+                    "response": {
+                        "headers": useful_resp_headers,
+                        "body_snippet": resp_body,
+                        "body_size": len(req.get("response_body") or ""),
+                    },
+                    "auth_session": session_label,
+                    "resource_type": resource_type,
+                }
+
+        # Process anonymous traffic
+        if anon_data:
+            _add_traffic(anon_data.get("http_traffic", []), "anonymous")
+
+        # Process authenticated traffic
+        for session in auth_sessions:
+            data = session.get("data", {})
+            if data:
+                _add_traffic(data.get("http_traffic", []), session.get("label", "authenticated"))
+
+        # Sort by path for readability
+        endpoints = sorted(seen.values(), key=lambda e: (e["path"], e["method"]))
+        _debug(f"Extracted {len(endpoints)} raw endpoint examples")
+        return endpoints
 
     def _format_crawl_data(self, data: dict) -> str:
         """Format crawler JSON output into readable text for LLM."""

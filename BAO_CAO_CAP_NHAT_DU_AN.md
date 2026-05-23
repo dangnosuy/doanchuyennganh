@@ -719,3 +719,71 @@ Tại thời điểm cập nhật 23/05/2026, dự án đã có hình dạng rõ
 Các cải tiến mới nhất tập trung vào **chất lượng quyết định của Manager**: phân biệt đúng loại BAC, tôn trọng verdict từ script tự verify, cho phép retry khi bằng chứng chưa đủ mạnh thay vì dừng ngay, và dynamic tick budget theo số lượng bugs. Những thay đổi này không thay đổi kiến trúc tổng thể mà chỉ tinh chỉnh logic quyết định bên trong `ManageAgent` — đúng vai trò "ông sếp thông thái" điều phối pipeline.
 
 Với trạng thái hiện tại, dự án đủ cơ sở để báo cáo như một prototype có kiến trúc hoàn chỉnh, có pipeline chạy thật, có artifact chứng minh, có cơ chế proof quality gate phân biệt theo loại lỗ hổng, và có hướng phát triển rõ ràng cho giai đoạn sau.
+
+---
+
+## 20. Cập nhật 23/05/2026 — Chuyển từ Shot-based sang Orchestrator-driven
+
+### 20.1. Vấn đề kiến trúc cũ
+
+```text
+CŨ (Shot-based, sequential):
+  Crawl → VulnHunter → [Red viết SHOT PLAN → Blue review shot → Exec gen 1 Python script → chạy 1 lần]
+
+Hạn chế:
+  ① Login fail → toàn bộ pipeline mất auth → 6/10 bugs bị BLOCKED_AUTH
+  ② Exec gen Python script từ shot plan → dễ syntax error, dễ vỡ với SPA
+  ③ Blue review format shot plan thay vì review logic chiến lược
+  ④ SPA popup overlay che nút Login → Playwright login fail
+  ⑤ VulnHunter thiếu HTTP evidence → Red/Exec thiếu context
+```
+
+### 20.2. Kiến trúc mới
+
+```text
+MỚI (Orchestrator-driven, adaptive):
+  Crawl (+ auto-register + overlay dismiss + raw HTTP examples)
+    → VulnHunter (+ inject http_examples + filter metadata)
+    → Manager Phase 0: Context Review → Sort bugs → Auth recovery
+    → [Red: EXECUTION GUIDE → Blue: review guide quality → Exec: tool-loop adaptive]
+    → [EXPLOITED? → PoC script generation]
+```
+
+### 20.3. So sánh
+
+| Thành phần | Cũ | Mới |
+|---|---|---|
+| **Login** | Fail nếu popup/account không tồn tại | Auto-register + dismiss overlay |
+| **Red** | `SHOT PLAN` (script format) | `EXECUTION GUIDE` (approach + fallbacks) |
+| **Blue** | Review shot format | Review guide quality + fallback paths |
+| **Exec** | Gen 1 Python script, chạy 1 lần | Tool-loop adaptive (curl/browser, 15 rounds) |
+| **PoC** | Luôn gen (dù fail) | Chỉ gen khi EXPLOITED |
+| **Manager** | Block nếu thiếu auth | Phase 0 review → auth recovery → sort bugs |
+| **VulnHunter** | Chỉ recon.md | + raw HTTP examples + filter metadata |
+
+### 20.4. Files đã sửa
+
+| File | Thêm mới |
+|---|---|
+| `crawl_agent.py` | `_dismiss_spa_overlays()`, `_auto_register()`, `_extract_raw_endpoints()` |
+| `red_team.py` | `EXECUTION GUIDE` (Approach, Auth setup, Fallback) |
+| `blue_team.py` | Review criteria mới cho guide quality |
+| `manage_agent.py` | `_phase0_context_review()`, `_ensure_auth_or_skip()`, `_sort_bugs_by_auth_priority()` |
+| `exec_agent.py` | `_choose_exploit_mode()`, `_exploit_via_tools()`, `_generate_poc_from_evidence()` |
+| `vuln_hunter_agent.py` | `_load_raw_endpoints()`, `_match_raw_endpoints()`, `_filter_challenge_metadata_bugs()` |
+
+### 20.5. Mô hình Orchestrator
+
+```text
+ManageAgent (Orchestrator)
+  ├── Phase 0: Context Review
+  ├── Auth Recovery
+  ├── Bug Priority Sort (anon first)
+  ├── CrawlAgent    → thu thập + login
+  ├── VulnHunter    → phân tích + giả thuyết
+  ├── RedTeam       → EXECUTION GUIDE
+  ├── BlueTeam      → review guide
+  └── ExecAgent     → tool-loop exploit + PoC
+```
+
+Mỗi sub-agent nhận chỉ context cần thiết (context isolation) — tránh overfitting, tiết kiệm token.

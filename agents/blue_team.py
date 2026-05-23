@@ -91,7 +91,11 @@ Ban KHONG doi viet code/curl, nhung PHAI bat Red cu the hoa endpoint, auth, para
 3. Executability: ExecAgent co the lam theo duoc khong, hay chi la y tuong chung chung?
 4. Auth/state logic: Co noi ro user nao, role nao, session nao, state truoc/sau nao can so sanh khong?
 5. Verification: Buoc verify co dung raw evidence, khop verify_method/hypothesis khong?
-6. Shot plan: Co section `EXECUTION SHOT PLAN` phu hop do kho cua bug khong?
+6. Execution guide: Co section `EXECUTION GUIDE` voi:
+   - Approach phu hop (api_first/browser_first/mixed)?
+   - Steps co endpoint/method/params cu the?
+   - Verify marker ro rang?
+   - Co fallback paths khi step chinh fail?
 Luu y auth: `AUTH_CONTEXT_AVAILABLE` voi cookie/storage_state/localStorage token la auth evidence hop le.
 Khong reject chi vi thieu HTTP form login neu dossier/Manager cho biet co auth context tai su dung duoc.
 
@@ -124,10 +128,10 @@ Khong reject chi vi thieu HTTP form login neu dossier/Manager cho biet co auth c
 5. Verify chung chung, khong noi raw evidence nao se xac nhan thanh cong
 6. Thieu auth/state logic quan trong: khong ro user A/B, role nao, hoac bo qua field business quan trong
 7. Bia dat ngoai dossier: tu them endpoint/param/response ma bug dossier khong goi y
-8. Thieu `EXECUTION SHOT PLAN`, tru khi strategy cu trong conversation da co shot plan ro rang.
-9. Bug stateful/chaining/BLF ma shot plan khong chia baseline/action/verify hoac khong noi artifact/marker cho shot sau.
-10. Shot verify khong co stop condition ro: marker rong, parse fail, khong co delta/state change thi khong duoc EXPLOITED.
-11. Over-verify: bat them endpoint/tac dong phu khong can thiet de chung minh hypothesis.
+8. Thieu `EXECUTION GUIDE`, hoac guide chi co "thu request roi xem" ma khong noi ro endpoint/method/params/expect.
+9. Bug stateful/chaining/BLF ma guide khong co buoc baseline va buoc verify voi marker/delta cu the.
+10. Verify condition mo ho: khong noi ro marker/status/delta nao xac nhan thanh cong.
+11. Khong co fallback path — chi 1 huong duy nhat ma khong co alternatives khi step fail.
 12. Bug `Auth Required: True` nhưng không có HTTP Examples, không có authenticated recon/session evidence, hoặc Red dùng credential không xuất hiện trong user prompt/dossier.
 13. Strategy dựa trên metadata lab như `/api/Challenges` chỉ vì response có tên challenge/admin marker, nhưng không chứng minh endpoint/chức năng BAC/BLF thực tế.
 14. BAC-03/IDOR strategy chỉ chứng minh public collection/info leak, không chứng minh object ownership bypass/cross-user access.
@@ -148,7 +152,7 @@ Khong reject chi vi thieu HTTP form login neu dossier/Manager cho biet co auth c
 - Neu chi thieu 1 mat xich quan trong thi van REJECTED.
 - Uu tien bat Red sua dung 1 lo hong tu duy lon nhat; khong liet ke qua nhieu loi vat.
 - Neu sau nhieu vong ma evidence trong conversation cho thay bug khong con kha thi, duoc phep STOPPED.
-- Blue la nguoi gatekeep shot plan. Neu Red thieu shot plan hoac shot plan khong phu hop, phai REJECTED voi reason_type=verify hoac reason_type=scope.
+- Blue la nguoi gatekeep execution guide. Neu Red thieu guide hoac guide khong phu hop, phai REJECTED voi reason_type=verify hoac reason_type=scope.
 
 === FORMAT OUTPUT ===
 Viet ngan gon (duoi 220 chu), bat dau bang duy nhat mot verdict:

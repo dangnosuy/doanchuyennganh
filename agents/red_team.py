@@ -90,7 +90,7 @@ Ban KHONG dung tool, KHONG viet curl/code, KHONG viet review dai.
   ma khong chung minh ownership bypass chi la PARTIAL/INFO_EXPOSURE_ONLY.
 - BLF/input validation: test tung bien the it nhat, sau moi action phai doc lai state/message de verify.
 - Neu endpoint/param/context thieu that su, ghi `NEEDS_CONTEXT` va noi dung thieu, khong phong dai plan.
-- Strategy toi da 450 tu. Execution shot plan mac dinh 1 shot single-script; chi dung 2 shots neu bat buoc setup rieng.
+- Strategy toi da 500 tu. Phai co EXECUTION GUIDE voi cac buoc cu the de Exec (tool-loop) co the thuc hien adaptive.
 - ANTI-OVERFITTING: khong hardcode endpoint/marker cua mot lab. Endpoint, marker, account, payload phai den tu dossier/recon/current conversation.
 - MINIMUM SUFFICIENT PROOF: chi dat dieu kien thanh cong toi thieu de chung minh hypothesis, khong bat endpoint/tac dong phu.
 - BAC vertical/admin: user thuong/guest phai thay control/admin API quyen cao that. Status 200, generic Admin,
@@ -120,17 +120,34 @@ Buoc 3 (VERIFY): <doc lai state/response de xac minh>
   Expect: <minimum sufficient proof: marker/status/delta cu the; neu khong co thi FAILED/PARTIAL>
 === KET THUC CHIEN LUOC ===
 
-=== EXECUTION SHOT PLAN ===
-Shot 1 - single-script:
-  Goal: Thuc hien baseline -> probe -> verify trong mot script, dung endpoint/params tu dossier.
-  Input: workspace, target, cookies.txt neu da co; credentials tu user/recon neu can login.
-  Actions: <3-6 hanh dong ngan, gom ca verify>
-  Must save: baseline.req.txt, baseline.resp.txt, probe.req.txt, probe.resp.txt, verify.req.txt, verify.resp.txt, result.json trong STATE_DIR.
-  Success/Partial condition: EXPLOITED khi dat minimum proof cua hypothesis; PARTIAL neu co signal nhung chua dat proof toi thieu.
-=== END EXECUTION SHOT PLAN ===
+=== EXECUTION GUIDE ===
+Approach: <api_first | browser_first | mixed>
+  (api_first: endpoint tra JSON/REST, Exec dung curl/fetch.
+   browser_first: SPA/JS-heavy, Exec can browser render.
+   mixed: login qua API, verify qua browser hoac nguoc lai.)
+
+Auth setup: <da co session/token | can login truoc | anonymous>
+  Login endpoint: <path neu can login>
+  Auth mechanism: <jwt_bearer | cookie_session | unknown>
+
+Steps:
+  1. <Baseline>: <method> <endpoint> -> expect <marker/status>
+  2. <Probe/Action>: <method> <endpoint> params=<...> -> expect <change/marker>
+  3. <Verify>: <method> <endpoint> -> expect <minimum proof: specific marker/delta/status>
+
+Fallback neu step chinh fail:
+  - Neu endpoint tra 404: thu <alternative endpoint>
+  - Neu endpoint tra 403: thu <different auth approach>
+  - Neu response khac expect: <cach xac nhan alternative>
+
+Evidence files can luu: baseline.resp.txt, probe.resp.txt, result.json
+
+Success condition: <minimum sufficient proof — 1 cau ro rang>
+Partial condition: <khi nao la PARTIAL — 1 cau>
+=== END EXECUTION GUIDE ===
 
 === KHONG DUOC ===
-- Khong viet nhieu hon 2 shots tru khi Manager bao retry.
+- Khong viet script/curl/code trong strategy. Exec se tu chon tools.
 - Khong them endpoint/response/status tu tuong tuong.
 - Khong yeu cau verify phu lam success condition nang hon hypothesis.
 - Khong lap lai strategy cu neu conversation da cho thay fail; sua dung loi fail.

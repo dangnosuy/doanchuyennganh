@@ -901,6 +901,22 @@ class ManageAgent:
             memory_store  = self.memory,
         )
 
+        # ── Phase 0: CONTEXT REVIEW — Orchestrator đánh giá state trước dispatch ──
+        ctx = self._phase0_context_review()
+        log.phase_banner(0, "CONTEXT REVIEW", "Orchestrator đánh giá điều kiện trước khi dispatch")
+        log.info(f"Recon quality: {ctx['recon_quality']} ({ctx['endpoint_count']} endpoints)")
+        log.info(f"Auth status: {ctx['auth_status']}")
+        log.info(f"Bugs: {ctx['total_bugs']} total, {ctx['anon_bugs']} anonymous, {ctx['auth_bugs']} auth-required")
+        log.info(f"Recommendation: {ctx['recommendation']}")
+
+        if ctx["recommendation"] == "exec_login_first":
+            log.info("→ Thử giao Exec login/register trước khi chạy per-bug pipeline")
+            self._ensure_auth_or_skip(exec_agent, conversation)
+
+        # Sort bugs: anonymous first, then auth-required
+        # This maximizes chance of getting auth context from exec before auth-required bugs
+        self._sort_bugs_by_auth_priority()
+
         old_handlers = self._install_signal_handlers()
 
         try:
@@ -1568,6 +1584,19 @@ class ManageAgent:
                 current_bug["auth_evidence"] = f"AUTH_CONTEXT_AVAILABLE: {self.auth_context_summary or 'authenticated material captured'}"
                 self._save_risk_bugs()
         if current_bug.get("auth_required") and not self.has_authenticated_context and not http_examples:
+            # ── NEW: Try Exec login recovery before blocking ──
+            # If we have login_discovery info, let Exec try to establish auth
+            login_discovery = self._get_login_discovery_info()
+            if login_discovery:
+                log.info(f"{bug_id}: Auth required but no session — attempting Exec login recovery")
+                auth_recovered = self._ensure_auth_or_skip(exec_agent, conversation)
+                if auth_recovered:
+                    current_bug["auth_context_available"] = True
+                    current_bug["auth_evidence"] = f"AUTH_CONTEXT_AVAILABLE: {self.auth_context_summary or 'recovered via Exec login'}"
+                    self._save_risk_bugs()
+                    log.info(f"{bug_id}: Auth recovered — continuing with bug")
+                    return ""  # Don't block, continue with bug
+
             reason = (
                 "BLOCKED_AUTH: candidate yêu cầu authenticated context nhưng crawl không có "
                 "authenticated session verified và bug không có http_examples để Exec bám theo."
@@ -1596,6 +1625,149 @@ class ManageAgent:
             )
 
         return ""
+
+    # ══════════════════════════════════════════════════════════
+    # ORCHESTRATOR METHODS — Phase 0 context review + auth recovery
+    # ══════════════════════════════════════════════════════════
+
+    def _phase0_context_review(self) -> dict:
+        """Orchestrator reads and evaluates all context before dispatching per-bug pipeline.
+
+        Returns a dict with recon quality assessment, auth status, bug breakdown,
+        and a recommendation for how to proceed.
+        """
+        # Count recon endpoints
+        recon_text = self.recon_content or ""
+        import re as _re
+        endpoint_patterns = _re.findall(
+            r'(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(/[^\s]+)',
+            recon_text,
+        )
+        endpoint_count = len(set(endpoint_patterns))
+
+        # Classify bugs
+        anon_bugs = [b for b in self.risk_bugs if not b.get("auth_required")]
+        auth_bugs = [b for b in self.risk_bugs if b.get("auth_required")]
+        bugs_with_examples = [b for b in self.risk_bugs if b.get("http_examples")]
+
+        # Recon quality
+        if endpoint_count < 5 and not bugs_with_examples:
+            recon_quality = "poor"
+        elif endpoint_count < 10:
+            recon_quality = "minimal"
+        else:
+            recon_quality = "rich"
+
+        # Auth status
+        if self.has_authenticated_context:
+            auth_status = "verified"
+        elif self.auth_context_summary:
+            auth_status = "partial"
+        else:
+            auth_status = "none"
+
+        # Recommendation
+        if auth_status == "none" and len(auth_bugs) > len(anon_bugs):
+            recommendation = "exec_login_first"
+        elif recon_quality == "poor":
+            recommendation = "proceed_cautious"
+        else:
+            recommendation = "proceed"
+
+        return {
+            "recon_quality": recon_quality,
+            "auth_status": auth_status,
+            "endpoint_count": endpoint_count,
+            "total_bugs": len(self.risk_bugs),
+            "anon_bugs": len(anon_bugs),
+            "auth_bugs": len(auth_bugs),
+            "bugs_with_examples": len(bugs_with_examples),
+            "recommendation": recommendation,
+        }
+
+    def _ensure_auth_or_skip(self, exec_agent, conversation: list[dict]) -> bool:
+        """If auth is needed but missing, have Exec try to establish a session.
+
+        Uses the login discovery info from crawl to attempt REST login + auto-register.
+        Returns True if auth was successfully established.
+        """
+        if self.has_authenticated_context:
+            return True
+
+        login_info = self._get_login_discovery_info()
+        if not login_info:
+            log.warn("Không có login_discovery info — không thể thử Exec login recovery")
+            return False
+
+        log.info(f"Attempting Exec login recovery via {login_info.get('login_endpoint', '?')}...")
+
+        try:
+            # Use Exec's _prepare_authenticated_session if available
+            # Build a minimal workflow text that triggers login
+            login_workflow = (
+                f"Auth: required=true\n"
+                f"Login endpoint: {login_info.get('login_endpoint', '')}\n"
+                f"Auth mechanism: {login_info.get('auth_mechanism', 'unknown')}\n"
+                f"TASK: Establish authenticated session for subsequent exploit workflows.\n"
+            )
+            # Pass it through Exec's session prep
+            login_result, session_cookie = exec_agent._prepare_authenticated_session(
+                login_workflow, conversation
+            )
+            if session_cookie and not session_cookie.startswith("("):
+                log.info(f"Exec login recovery succeeded — session cookie/token obtained")
+                self.has_authenticated_context = self._has_authenticated_context()
+                self.auth_context_summary = self._auth_context_summary()
+                return self.has_authenticated_context
+        except Exception as e:
+            log.warn(f"Exec login recovery error: {e}")
+
+        # Re-check in case something was saved by the attempt
+        self.has_authenticated_context = self._has_authenticated_context()
+        self.auth_context_summary = self._auth_context_summary()
+        return self.has_authenticated_context
+
+    def _sort_bugs_by_auth_priority(self) -> None:
+        """Sort bugs: anonymous first, then auth-required.
+
+        This maximizes chance of establishing auth context from successful
+        anonymous exploits before needing it for auth-required bugs.
+        Also sorts by risk level within each group (critical first).
+        """
+        risk_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+        def sort_key(bug):
+            auth_priority = 1 if bug.get("auth_required") else 0
+            risk = risk_order.get(str(bug.get("risk_level", "medium")).lower(), 2)
+            return (auth_priority, risk)
+
+        self.risk_bugs.sort(key=sort_key)
+        self._save_risk_bugs()
+        log.debug(f"Bugs sorted: {[b.get('id','?') for b in self.risk_bugs]}")
+
+    def _get_login_discovery_info(self) -> dict | None:
+        """Extract login discovery info from auth_context.json or crawl_raw.json."""
+        try:
+            context = load_auth_context(self.run_dir)
+            for session in context.get("sessions", []) or []:
+                ld = session.get("login_discovery")
+                if isinstance(ld, dict) and ld.get("login_endpoint"):
+                    return ld
+        except Exception:
+            pass
+
+        # Fallback: look in crawl_raw.json
+        raw_path = Path(self.run_dir) / "crawl_raw.json"
+        if raw_path.is_file():
+            try:
+                raw = json.loads(raw_path.read_text(encoding="utf-8"))
+                ld = raw.get("login_discovery")
+                if isinstance(ld, dict) and ld.get("login_endpoint"):
+                    return ld
+            except Exception:
+                pass
+
+        return None
 
     def _has_authenticated_context(self) -> bool:
         """Return True when crawl captured reusable auth material, including SPA storage_state."""

@@ -423,6 +423,62 @@ QUY TAC:
 """
 
 
+EXPLOIT_TOOL_LOOP_PROMPT = """\
+Ban la Security Executor. Thuc thi exploit strategy bang MCP tools.
+
+=== NHIEM VU ===
+- Doc EXECUTION GUIDE tu Red Team strategy ben duoi
+- Thuc hien tung buoc bang tool calls: fetch, execute_command(curl), browser_navigate, browser_click
+- Moi buoc: goi tool -> doc response -> quyet dinh buoc tiep theo
+- Neu step fail: thu fallback path neu Red de xuat, hoac thu alternative approach
+- Luu evidence artifacts trong STATE_DIR
+
+=== TOOLS PREFERENCE ===
+- Approach = api_first: uu tien fetch/curl cho API endpoints (REST, JSON)
+- Approach = browser_first: uu tien browser_navigate/browser_click cho SPA/JS pages
+- Approach = mixed: dung ca hai tuy tinh huong cua tung step
+
+=== AUTH ===
+- Bearer token: {bearer_token}
+- Cookie header: {cookie_header}
+- Auth mechanism: {auth_mechanism}
+- Neu auth da co: inject vao moi request (Authorization header hoac Cookie header)
+- Neu can login: thuc hien login truoc roi luu token/cookie
+
+=== STRATEGY ===
+{strategy}
+
+=== QUY TAC ===
+1. Moi request quan trong: luu req/resp vao STATE_DIR bang write_file
+2. Khong loop cung request neu khong co thong tin moi (max 2 retries/step)
+3. Neu verify thanh cong voi minimum sufficient proof: ket luan EXPLOITED
+4. Neu server chan dung (403/401/input validation): ket luan FAILED
+5. Neu co tien trien nhung chua du evidence: ket luan PARTIAL
+6. Ket qua cuoi phai nam trong =========SEND========= ... =========END-SEND========= block
+7. In SHOT_RESULT, EVIDENCE_SUMMARY, VERIFY_COMPLETED truoc FINAL
+8. Toi da {max_rounds} vong tool calls. Sau do phai tong hop ket qua.
+
+=== ANTI-OVERFITTING ===
+- Khong hardcode marker/endpoint cua mot lab cu the
+- Lay endpoint, marker, account, payload tu strategy/dossier
+- Neu da dat minimum proof cua hypothesis, ket luan EXPLOITED ngay
+- BAC-01/admin: chi EXPLOITED khi low-privileged session thay control/admin API quyen cao that
+- IDOR/BAC horizontal: chi EXPLOITED khi user A/guest doc duoc object/data cu the cua user B
+- BLF/stateful: chi EXPLOITED khi state thay doi trai logic va co before/after evidence
+
+=== OUTPUT FORMAT ===
+=========SEND=========
+SHOT_RESULT: EXPLOITED/PARTIAL/FAILED
+REQUEST_SUMMARY: <method path status va marker chinh cho moi step>
+EVIDENCE_SUMMARY: <baseline/action/after hoac object A/B ngan gon>
+ERRORS: <none hoac loi thuc te>
+VERIFY_COMPLETED: yes/no
+FINAL_REASON: <1 cau giai thich vi sao EXPLOITED/PARTIAL/FAILED>
+=== FINAL: EXPLOITED/PARTIAL/FAILED ===
+=========END-SEND=========
+"""
+
+
 # ═══════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS — tìm context / PoC trong conversation
 # ═══════════════════════════════════════════════════════════════
@@ -703,13 +759,14 @@ class ExecAgent:
         allow_tool_loop: bool = False,
         artifact_prefix: str | None = None,
     ) -> str:
-        """Thực thi attack workflow — LOGIN rồi EXPLOIT theo bounded script shots.
+        """Thực thi attack workflow — LOGIN rồi EXPLOIT (hybrid: tool-loop hoặc script).
 
-        Phase 1 (LOGIN): Dùng Playwright deterministic login để lấy session cookie.
+        Phase 1 (LOGIN): Dùng Playwright/REST login để lấy session cookie.
         Phase 2 (EXPLOIT):
-          - Manager cấp shot budget hữu hạn (vd. 2-shot hoặc 3-shot).
-          - Mỗi shot: LLM viết/revise 1 Python exploit hoàn chỉnh → execute_command 1 lần → parse kết quả.
-          - Không tự rơi sang tool-loop trừ khi Manager bật rõ allow_tool_loop.
+          - DEFAULT: MCP tool-loop — Exec dùng tools adaptive (fetch, curl, browser)
+          - FALLBACK: Script-based — Gen Python exploit script (legacy mode)
+          - Chọn mode tự động dựa trên workflow/target characteristics
+        Phase 3 (PoC): Nếu EXPLOITED → gen Python PoC script reproduce.
 
         Args:
             workflow_text: Chiến lược tấn công từ Red Team (đã được Blue approve).
@@ -734,24 +791,215 @@ class ExecAgent:
             )
             session_cookie = ""
 
-        # ── Phase 2: EXPLOIT ──
+        # ── Phase 2: EXPLOIT (hybrid mode) ──
+        exploit_mode = self._choose_exploit_mode(workflow_text)
         print(
             f"\n{YELLOW}{BOLD}[EXEC-AGENT] Phase 2: EXPLOIT "
-            f"(python exploit mode, max_shots={max_script_shots}){RESET}"
-        )
-        exploit_result = self._run_script_shots(
-            workflow_text,
-            conversation,
-            session_cookie,
-            max_script_shots=max_script_shots,
-            allow_tool_loop=allow_tool_loop,
-            artifact_prefix=artifact_prefix,
+            f"(mode={exploit_mode}, max_shots={max_script_shots}){RESET}"
         )
 
-        combined = f"=== LOGIN PHASE ===\n{login_result}\n\n=== EXPLOIT PHASE ===\n{exploit_result}"
+        if exploit_mode == "tool_loop":
+            exploit_result = self._exploit_via_tools(
+                workflow_text, conversation, session_cookie,
+                artifact_prefix=artifact_prefix,
+            )
+        else:
+            # Legacy script-based mode
+            exploit_result = self._run_script_shots(
+                workflow_text,
+                conversation,
+                session_cookie,
+                max_script_shots=max_script_shots,
+                allow_tool_loop=allow_tool_loop,
+                artifact_prefix=artifact_prefix,
+            )
+
+        # ── Phase 3: PoC script generation (only when EXPLOITED) ──
+        poc_note = ""
+        lower_result = str(exploit_result or "").lower()
+        if "final: exploited" in lower_result or "shot_result: exploited" in lower_result:
+            print(f"\n{GREEN}{BOLD}[EXEC-AGENT] Phase 3: Generating PoC script...{RESET}")
+            poc_script = self._generate_poc_from_evidence(
+                workflow_text, exploit_result, session_cookie, artifact_prefix,
+            )
+            if poc_script:
+                poc_note = f"\n\n=== PoC SCRIPT ===\n{poc_script}"
+
+        combined = f"=== LOGIN PHASE ===\n{login_result}\n\n=== EXPLOIT PHASE ===\n{exploit_result}{poc_note}"
         if self.memory_store:
             self._save_workflow_result(combined)
         return combined
+
+    def _choose_exploit_mode(self, workflow_text: str) -> str:
+        """Choose exploit mode based on workflow/target characteristics.
+
+        Returns: 'tool_loop' | 'script_first'
+        """
+        lower = workflow_text.lower()
+
+        # Explicit markers from Red Team's EXECUTION GUIDE
+        if "approach: browser_first" in lower or "approach: mixed" in lower:
+            return "tool_loop"
+
+        # SPA target → tool_loop (needs browser for JS-rendered pages)
+        if getattr(self, "_is_spa", False):
+            return "tool_loop"
+
+        # Stateful / BLF workflows → tool_loop (adaptive is better)
+        stateful_markers = (
+            "stateful", "baseline", "before/after", "before and after",
+            "delta", "compare", "cart", "qty", "quantity", "checkout",
+            "transfer", "balance", "wallet", "total", "business logic",
+        )
+        if any(marker in lower for marker in stateful_markers):
+            return "tool_loop"
+
+        # EXECUTION GUIDE present → tool_loop (new format)
+        if "=== execution guide ===" in lower:
+            return "tool_loop"
+
+        # Simple API endpoint with api_first approach → script can work
+        if "approach: api_first" in lower:
+            return "script_first"
+
+        # Default: tool_loop (safer, more adaptive)
+        return "tool_loop"
+
+    def _exploit_via_tools(
+        self,
+        workflow_text: str,
+        conversation: list[dict] | None,
+        session_cookie: str,
+        *,
+        artifact_prefix: str | None = None,
+    ) -> str:
+        """Execute exploit strategy using MCP tool-loop (adaptive, browser-aware).
+
+        This is the NEW default exploit mode. Uses fetch/curl/browser tools
+        adaptively, following Red Team's EXECUTION GUIDE.
+        """
+        # Prepare auth context for prompt
+        bearer_token = ""
+        cookie_header = session_cookie or ""
+        auth_mechanism = "unknown"
+
+        # Try to load from auth_context.json
+        try:
+            context = load_auth_context(self.working_dir)
+            for session in context.get("sessions", []) or []:
+                bt = bearer_token_from_session(session)
+                if bt:
+                    bearer_token = bt
+                    auth_mechanism = "jwt_bearer"
+                    break
+                ch = cookie_header_from_cookie_objects(session.get("cookies") or [])
+                if ch:
+                    cookie_header = cookie_header or ch
+                    auth_mechanism = "cookie_session"
+        except Exception:
+            pass
+
+        if not auth_mechanism or auth_mechanism == "unknown":
+            if bearer_token:
+                auth_mechanism = "jwt_bearer"
+            elif cookie_header:
+                auth_mechanism = "cookie_session"
+
+        # Build system prompt
+        state_dir = ""
+        if artifact_prefix:
+            state_dir = os.path.join(self.working_dir, "exploit_state", artifact_prefix)
+            os.makedirs(state_dir, exist_ok=True)
+        else:
+            state_dir = os.path.join(self.working_dir, "exploit_state", "current")
+            os.makedirs(state_dir, exist_ok=True)
+
+        system_prompt = EXPLOIT_TOOL_LOOP_PROMPT.format(
+            bearer_token=bearer_token or "(none)",
+            cookie_header=cookie_header or "(none)",
+            auth_mechanism=auth_mechanism,
+            strategy=workflow_text,
+            max_rounds=15,
+        )
+
+        print(f"{YELLOW}[EXEC-AGENT] Tool-loop exploit — auth_mechanism={auth_mechanism}{RESET}")
+        if bearer_token:
+            print(f"{DIM}[EXEC-AGENT]   Bearer: {bearer_token[:25]}...{RESET}")
+        if cookie_header:
+            print(f"{DIM}[EXEC-AGENT]   Cookie: {cookie_header[:60]}...{RESET}")
+        print(f"{DIM}[EXEC-AGENT]   State dir: {state_dir}{RESET}")
+
+        # Run tool-loop
+        result = self._tool_loop(
+            system_prompt=system_prompt,
+            user_message=f"Thực thi exploit strategy cho target {self.target_url}.\nSTATE_DIR={state_dir}",
+            max_rounds=15,
+        )
+
+        return result
+
+    def _generate_poc_from_evidence(
+        self,
+        workflow_text: str,
+        exploit_log: str,
+        session_cookie: str,
+        artifact_prefix: str | None = None,
+    ) -> str:
+        """Generate a Python PoC script ONLY after tool-loop confirmed EXPLOITED.
+
+        The script reproduces the exact exploit path — no discovery needed.
+        """
+        # Trim exploit log to keep relevant parts
+        exploit_summary = truncate(exploit_log, 4000)
+
+        poc_prompt = f"""\
+Viết 1 Python script (requests library) REPRODUCE exploit đã verify thành công.
+
+== EXPLOIT LOG (đã verify EXPLOITED) ==
+{exploit_summary}
+
+== AUTH ==
+Cookie/Token: {session_cookie or '(none)'}
+Target: {self.target_url}
+
+== REQUIREMENTS ==
+1. Reproduce CHÍNH XÁC các requests đã thành công trong exploit log
+2. Dùng requests.Session() để giữ cookies
+3. In FINAL: EXPLOITED nếu reproduce thành công
+4. Lưu artifacts vào STATE_DIR (baseline.resp.txt, probe.resp.txt, result.json)
+5. KHÔNG khám phá thêm — chỉ reproduce exact requests từ log
+6. Script tối giản, chỉ cần chạy 1 lần để verify
+
+Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
+"""
+
+        try:
+            messages = [{"role": "system", "content": WORKFLOW_SCRIPT_PROMPT}]
+            messages.append({"role": "user", "content": poc_prompt})
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=3000,
+            )
+            text = response.choices[0].message.content or ""
+            # Extract Python code block
+            import re
+            match = re.search(r'```python\s*\n(.+?)```', text, re.DOTALL)
+            if match:
+                script = match.group(1)
+                # Save PoC script
+                poc_name = f"poc_{artifact_prefix or 'exploit'}.py"
+                poc_path = os.path.join(self.working_dir, poc_name)
+                with open(poc_path, "w", encoding="utf-8") as f:
+                    f.write(script)
+                print(f"{GREEN}[EXEC-AGENT] PoC script saved: {poc_path}{RESET}")
+                return script
+        except Exception as e:
+            print(f"{YELLOW}[EXEC-AGENT] PoC generation error: {e}{RESET}")
+
+        return ""
 
     def _should_start_iterative(
         self,
