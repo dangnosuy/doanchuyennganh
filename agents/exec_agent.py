@@ -1259,8 +1259,28 @@ Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
 
     @classmethod
     def _extract_execution_shot_plan(cls, workflow_text: str) -> str:
-        """Return the Manager-approved execution shot plan, if present."""
+        """Return the Manager-approved execution guide or shot plan, if present."""
         text = str(workflow_text or "")
+        
+        # 1. Try EXECUTION GUIDE (new format)
+        match = re.search(
+            r"===\s*EXECUTION GUIDE\s*===\s*(.*?)\s*===\s*END EXECUTION GUIDE\s*===",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group(1).strip()
+            
+        # 2. Try lenient EXECUTION GUIDE without END
+        match = re.search(
+            r"===\s*EXECUTION GUIDE\s*===\s*(.*)",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if match and "Approach:" in match.group(1):
+            return match.group(1).strip()
+
+        # 3. Try EXECUTION SHOT PLAN (legacy format)
         match = re.search(
             r"===\s*EXECUTION SHOT PLAN\s*===\s*(.*?)\s*===\s*END EXECUTION SHOT PLAN\s*===",
             text,
@@ -1269,7 +1289,7 @@ Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
         if match:
             return match.group(1).strip()
 
-        # Lenient fallback for older Red output that starts a shot plan but omits the end marker.
+        # 4. Lenient fallback for older Red output
         match = re.search(
             r"===\s*EXECUTION SHOT PLAN\s*===\s*(.*)",
             text,

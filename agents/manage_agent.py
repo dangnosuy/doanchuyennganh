@@ -430,12 +430,17 @@ def _is_valid_red_approach(content: str) -> bool:
         or "muc tieu:" in lower
         or "mục tiêu:" in lower
     )
-    has_shot_plan = "=== execution shot plan ===" in lower
-    return has_strategy and has_shot_plan
+    # Accept EXECUTION GUIDE (new format) OR EXECUTION SHOT PLAN (legacy)
+    has_plan = (
+        "=== execution guide ===" in lower
+        or "execution guide" in lower
+        or "=== execution shot plan ===" in lower
+    )
+    return has_strategy and has_plan
 
 
 def _get_last_valid_red_content(conversation: list[dict]) -> str:
-    """Return the most recent Red strategy that is non-empty and has a shot plan."""
+    """Return the most recent Red strategy that is non-empty and has an execution guide/shot plan."""
     for msg in reversed(conversation):
         if msg["speaker"] == "REDTEAM":
             clean = _strip_tag_display(msg["content"])
