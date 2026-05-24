@@ -42,6 +42,34 @@ def _log(msg: str):
     print(msg, file=sys.stderr)
 
 
+def _progress(msg: str):
+    """Render crawler progress on one stderr line for realtime CLI consumers."""
+    width = 140
+    clean = " ".join(str(msg or "").split())
+    if len(clean) > width:
+        clean = clean[: width - 3] + "..."
+    sys.stderr.write(clean.ljust(width) + "\r")
+    sys.stderr.flush()
+
+
+def _progress_done():
+    """Finish the current progress line before normal newline logs."""
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
+def _short_url(url: str) -> str:
+    """Return a compact endpoint display while preserving query strings."""
+    try:
+        parsed = urlparse(url)
+        endpoint = parsed.path or "/"
+        if parsed.query:
+            endpoint = f"{endpoint}?{parsed.query}"
+        return endpoint
+    except Exception:
+        return str(url or "")
+
+
 class BrowserAgent:
     """BFS web crawler with Playwright request/response interception."""
 
@@ -368,12 +396,19 @@ class BrowserAgent:
                 while queue and pages_visited < max_pages:
                     action = queue.popleft()
                     atype = action["type"]
+                    _progress(
+                        f"[CRAWLER-PROGRESS] round={round_num}/{max_rounds} "
+                        f"action={atype} pages={pages_visited}/{max_pages} "
+                        f"queue={len(queue)} requests={len(self.http_traffic)} "
+                        f"endpoint={_short_url(action.get('url', ''))}"
+                    )
 
                     if atype == "visit":
                         ok = await self._visit(page, action["url"], visited, queue, visited_actions, seen)
                         if ok:
                             pages_visited += 1
                         elif action["url"] == start_url and round_num == 1:
+                            _progress_done()
                             _log(f"[CRAWLER] Cannot reach {start_url}, aborting")
                             await browser.close()
                             return self.http_traffic, [], self.external_links
@@ -389,6 +424,7 @@ class BrowserAgent:
                             queue.append({"type": "visit", "url": disc_url})
                     self.discovered_from_requests.clear()
 
+                _progress_done()
                 _log(f"[CRAWLER] Round {round_num} done: {pages_visited} pages, {len(self.http_traffic)} requests")
 
             cookies = await context.cookies()

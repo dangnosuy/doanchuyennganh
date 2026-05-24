@@ -10,10 +10,12 @@ Usage:
 """
 
 import json
+import hashlib
 import os
 import re
 import sys
 import subprocess
+import threading
 from collections import Counter
 from html import unescape
 from pathlib import Path
@@ -55,7 +57,6 @@ SERVER_URL = os.getenv("MARL_SERVER_URL", "http://127.0.0.1:5000/v1")
 MODEL = os.getenv("MARL_CRAWL_MODEL", os.getenv("MARL_EXECUTOR_MODEL", "ollama/gemma4:31b-cloud"))
 TOOLCALL_MODEL = os.getenv("MARL_CRAWL_TOOLCALL_MODEL", os.getenv("MARL_TOOLCALL_MODEL", MODEL))
 DEBUG = os.getenv("MARL_DEBUG", "").lower() in ("1", "true", "yes")
-PROMPT_PATH = "prompts/crawl"
 
 # Colors
 YELLOW = "\033[93m"
@@ -82,6 +83,10 @@ RECON_FILE_INLINE_PREVIEW_LIMIT = 4000
 RECON_CONCRETE_URL_SAMPLE_LIMIT = 6
 RECON_ROUTE_CLUE_LIMIT = 8
 RECON_ROUTE_TABLE_LIMIT = 80
+DISCOVERY_CANDIDATE_LIMIT = 70
+DISCOVERY_BODY_SNIPPET_LIMIT = 2000
+DISCOVERY_TIMEOUT = 8
+DISCOVERY_METHODS = ("GET", "OPTIONS")
 RECON_ALLOWED_TOOL_NAMES = {
     "read_text_file",
     "write_file",
@@ -101,21 +106,33 @@ SECURITY_COOKIE_NAMES = {
     "session", "sessionid", "phpsessid", "jsessionid", "sid", "auth",
     "auth_token", "token", "csrf", "xsrf",
 }
+STATIC_PATH_EXTENSIONS = (
+    ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
+    ".woff", ".woff2", ".ttf", ".map", ".webp", ".mp4", ".pdf",
+)
+BAC_DISCOVERY_PATHS = (
+    "/admin", "/admin/", "/admin/dashboard", "/admin/users", "/admin/orders",
+    "/admin/products", "/admin/product", "/admin/settings", "/admin/manage",
+    "/administrator", "/management", "/manage", "/dashboard", "/console",
+    "/settings", "/users", "/user/list", "/accounts", "/roles",
+    "/api/users", "/api/admin/users", "/api/admin", "/api/v1/users",
+    "/api/v1/admin", "/api/v1/admin/users", "/internal/users",
+    "/internal/admin", "/internal/admin/users",
+)
+BLF_DISCOVERY_PATHS = (
+    "/cart", "/basket", "/checkout", "/orders", "/order", "/payment",
+    "/payments", "/transfer", "/wallet", "/balance", "/coupon", "/coupons",
+    "/discount", "/discounts", "/promo", "/promotions", "/invoice",
+    "/invoices", "/api/cart", "/api/checkout", "/api/orders",
+    "/api/payment", "/api/transfer", "/api/wallet", "/api/coupons",
+    "/api/v1/cart", "/api/v1/checkout", "/api/v1/orders",
+    "/api/v1/payment", "/api/v1/transfer", "/api/v1/wallet",
+    "/api/v1/coupons",
+)
 
 # Path to crawler CLI
 _CRAWLER_CLI = str(Path(__file__).resolve().parent.parent / "tools" / "crawler.py")
 
-
-def load_prompt(task: str) -> str:
-    try:
-        with open(f"{PROMPT_PATH}/{task}.md", "r") as f:
-            prompt = f.read()
-            if len(prompt) == 0:
-                raise Exception
-            return prompt
-    except:
-        print(f"{task}.md not found or empty. Script will now halt.")
-        exit(0)
 
 # ═══════════════════════════════════════════════════════════════
 # RECON SYSTEM PROMPT
@@ -387,6 +404,15 @@ class CrawlAgent:
                     max_rounds=1,
                     timeout=180,
                 )
+                if not data or not data.get("http_traffic"):
+                    print(f"{YELLOW}[CRAWL-AGENT] Auth browser crawl [{label}] rỗng — thử authenticated API fallback...{RESET}")
+                    data = self._api_discovery_fallback(url, auth_session=login_context, session_label=label)
+                    if data and data.get("http_traffic"):
+                        print(
+                            f"{GREEN}[CRAWL-AGENT] Auth API fallback [{label}]: "
+                            f"{len(data['http_traffic'])} requests{RESET}"
+                        )
+
                 if data:
                     auth_verified = self._auth_crawl_verified(anon_data, data) or bool(login_context.get("auth_verified"))
                     session_record = {
@@ -432,7 +458,16 @@ class CrawlAgent:
                             print(f"{YELLOW}[CRAWL-AGENT]   Auth crawl [{label}]: "
                                   f"{len(auth_urls)} URLs (anon had {len(anon_urls)}){RESET}")
                 else:
-                    print(f"{YELLOW}[CRAWL-AGENT] Auth crawl [{label}] returned no data{RESET}")
+                    print(f"{YELLOW}[CRAWL-AGENT] Auth crawl [{label}] returned no data — preserving auth context anyway{RESET}")
+                    session_record = {
+                        **login_context,
+                        "label": label,
+                        "cookies": login_cookies,
+                        "data": {"http_traffic": [], "cookies": login_cookies, "external_links": []},
+                        "auth_verified": bool(login_context.get("auth_verified")),
+                    }
+                    auth_sessions.append(session_record)
+                    self._persist_auth_context(url, session_record)
             else:
                 print(f"{YELLOW}[CRAWL-AGENT] ✗ Login [{label}] FAILED — skipping authenticated crawl{RESET}")
                 print(f"{YELLOW}[CRAWL-AGENT]   Pipeline will only have anonymous endpoints{RESET}")
@@ -440,12 +475,18 @@ class CrawlAgent:
         if not credentials_list:
             print(f"\n{DIM}[CRAWL-AGENT] Phase 2+3: No credentials, skipping login{RESET}")
 
-        # ── Phase 4: Lưu crawl data đầy đủ ──
-        self._save_crawl_data(url, anon_data, auth_sessions, focus)
+        # ── Phase 4: Active discovery for BAC/BLF route candidates ──
+        print(f"\n{YELLOW}{BOLD}══════════════════════════════════════════════════{RESET}")
+        print(f"{YELLOW}{BOLD}[CRAWL-AGENT] Phase 4: BAC/BLF DISCOVERY PROBES{RESET}")
+        print(f"{YELLOW}{BOLD}══════════════════════════════════════════════════{RESET}")
+        discovery_data = self._run_bac_blf_discovery(url, anon_data, auth_sessions, focus)
 
-        # ── Phase 5: Tóm tắt crawl data thành recon.md ──
-        print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 5: Recon summary...{RESET}")
-        recon_path = self._analyze(url, anon_data, auth_sessions, focus)
+        # ── Phase 5: Lưu crawl data đầy đủ ──
+        self._save_crawl_data(url, anon_data, auth_sessions, focus, discovery_data)
+
+        # ── Phase 6: Tóm tắt crawl data thành recon.md ──
+        print(f"\n{YELLOW}{BOLD}[CRAWL-AGENT] Phase 6: Recon summary...{RESET}")
+        recon_path = self._analyze(url, anon_data, auth_sessions, focus, discovery_data)
         print(f"\n{GREEN}[CRAWL-AGENT] Done — recon.md generated.{RESET}")
 
         return recon_path
@@ -494,6 +535,555 @@ class CrawlAgent:
 
         _debug(f"Extracted {len(new_urls)} new same-domain URLs for recrawl")
         return new_urls[:10]  # Limit to 10 new URLs per pass to avoid explosion
+
+    # ─── Internal: bounded BAC/BLF active discovery ───────────────
+
+    def _run_bac_blf_discovery(
+        self,
+        base_url: str,
+        anon_data: dict | None,
+        auth_sessions: list[dict],
+        focus: str = "",
+    ) -> dict:
+        """Probe a bounded read-only candidate set for BAC/BLF-relevant routes.
+
+        This phase is intentionally separate from normal crawl evidence:
+        guessed paths are recorded as discovery probes with provenance and only
+        promoted into raw endpoint evidence when the response indicates a real
+        route instead of a generic homepage/404 fallback.
+        """
+        candidates = self._build_bac_blf_discovery_candidates(base_url, anon_data, auth_sessions, focus)
+        contexts = self._build_discovery_contexts(auth_sessions)
+
+        result = {
+            "strategy": {
+                "name": "bounded_read_only_bac_blf_discovery",
+                "scope": "GET/OPTIONS only; no state-changing requests",
+                "covers": ["BAC", "BLF"],
+                "candidate_limit": DISCOVERY_CANDIDATE_LIMIT,
+                "methods": list(DISCOVERY_METHODS),
+                "notes": [
+                    "Candidates are not endpoint evidence until probed.",
+                    "Generic homepage/404/login fallbacks are not promoted.",
+                    "Tampered contexts are only used with read-only methods.",
+                ],
+            },
+            "candidates": candidates,
+            "contexts": [
+                {
+                    "label": ctx["label"],
+                    "type": ctx["type"],
+                    "source_session": ctx.get("source_session", ""),
+                    "tamper_notes": ctx.get("tamper_notes", []),
+                }
+                for ctx in contexts
+            ],
+            "probes": [],
+            "summary": {},
+        }
+
+        if not candidates:
+            result["summary"] = {"candidates": 0, "probes": 0, "route_exists": 0}
+            print(f"{DIM}[CRAWL-AGENT] Discovery skipped: no candidates{RESET}")
+            return result
+
+        print(
+            f"{DIM}[CRAWL-AGENT] Discovery strategy: read-only GET/OPTIONS, "
+            f"{len(candidates)} candidates, {len(contexts)} context(s){RESET}"
+        )
+
+        probes: list[dict] = []
+        progress_width = 150
+        total = len(candidates) * len(contexts) * len(DISCOVERY_METHODS)
+        done = 0
+
+        try:
+            with httpx.Client(timeout=DISCOVERY_TIMEOUT, follow_redirects=False, verify=False) as client:
+                baselines = {
+                    ctx["label"]: self._collect_discovery_baselines(client, base_url, ctx)
+                    for ctx in contexts
+                }
+
+                for candidate in candidates:
+                    path = candidate["path"]
+                    full_url = urljoin(base_url, path)
+                    for ctx in contexts:
+                        for method in DISCOVERY_METHODS:
+                            done += 1
+                            progress = (
+                                f"[DISCOVERY] {done}/{total} {method} {path} "
+                                f"context={ctx['label']}"
+                            )
+                            if len(progress) > progress_width:
+                                progress = progress[: progress_width - 3] + "..."
+                            sys.__stdout__.write("\r" + f"{DIM}{progress.ljust(progress_width)}{RESET}")
+                            sys.__stdout__.flush()
+
+                            try:
+                                headers = dict(ctx.get("headers") or {})
+                                headers.setdefault("Accept", "text/html,application/json,*/*")
+                                resp = client.request(method, full_url, headers=headers)
+                                probe = self._build_discovery_probe_record(
+                                    base_url=base_url,
+                                    candidate=candidate,
+                                    context=ctx,
+                                    method=method,
+                                    response=resp,
+                                    baseline=baselines.get(ctx["label"], {}),
+                                )
+                                probes.append(probe)
+                            except Exception as e:
+                                probes.append({
+                                    "method": method,
+                                    "path": path,
+                                    "url": full_url,
+                                    "context": ctx["label"],
+                                    "context_type": ctx["type"],
+                                    "candidate_sources": candidate.get("sources", []),
+                                    "candidate_reason": candidate.get("reason", ""),
+                                    "error": str(e),
+                                    "route_exists": False,
+                                    "classification": "request_error",
+                                    "bac_signals": [],
+                                    "blf_signals": [],
+                                })
+        finally:
+            sys.__stdout__.write("\r" + " " * (progress_width + 8) + "\r")
+            sys.__stdout__.flush()
+
+        route_exists_count = sum(1 for p in probes if p.get("route_exists"))
+        sensitive_count = sum(1 for p in probes if p.get("bac_signals") or p.get("blf_signals"))
+        interesting = [
+            p for p in probes
+            if p.get("route_exists") and (p.get("bac_signals") or p.get("blf_signals"))
+        ]
+        result["probes"] = probes
+        result["summary"] = {
+            "candidates": len(candidates),
+            "contexts": len(contexts),
+            "probes": len(probes),
+            "route_exists": route_exists_count,
+            "with_bac_or_blf_signals": sensitive_count,
+            "promotable": len(interesting),
+        }
+
+        print(
+            f"{GREEN}[CRAWL-AGENT] Discovery complete: {route_exists_count} route-like responses, "
+            f"{sensitive_count} BAC/BLF signal(s){RESET}"
+        )
+        for probe in interesting[:10]:
+            signals = ", ".join((probe.get("bac_signals") or []) + (probe.get("blf_signals") or []))
+            print(
+                f"{GREEN}[CRAWL-AGENT]   [DISCOVERED] {probe.get('method')} {probe.get('path')} "
+                f"ctx={probe.get('context')} status={probe.get('status')} signals={signals}{RESET}"
+            )
+        return result
+
+    def _build_bac_blf_discovery_candidates(
+        self,
+        base_url: str,
+        anon_data: dict | None,
+        auth_sessions: list[dict],
+        focus: str = "",
+    ) -> list[dict]:
+        """Build bounded candidates from playbook seeds plus observed app clues."""
+        base_host = urlparse(base_url).netloc
+        observed_paths = self._observed_paths_from_crawl(anon_data, auth_sessions)
+        candidates: dict[str, dict] = {}
+
+        def add_candidate(path: str, source: str, reason: str) -> None:
+            normalized = self._normalize_discovery_path(base_url, path)
+            if not normalized:
+                return
+            parsed = urlparse(urljoin(base_url, normalized))
+            if parsed.netloc and parsed.netloc != base_host:
+                return
+            if parsed.path in observed_paths and "observed" not in source:
+                return
+            if parsed.path.lower().endswith(STATIC_PATH_EXTENSIONS):
+                return
+            entry = candidates.setdefault(normalized, {
+                "path": normalized,
+                "sources": [],
+                "reason": "",
+            })
+            if source not in entry["sources"]:
+                entry["sources"].append(source)
+            if reason and reason not in entry["reason"]:
+                entry["reason"] = (entry["reason"] + "; " + reason).strip("; ")
+
+        focus_lower = (focus or "").lower()
+        seed_reason = "bounded playbook seed for BAC/admin forced-browsing discovery"
+        for path in BAC_DISCOVERY_PATHS:
+            add_candidate(path, "bac_seed", seed_reason)
+
+        blf_reason = "bounded playbook seed for BLF workflow/state discovery"
+        for path in BLF_DISCOVERY_PATHS:
+            add_candidate(path, "blf_seed", blf_reason)
+
+        if "bac" in focus_lower or "access" in focus_lower or "admin" in focus_lower:
+            for path in BAC_DISCOVERY_PATHS:
+                add_candidate(path, "focus_bac", "user focus mentions BAC/access/admin")
+        if "blf" in focus_lower or "logic" in focus_lower or "business" in focus_lower:
+            for path in BLF_DISCOVERY_PATHS:
+                add_candidate(path, "focus_blf", "user focus mentions BLF/business logic")
+
+        for path, source_url in self._extract_candidate_paths_from_crawl(base_url, anon_data, auth_sessions):
+            add_candidate(path, "observed_link_or_script", f"path string observed in {source_url}")
+
+        observed_text = self._combined_response_text(anon_data, auth_sessions).lower()
+        if any(token in observed_text for token in ("admin", "isadmin", "is_admin", "role", "privilege")):
+            for path in BAC_DISCOVERY_PATHS:
+                add_candidate(path, "html_or_js_bac_signal", "admin/role keyword observed in crawled response")
+        if any(token in observed_text for token in ("cart", "checkout", "coupon", "discount", "order", "payment", "transfer", "balance")):
+            for path in BLF_DISCOVERY_PATHS:
+                add_candidate(path, "html_or_js_blf_signal", "workflow/commerce keyword observed in crawled response")
+
+        ranked = sorted(
+            candidates.values(),
+            key=lambda item: (
+                0 if any(src.startswith("observed") for src in item["sources"]) else 1,
+                0 if any(src.startswith("html_or_js") for src in item["sources"]) else 1,
+                item["path"].count("/"),
+                item["path"],
+            ),
+        )
+        return ranked[:DISCOVERY_CANDIDATE_LIMIT]
+
+    @staticmethod
+    def _normalize_discovery_path(base_url: str, raw_path: str) -> str:
+        text = str(raw_path or "").strip()
+        if not text or text.startswith(("mailto:", "tel:", "javascript:", "#")):
+            return ""
+        text = unescape(text).strip("\"'")
+        full = urljoin(base_url, text)
+        parsed = urlparse(full)
+        path = parsed.path or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        return path
+
+    @classmethod
+    def _observed_paths_from_crawl(cls, anon_data: dict | None, auth_sessions: list[dict]) -> set[str]:
+        paths: set[str] = set()
+
+        def feed(data: dict | None) -> None:
+            if not data:
+                return
+            for record in data.get("http_traffic", []) or []:
+                url_str = record.get("url")
+                if not url_str:
+                    continue
+                paths.add(urlparse(url_str).path or "/")
+
+        feed(anon_data)
+        for session in auth_sessions or []:
+            feed(session.get("data"))
+        return paths
+
+    @classmethod
+    def _combined_response_text(cls, anon_data: dict | None, auth_sessions: list[dict]) -> str:
+        chunks: list[str] = []
+
+        def feed(data: dict | None) -> None:
+            if not data:
+                return
+            for record in data.get("http_traffic", []) or []:
+                body = record.get("response_body")
+                if body:
+                    chunks.append(str(body)[:5000])
+
+        feed(anon_data)
+        for session in auth_sessions or []:
+            feed(session.get("data"))
+        return "\n".join(chunks)
+
+    @classmethod
+    def _extract_candidate_paths_from_crawl(
+        cls,
+        base_url: str,
+        anon_data: dict | None,
+        auth_sessions: list[dict],
+    ) -> list[tuple[str, str]]:
+        """Extract same-origin path strings from HTML/JS without calling them facts."""
+        base_host = urlparse(base_url).netloc
+        found: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        attr_re = re.compile(r"""(?:href|src|action)\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+        js_path_re = re.compile(
+            r"""["'](/(?:api|admin|manage|dashboard|orders?|cart|checkout|payment|transfer|wallet|coupon|discount|users?)[^"' <>)\\]*)["']""",
+            re.IGNORECASE,
+        )
+
+        def feed(data: dict | None) -> None:
+            if not data:
+                return
+            for record in data.get("http_traffic", []) or []:
+                source_url = record.get("url") or base_url
+                body = record.get("response_body") or ""
+                if not body:
+                    continue
+                for match in list(attr_re.findall(body)) + list(js_path_re.findall(body)):
+                    full = urljoin(source_url, match)
+                    parsed = urlparse(full)
+                    if parsed.netloc and parsed.netloc != base_host:
+                        continue
+                    path = parsed.path or "/"
+                    if path.lower().endswith(STATIC_PATH_EXTENSIONS):
+                        continue
+                    if parsed.query:
+                        path = f"{path}?{parsed.query}"
+                    if path not in seen:
+                        seen.add(path)
+                        found.append((path, source_url))
+
+        feed(anon_data)
+        for session in auth_sessions or []:
+            feed(session.get("data"))
+        return found[:80]
+
+    @classmethod
+    def _build_discovery_contexts(cls, auth_sessions: list[dict]) -> list[dict]:
+        contexts = [{
+            "label": "anonymous",
+            "type": "anonymous",
+            "headers": {},
+            "source_session": "",
+            "tamper_notes": [],
+        }]
+
+        for session in (auth_sessions or [])[:2]:
+            label = str(session.get("label", "auth") or "auth")
+            cookies = session.get("cookies") or []
+            token = session.get("bearer_token") or bearer_token_from_session(session)
+            if token:
+                contexts.append({
+                    "label": f"auth:{label}:bearer",
+                    "type": "authenticated_bearer",
+                    "headers": {"Authorization": f"Bearer {token}"},
+                    "source_session": label,
+                    "tamper_notes": [],
+                })
+
+            cookie_header = cookie_header_from_cookie_objects(cookies)
+            if cookie_header:
+                contexts.append({
+                    "label": f"auth:{label}",
+                    "type": "authenticated",
+                    "headers": {"Cookie": cookie_header},
+                    "source_session": label,
+                    "tamper_notes": [],
+                })
+
+            tampered, notes = cls._tamper_identity_cookies(cookies)
+            tampered_header = cookie_header_from_cookie_objects(tampered)
+            if tampered_header and notes and tampered_header != cookie_header:
+                contexts.append({
+                    "label": f"tampered:{label}",
+                    "type": "tampered_identity_cookie",
+                    "headers": {"Cookie": tampered_header},
+                    "source_session": label,
+                    "tamper_notes": notes,
+                })
+
+        return contexts
+
+    @staticmethod
+    def _tamper_identity_cookies(cookies: list[dict]) -> tuple[list[dict], list[str]]:
+        tampered: list[dict] = []
+        notes: list[str] = []
+        for cookie in cookies or []:
+            if not isinstance(cookie, dict):
+                continue
+            c = dict(cookie)
+            name = str(c.get("name", "") or "")
+            value = str(c.get("value", "") or "")
+            lower = name.lower()
+            new_value = value
+            if lower in {"role", "roles", "privilege", "permission"} and value.lower() not in {"admin", "administrator"}:
+                new_value = "admin"
+            elif lower in {"is_admin", "isadmin", "admin"} and value.lower() not in {"1", "true", "yes"}:
+                new_value = "true"
+            elif lower in {"user_id", "userid", "uid", "account_id", "accountid"} and value.isdigit() and value != "1":
+                new_value = "1"
+
+            if new_value != value:
+                c["value"] = new_value
+                notes.append(f"{name}={value} -> {new_value}")
+            tampered.append(c)
+        return tampered, notes
+
+    @staticmethod
+    def _response_signature(text: str) -> str:
+        normalized = re.sub(r"\s+", " ", CrawlAgent._clean_html_text(text or "").lower()).strip()
+        return hashlib.sha256(normalized[:1200].encode("utf-8", "ignore")).hexdigest()
+
+    def _collect_discovery_baselines(
+        self,
+        client: httpx.Client,
+        base_url: str,
+        context: dict,
+    ) -> dict:
+        headers = dict(context.get("headers") or {})
+        headers.setdefault("Accept", "text/html,application/json,*/*")
+        baselines: dict[str, dict] = {}
+        baseline_paths = {
+            "home": "/",
+            "missing": "/__marl_missing_probe_404__",
+        }
+        for name, path in baseline_paths.items():
+            try:
+                resp = client.get(urljoin(base_url, path), headers=headers)
+                baselines[name] = {
+                    "status": resp.status_code,
+                    "location": resp.headers.get("location", ""),
+                    "signature": self._response_signature(resp.text),
+                    "content_type": resp.headers.get("content-type", ""),
+                }
+            except Exception:
+                baselines[name] = {}
+        return baselines
+
+    def _build_discovery_probe_record(
+        self,
+        base_url: str,
+        candidate: dict,
+        context: dict,
+        method: str,
+        response: httpx.Response,
+        baseline: dict,
+    ) -> dict:
+        path = candidate["path"]
+        text = response.text or ""
+        content_type = response.headers.get("content-type", "")
+        signature = self._response_signature(text)
+        status = response.status_code
+        location = response.headers.get("location", "")
+
+        classification, route_exists = self._classify_discovery_response(
+            method=method,
+            status=status,
+            location=location,
+            signature=signature,
+            content_type=content_type,
+            body=text,
+            baseline=baseline,
+        )
+        bac_signals, blf_signals = self._extract_probe_security_signals(path, text, content_type)
+
+        return {
+            "method": method,
+            "path": path,
+            "url": str(response.request.url),
+            "context": context["label"],
+            "context_type": context["type"],
+            "source_session": context.get("source_session", ""),
+            "tamper_notes": context.get("tamper_notes", []),
+            "candidate_sources": candidate.get("sources", []),
+            "candidate_reason": candidate.get("reason", ""),
+            "status": status,
+            "redirect_location": location,
+            "content_type": content_type,
+            "classification": classification,
+            "route_exists": route_exists,
+            "bac_signals": bac_signals,
+            "blf_signals": blf_signals,
+            "response": {
+                "headers": {
+                    k: v for k, v in response.headers.items()
+                    if k.lower() in ("content-type", "location", "set-cookie", "www-authenticate", "allow")
+                },
+                "body_snippet": text[:DISCOVERY_BODY_SNIPPET_LIMIT],
+                "body_size": len(text),
+                "body_signature": signature,
+            },
+            "request": {
+                "headers": {
+                    k: v for k, v in (context.get("headers") or {}).items()
+                    if k.lower() in ("cookie", "authorization")
+                },
+                "body": None,
+            },
+        }
+
+    @staticmethod
+    def _classify_discovery_response(
+        method: str,
+        status: int,
+        location: str,
+        signature: str,
+        content_type: str,
+        body: str,
+        baseline: dict,
+    ) -> tuple[str, bool]:
+        method = str(method or "GET").upper()
+        lower_body = (body or "").lower()
+        home_sig = (baseline.get("home") or {}).get("signature", "")
+        missing = baseline.get("missing") or {}
+        missing_sig = missing.get("signature", "")
+        missing_status = missing.get("status")
+        missing_location = missing.get("location", "")
+
+        if method == "OPTIONS":
+            if status in {401, 403, 405}:
+                return "options_protected_or_method_limited_signal", False
+            return "options_preflight_signal", False
+        if status == 404:
+            return "not_found", False
+        if status >= 500 and "unexpected path:" in lower_body:
+            return "framework_unexpected_path_fallback", False
+        if missing_status and status == missing_status and signature and signature == missing_sig:
+            return "same_as_missing_baseline", False
+        if status in {301, 302, 303, 307, 308}:
+            loc_lower = (location or "").lower()
+            if missing_status == status and location == missing_location:
+                return "same_redirect_as_missing_baseline", False
+            if any(token in loc_lower for token in ("login", "signin", "auth")):
+                return "auth_redirect_route_candidate", True
+            return "redirect_route_candidate", True
+        if status in {401, 403, 405}:
+            return "protected_or_method_limited_route", True
+        if status >= 500:
+            return "server_error_signal", False
+        if 200 <= status < 300:
+            if signature and home_sig and signature == home_sig and "json" not in content_type.lower():
+                return "generic_homepage_fallback", False
+            return "live_response", True
+        return "other_response", False
+
+    @staticmethod
+    def _extract_probe_security_signals(
+        path: str,
+        body: str,
+        content_type: str,
+    ) -> tuple[list[str], list[str]]:
+        text = f"{path}\n{body[:5000]}".lower()
+        bac_signals: list[str] = []
+        blf_signals: list[str] = []
+
+        def add(target: list[str], value: str) -> None:
+            if value not in target:
+                target.append(value)
+
+        if any(token in text for token in ("admin", "administrator", "management", "privilege", "role", "is_admin")):
+            add(bac_signals, "admin_or_role_surface")
+        if any(token in text for token in ("users", "user list", "email", "role")) and any(token in text for token in ("admin", "user_id", "id")):
+            add(bac_signals, "user_or_role_data_surface")
+        if "json" in content_type.lower() and any(token in text for token in ("email", "role", "password", "token", "user_id")):
+            add(bac_signals, "sensitive_json_identity_fields")
+        if any(token in text for token in ("profile", "account", "user_id", "account_id")):
+            add(bac_signals, "account_or_object_reference_surface")
+
+        if any(token in text for token in ("cart", "basket", "checkout", "quantity", "coupon", "discount")):
+            add(blf_signals, "cart_checkout_or_discount_surface")
+        if any(token in text for token in ("order", "invoice", "payment", "transfer", "wallet", "balance", "amount", "price")):
+            add(blf_signals, "order_payment_or_value_surface")
+        if any(token in text for token in ("stock", "inventory", "shipping", "status", "cancel", "refund")):
+            add(blf_signals, "workflow_state_surface")
+
+        return bac_signals, blf_signals
 
     def recrawl_new_urls(self, new_urls: list[str], cookie_header: str | None = None) -> dict | None:
         """Recrawl additional URLs discovered during analysis.
@@ -581,15 +1171,17 @@ class CrawlAgent:
         raw_crawl_path = os.path.join(self.working_dir, "crawl_raw.json")
         anon_data = None
         auth_sessions: list[dict] = []
+        discovery_data: dict | None = None
         if os.path.isfile(raw_crawl_path):
             try:
                 raw_payload = json.loads(Path(raw_crawl_path).read_text(encoding="utf-8"))
                 anon_data = raw_payload.get("anonymous")
                 auth_sessions = raw_payload.get("authenticated", []) or []
+                discovery_data = raw_payload.get("discovery_probes") or None
             except Exception as e:
                 print(f"{YELLOW}[CRAWL-AGENT] Could not parse saved crawl_raw.json: {e}{RESET}")
 
-        return self._analyze(url, anon_data, auth_sessions, focus)
+        return self._analyze(url, anon_data, auth_sessions, focus, discovery_data)
 
     # ─── Internal: Run crawler CLI ───────────────────────────────
 
@@ -623,26 +1215,105 @@ class CrawlAgent:
             _debug(f"Storage state path: {storage_state_path}")
         print(f"{DIM}[CRAWL-AGENT] Running: {' '.join(cmd[:6])}...{RESET}")
 
+        progress_width = 140
+        progress_active = False
+
+        def _terminal_progress(line: str) -> None:
+            nonlocal progress_active
+            clean = line.replace("[CRAWLER-PROGRESS]", "Crawling").strip()
+            if len(clean) > progress_width:
+                clean = clean[: progress_width - 3] + "..."
+            sys.__stdout__.write("\r" + f"{DIM}  {clean.ljust(progress_width)}{RESET}")
+            sys.__stdout__.flush()
+            progress_active = True
+
+        def _clear_terminal_progress() -> None:
+            nonlocal progress_active
+            if not progress_active:
+                return
+            sys.__stdout__.write("\r" + " " * (progress_width + 8) + "\r")
+            sys.__stdout__.flush()
+            progress_active = False
+
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout + 30,  # extra buffer over crawler timeout
                 cwd=_PROJECT_ROOT,
+                bufsize=1,
             )
 
-            # Show stderr logs
-            if result.stderr:
-                for line in result.stderr.strip().split("\n"):
-                    print(f"{DIM}  {line}{RESET}")
+            stdout_chunks: list[str] = []
 
-            if result.returncode != 0:
-                print(f"{YELLOW}[CRAWL-AGENT] Crawler exited with code {result.returncode}{RESET}")
+            def _read_stdout() -> None:
+                if proc.stdout is None:
+                    return
+                for chunk in iter(lambda: proc.stdout.read(8192), ""):
+                    if not chunk:
+                        break
+                    stdout_chunks.append(chunk)
+
+            def _read_stderr() -> None:
+                if proc.stderr is None:
+                    return
+                buf = ""
+                for ch in iter(lambda: proc.stderr.read(1), ""):
+                    if ch == "\r":
+                        line = buf.strip()
+                        buf = ""
+                        if line:
+                            if line.startswith("[CRAWLER-PROGRESS]"):
+                                _terminal_progress(line)
+                            else:
+                                _clear_terminal_progress()
+                                print(f"{DIM}  {line}{RESET}")
+                    elif ch == "\n":
+                        line = buf.strip()
+                        buf = ""
+                        if not line:
+                            continue
+                        if line.startswith("[CRAWLER-PROGRESS]"):
+                            _terminal_progress(line)
+                        else:
+                            _clear_terminal_progress()
+                            print(f"{DIM}  {line}{RESET}")
+                    else:
+                        buf += ch
+                line = buf.strip()
+                if line:
+                    if line.startswith("[CRAWLER-PROGRESS]"):
+                        _terminal_progress(line)
+                    else:
+                        _clear_terminal_progress()
+                        print(f"{DIM}  {line}{RESET}")
+
+            stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
+            stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+
+            try:
+                proc.wait(timeout=timeout + 30)  # extra buffer over crawler timeout
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+                _clear_terminal_progress()
+                print(f"{RED}[CRAWL-AGENT] Crawler timed out after {timeout + 30}s{RESET}")
+                return None
+
+            stdout_thread.join(timeout=5)
+            stderr_thread.join(timeout=5)
+            _clear_terminal_progress()
+
+            if proc.returncode != 0:
+                print(f"{YELLOW}[CRAWL-AGENT] Crawler exited with code {proc.returncode}{RESET}")
 
             # Parse JSON stdout
-            if result.stdout.strip():
-                data = json.loads(result.stdout)
+            stdout_text = "".join(stdout_chunks)
+            if stdout_text.strip():
+                data = json.loads(stdout_text)
                 n_traffic = len(data.get("http_traffic", []))
                 n_cookies = len(data.get("cookies", []))
                 n_external = len(data.get("external_links", []))
@@ -678,13 +1349,12 @@ class CrawlAgent:
                 print(f"{YELLOW}[CRAWL-AGENT] No output from crawler{RESET}")
                 return None
 
-        except subprocess.TimeoutExpired:
-            print(f"{RED}[CRAWL-AGENT] Crawler timed out after {timeout + 30}s{RESET}")
-            return None
         except json.JSONDecodeError as e:
+            _clear_terminal_progress()
             print(f"{RED}[CRAWL-AGENT] Failed to parse crawler JSON: {e}{RESET}")
             return None
         except Exception as e:
+            _clear_terminal_progress()
             print(f"{RED}[CRAWL-AGENT] Crawler error: {e}{RESET}")
             return None
 
@@ -730,7 +1400,12 @@ class CrawlAgent:
 
     # ─── Internal: API discovery fallback ─────────────────────────
 
-    def _api_discovery_fallback(self, url: str) -> dict | None:
+    def _api_discovery_fallback(
+        self,
+        url: str,
+        auth_session: dict | None = None,
+        session_label: str = "anonymous",
+    ) -> dict | None:
         """Probe common REST API patterns when browser crawler fails.
 
         This is a lightweight HTTP-only fallback for SPA targets where the
@@ -767,11 +1442,20 @@ class CrawlAgent:
         traffic = []
         discovered_urls = set()
 
+        auth_headers: dict[str, str] = {}
+        if auth_session:
+            token = auth_session.get("bearer_token") or bearer_token_from_session(auth_session)
+            if token:
+                auth_headers["Authorization"] = f"Bearer {token}"
+            cookie_header = auth_session.get("cookie_header") or cookie_header_from_cookie_objects(auth_session.get("cookies") or [])
+            if cookie_header:
+                auth_headers["Cookie"] = cookie_header
+
         try:
             with httpx.Client(timeout=8, follow_redirects=True, verify=False) as client:
                 # 1. First check homepage for embedded API hints
                 try:
-                    home_resp = client.get(url)
+                    home_resp = client.get(url, headers=auth_headers or None)
                     home_body = home_resp.text
 
                     # Extract API URLs from JavaScript source
@@ -802,13 +1486,14 @@ class CrawlAgent:
                             discovered_urls.add(probe_url)
 
                 # 4. Actually probe each URL
-                print(f"{DIM}[CRAWL-AGENT] API fallback: probing {len(discovered_urls)} endpoints...{RESET}")
+                mode_note = f" [{session_label}]" if session_label != "anonymous" else ""
+                print(f"{DIM}[CRAWL-AGENT] API fallback{mode_note}: probing {len(discovered_urls)} endpoints...{RESET}")
                 for probe_url in sorted(discovered_urls):
                     try:
-                        resp = client.get(probe_url)
+                        resp = client.get(probe_url, headers=auth_headers or None)
                         content_type = resp.headers.get("content-type", "")
                         body = None
-                        if resp.status_code < 400:
+                        if resp.status_code < 500:
                             body = resp.text[:12000] if resp.text else None
 
                         traffic.append({
@@ -846,14 +1531,16 @@ class CrawlAgent:
 
         # Filter out 404s — only keep endpoints that actually exist
         useful_traffic = [t for t in traffic if t.get("response_status") and t["response_status"] < 404]
-        print(f"{GREEN}[CRAWL-AGENT] API fallback: {len(useful_traffic)} live endpoints found "
+        mode_note = f" [{session_label}]" if session_label != "anonymous" else ""
+        print(f"{GREEN}[CRAWL-AGENT] API fallback{mode_note}: {len(useful_traffic)} live endpoints found "
               f"(out of {len(traffic)} probed){RESET}")
 
         # ── Auth endpoint probing: fingerprint login/register mechanisms ──
-        auth_fingerprint = self._probe_auth_endpoints(url, useful_traffic)
-        if auth_fingerprint:
-            self._auth_fingerprint = auth_fingerprint
-            print(f"{GREEN}[CRAWL-AGENT] Auth fingerprint: {len(auth_fingerprint)} auth endpoint(s) probed{RESET}")
+        if not auth_session:
+            auth_fingerprint = self._probe_auth_endpoints(url, useful_traffic)
+            if auth_fingerprint:
+                self._auth_fingerprint = auth_fingerprint
+                print(f"{GREEN}[CRAWL-AGENT] Auth fingerprint: {len(auth_fingerprint)} auth endpoint(s) probed{RESET}")
 
         return {
             "http_traffic": useful_traffic,
@@ -1899,8 +2586,9 @@ class CrawlAgent:
         anon_data: dict | None,
         auth_sessions: list[dict],
         focus: str = "",
+        discovery_data: dict | None = None,
     ) -> str:
-        """Send crawl data to LLM, let it write recon.md via tools.
+        """Render recon.md from crawl/discovery facts without endpoint invention.
 
         Args:
             auth_sessions: list of {"label": str, "cookies": list, "data": dict}
@@ -1912,113 +2600,233 @@ class CrawlAgent:
         """
         recon_path = os.path.join(self.working_dir, "recon.md")
         raw_crawl_path = os.path.join(self.working_dir, "crawl_raw.json")
-        crawl_data_path = os.path.join(self.working_dir, "crawl_data.txt")
-        auth_ctx_path = auth_context_path(self.working_dir)
 
-        # Build a compact manifest and let the agent read the full crawl files directly.
-        parts = []
-        parts.append("=== RECON JOB ===")
-        parts.append(f"TARGET: {url}")
-        parts.append(f"WORKSPACE: {self.working_dir}")
-        parts.append(f"OUTPUT FILE: {recon_path}")
-        parts.append(f"CRAWL DATA FILE: {crawl_data_path}")
-        parts.append(f"RAW CRAWL JSON FILE: {raw_crawl_path}")
-        parts.append(f"AUTH CONTEXT FILE: {auth_ctx_path}")
-        if focus:
-            parts.append(f"FOCUS: {focus}")
-        if anon_data:
-            parts.append(f"ANONYMOUS REQUESTS: {len(anon_data.get('http_traffic', []))}")
-        if auth_sessions:
-            labels = ", ".join(s["label"] for s in auth_sessions)
-            parts.append(f"AUTHENTICATED SESSIONS: {labels}")
-        for session in auth_sessions:
-            label = session["label"]
-            auth_verified = session.get("auth_verified", False)
-            req_count = len(session.get("data", {}).get("http_traffic", []))
-            parts.append(
-                f"- session={label} requests={req_count} auth_verified={auth_verified} "
-                f"storage_state={bool(session.get('storage_state_path'))} "
-                f"token={bool(session.get('bearer_token') or bearer_token_from_session(session))}"
-            )
-
-        if not anon_data and not auth_sessions:
-            parts.append("WARNING: No crawl data available. Write a minimal report noting the failure.")
-        parts.append("")
-        parts.append("MANDATORY:")
-        parts.append(f"1. Read full crawl data from {crawl_data_path}")
-        parts.append(f"2. If needed, read full raw JSON from {raw_crawl_path}")
-        parts.append(f"3. Write the final markdown report to {recon_path}")
-        parts.append("4. Include endpoint inventory, endpoint details, forms, params, response clues, and BAC/BLF attack surface.")
-        parts.append("5. Pay special attention to client-controlled cookies/state such as role, user_id, is_admin, account_id.")
-        parts.append("6. Do not call shell commands such as cat, wc, jq, grep, sed. Use read_text_file/write_file only.")
-        parts.append("7. Read each crawl artifact at most once, then write recon.md and finish with [DONE].")
-        parts.append("8. CRITICAL: If AUTH ENDPOINT FINGERPRINT section exists in crawl_data.txt, include a "
-                     "'## Auth Mechanism Discovery' section in recon.md with: "
-                     "(a) verified login endpoint path, method, Content-Type, body fields; "
-                     "(b) auth mechanism type (JWT bearer vs cookie session); "
-                     "(c) token extraction location (e.g. body.authentication.token); "
-                     "(d) raw request/response examples for login and register endpoints. "
-                     "This is ESSENTIAL for exploit agents to authenticate correctly.")
-        parts.append("")
-        parts.append("Quick preview from crawl_data.txt:")
+        raw_payload: dict = {}
         try:
-            preview = Path(crawl_data_path).read_text(encoding="utf-8")
-            parts.append(truncate(preview, RECON_FILE_INLINE_PREVIEW_LIMIT))
+            raw_payload = json.loads(Path(raw_crawl_path).read_text(encoding="utf-8"))
         except Exception as e:
-            parts.append(f"(Could not read preview: {e})")
+            print(f"{YELLOW}[CRAWL-AGENT] Could not read crawl_raw.json for recon render: {e}{RESET}")
+            raw_payload = {
+                "target": url,
+                "raw_endpoints": self._extract_raw_endpoints(anon_data, auth_sessions),
+                "discovery_probes": discovery_data or {},
+            }
 
-        messages = [
-            {"role": "system", "content": RECON_SYSTEM_PROMPT},
-            {"role": "user", "content": "\n".join(parts)},
-        ]
+        if discovery_data and not raw_payload.get("discovery_probes"):
+            raw_payload["discovery_probes"] = discovery_data
 
-        self._tool_loop(
-            messages,
-            max_rounds=RECON_TOOL_ROUNDS,
-            allowed_tool_names=RECON_ALLOWED_TOOL_NAMES,
+        report = self._render_fact_recon_report(
+            url=url,
+            anon_data=anon_data,
+            auth_sessions=auth_sessions,
+            focus=focus,
+            raw_payload=raw_payload,
         )
-
-        structured_appendix = self._render_structured_recon_appendix(anon_data, auth_sessions)
-
-        # Verify recon.md was created
-        if os.path.exists(recon_path):
-            size = os.path.getsize(recon_path)
-            if structured_appendix:
-                try:
-                    existing = Path(recon_path).read_text(encoding="utf-8")
-                    if "## Structured Route Families" not in existing:
-                        merged = existing.rstrip() + "\n\n" + structured_appendix
-                        Path(recon_path).write_text(merged, encoding="utf-8")
-                        size = os.path.getsize(recon_path)
-                    elif "## Client-Controlled State / Cookie Attack Surface" not in existing:
-                        cookie_appendix = self._render_cookie_recon_appendix(auth_sessions)
-                        if cookie_appendix:
-                            merged = existing.rstrip() + "\n\n" + cookie_appendix
-                            Path(recon_path).write_text(merged, encoding="utf-8")
-                            size = os.path.getsize(recon_path)
-                except Exception as e:
-                    print(f"{YELLOW}[CRAWL-AGENT] Could not append structured recon appendix: {e}{RESET}")
-            print(f"{GREEN}{BOLD}[CRAWL-AGENT] recon.md written: {recon_path} ({size} bytes){RESET}")
-        else:
-            # Fallback: write a basic report ourselves
-            print(f"{YELLOW}[CRAWL-AGENT] LLM did not write recon.md, creating fallback...{RESET}")
-            with open(recon_path, "w") as f:
-                f.write(f"# Recon Report — {url}\n\n")
-                f.write("LLM analysis failed to produce output.\n\n")
-                f.write("## Crawl Data Preview\n\n")
-                try:
-                    f.write(truncate(
-                        Path(crawl_data_path).read_text(encoding="utf-8"),
-                        RECON_FILE_INLINE_PREVIEW_LIMIT,
-                    ))
-                except Exception as e:
-                    f.write(f"(Could not read crawl_data.txt: {e})\n")
-                if structured_appendix:
-                    f.write("\n\n")
-                    f.write(structured_appendix)
-            print(f"{GREEN}[CRAWL-AGENT] Fallback recon.md written: {recon_path}{RESET}")
+        Path(recon_path).write_text(report, encoding="utf-8")
+        size = os.path.getsize(recon_path)
+        print(f"{GREEN}{BOLD}[CRAWL-AGENT] deterministic recon.md written: {recon_path} ({size} bytes){RESET}")
 
         return recon_path
+
+    def _render_fact_recon_report(
+        self,
+        url: str,
+        anon_data: dict | None,
+        auth_sessions: list[dict],
+        focus: str,
+        raw_payload: dict,
+    ) -> str:
+        """Build recon.md from structured crawl artifacts only."""
+        raw_endpoints = raw_payload.get("raw_endpoints") or []
+        discovery_data = raw_payload.get("discovery_probes") or {}
+        discovery_summary = discovery_data.get("summary") or {}
+        auth_fp = raw_payload.get("auth_fingerprint") or getattr(self, "_auth_fingerprint", [])
+
+        lines: list[str] = []
+        lines.append(f"# Recon Report - {url}")
+        lines.append("")
+        lines.append("> This report is rendered from crawl artifacts only. It does not list unprobed or hallucinated endpoints as facts.")
+        lines.append("")
+
+        lines.append("## Crawl Summary")
+        lines.append("")
+        lines.append(f"- Target: `{url}`")
+        if focus:
+            lines.append(f"- User focus: `{focus}`")
+        lines.append(f"- Anonymous requests captured: {len((anon_data or {}).get('http_traffic', []) or [])}")
+        lines.append(f"- Authenticated sessions: {len(auth_sessions or [])}")
+        for session in auth_sessions or []:
+            lines.append(
+                f"  - `{session.get('label', 'auth')}`: "
+                f"verified={bool(session.get('auth_verified'))}, "
+                f"requests={len(session.get('data', {}).get('http_traffic', []) or [])}, "
+                f"source={session.get('created_by', '?')}"
+            )
+        lines.append(f"- Raw endpoint examples: {len(raw_endpoints)}")
+        if discovery_summary:
+            lines.append(
+                "- Active discovery probes: "
+                + ", ".join(f"{k}={v}" for k, v in discovery_summary.items())
+            )
+        lines.append("")
+
+        lines.append("## Evidence Rules")
+        lines.append("")
+        lines.append("- `provenance=crawl` means the crawler observed the request during normal anonymous/authenticated crawl.")
+        lines.append("- `provenance=active_discovery` means the bounded read-only discovery layer actively probed the path.")
+        lines.append("- HTML/CSS/JS keywords are recorded as signals only; they are not endpoint evidence by themselves.")
+        lines.append("- A guessed candidate is promoted into endpoint inventory only when the probe classified it as route-like.")
+        lines.append("")
+
+        lines.append("## Observed Endpoint Inventory")
+        lines.append("")
+        if raw_endpoints:
+            lines.append("| Method | Path | Status | Auth/Context | Provenance | Response Type | Notes |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            for ep in raw_endpoints[:160]:
+                response = ep.get("response") or {}
+                headers = response.get("headers") or {}
+                content_type = (
+                    headers.get("content-type")
+                    or headers.get("Content-Type")
+                    or ""
+                )
+                notes: list[str] = []
+                discovery = ep.get("discovery") or {}
+                if discovery.get("classification"):
+                    notes.append(discovery["classification"])
+                signals = (discovery.get("bac_signals") or []) + (discovery.get("blf_signals") or [])
+                if signals:
+                    notes.append("signals: " + ", ".join(signals[:3]))
+                snippet = self._clean_html_text(response.get("body_snippet") or "")
+                if snippet and not notes:
+                    notes.append(snippet[:80])
+                lines.append(
+                    f"| `{ep.get('method', '?')}` | `{ep.get('path', '/')}` | "
+                    f"{ep.get('status', '?')} | `{ep.get('auth_session', '-')}` | "
+                    f"`{ep.get('provenance', 'crawl')}` | `{content_type[:45] or '-'}` | "
+                    f"{self._md_cell('; '.join(notes) or '-')} |"
+                )
+            if len(raw_endpoints) > 160:
+                lines.append(f"| ... | ... | ... | ... | ... | ... | {len(raw_endpoints) - 160} more endpoints omitted |")
+        else:
+            lines.append("_No endpoint examples captured._")
+        lines.append("")
+
+        discovery_section = self._render_discovery_recon_section(discovery_data)
+        if discovery_section:
+            lines.append(discovery_section.rstrip())
+            lines.append("")
+
+        auth_section = self._render_auth_mechanism_section(auth_fp)
+        if auth_section:
+            lines.append(auth_section.rstrip())
+            lines.append("")
+
+        structured = self._render_structured_recon_appendix(anon_data, auth_sessions)
+        if structured:
+            lines.append(structured.rstrip())
+            lines.append("")
+
+        lines.append("## BAC / BLF Strategy From Observed Evidence")
+        lines.append("")
+        lines.append("The crawl strategy now separates facts from candidates:")
+        lines.append("")
+        lines.append("1. Normal crawl records observed pages, forms, XHR/fetch calls, cookies, params, and response clues.")
+        lines.append("2. Bounded discovery probes common BAC and BLF surfaces using only GET/OPTIONS.")
+        lines.append("3. BAC coverage focuses on admin/management/API/user/role surfaces and client-visible identity cookies.")
+        lines.append("4. BLF coverage focuses on cart, checkout, order, payment, transfer, coupon, balance, price, quantity, and workflow-state surfaces.")
+        lines.append("5. Downstream agents should only create exploit strategies from rows in `Observed Endpoint Inventory` or active probes with `route_exists=true`.")
+        lines.append("6. Rows with only signals require verification; status 200 alone is not proof of BAC/BLF.")
+        lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
+
+    @staticmethod
+    def _md_cell(text: str) -> str:
+        return str(text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+    @classmethod
+    def _render_discovery_recon_section(cls, discovery_data: dict) -> str:
+        if not discovery_data:
+            return ""
+        probes = discovery_data.get("probes") or []
+        if not probes:
+            return ""
+
+        route_like = [p for p in probes if p.get("route_exists")]
+        signal_only = [
+            p for p in probes
+            if not p.get("route_exists") and (p.get("bac_signals") or p.get("blf_signals"))
+        ]
+
+        lines: list[str] = []
+        lines.append("## Active Discovery Probes")
+        lines.append("")
+        strategy = discovery_data.get("strategy") or {}
+        lines.append(f"- Strategy: `{strategy.get('name', 'bounded_read_only_bac_blf_discovery')}`")
+        lines.append(f"- Scope: {strategy.get('scope', 'GET/OPTIONS only')}")
+        lines.append("- Important: failed/generic candidates are not endpoint evidence.")
+        lines.append("")
+
+        if route_like:
+            lines.append("### Route-Like Probe Results")
+            lines.append("")
+            lines.append("| Method | Path | Context | Status | Classification | BAC Signals | BLF Signals | Source |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            for probe in route_like[:120]:
+                lines.append(
+                    f"| `{probe.get('method', '?')}` | `{probe.get('path', '/')}` | "
+                    f"`{probe.get('context', '-')}` | {probe.get('status', '?')} | "
+                    f"{cls._md_cell(probe.get('classification', '-'))} | "
+                    f"{cls._md_cell(', '.join(probe.get('bac_signals') or []) or '-')} | "
+                    f"{cls._md_cell(', '.join(probe.get('blf_signals') or []) or '-')} | "
+                    f"{cls._md_cell(', '.join(probe.get('candidate_sources') or []) or '-')} |"
+                )
+            lines.append("")
+
+        if signal_only:
+            lines.append("### Signal-Only Probe Results")
+            lines.append("")
+            lines.append("These responses had keywords but were not classified as route-like. Treat them as clues only.")
+            lines.append("")
+            for probe in signal_only[:40]:
+                signals = (probe.get("bac_signals") or []) + (probe.get("blf_signals") or [])
+                lines.append(
+                    f"- `{probe.get('method', '?')} {probe.get('path', '/')}` "
+                    f"context=`{probe.get('context', '-')}` status={probe.get('status', '?')} "
+                    f"classification={probe.get('classification', '-')} signals={', '.join(signals)}"
+                )
+            lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
+
+    @staticmethod
+    def _render_auth_mechanism_section(auth_fp: list[dict]) -> str:
+        if not auth_fp:
+            return ""
+        lines: list[str] = []
+        lines.append("## Auth Mechanism Discovery")
+        lines.append("")
+        for entry in auth_fp[:10]:
+            path = entry.get("path") or entry.get("url") or "?"
+            lines.append(f"### `{path}`")
+            lines.append(f"- Is login: {bool(entry.get('is_login'))}")
+            lines.append(f"- Is register: {bool(entry.get('is_register'))}")
+            if entry.get("login_success"):
+                lines.append("- Login success observed: true")
+                lines.append(f"- Method: `{entry.get('login_method', 'POST')}`")
+                lines.append(f"- Content-Type: `{entry.get('login_content_type', '?')}`")
+                lines.append(f"- Body fields: `{', '.join(entry.get('login_body_fields') or [])}`")
+                lines.append(f"- Auth mechanism: `{entry.get('auth_mechanism', 'unknown')}`")
+                if entry.get("token_location"):
+                    lines.append(f"- Token location: `{entry.get('token_location')}`")
+            elif entry.get("recommended_content_type"):
+                lines.append(f"- Recommended Content-Type: `{entry.get('recommended_content_type')}`")
+                lines.append(f"- Recommended body fields: `{', '.join(entry.get('recommended_body_fields') or [])}`")
+                lines.append(f"- Auth mechanism hint: `{entry.get('auth_mechanism', 'unknown')}`")
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
 
 
     # ─── Internal: Save crawl data to files (no LLM) ────────────
@@ -2029,6 +2837,7 @@ class CrawlAgent:
         anon_data: dict | None,
         auth_sessions: list[dict],
         focus: str = "",
+        discovery_data: dict | None = None,
     ) -> None:
         """Lưu crawl data ra crawl_data.txt và crawl_raw.json. Không gọi LLM."""
         parts = []
@@ -2127,6 +2936,14 @@ class CrawlAgent:
                         parts.append(f"  ★ SET-COOKIE: {probe.get('set_cookie_header', '?')}")
                 parts.append("")
 
+        if discovery_data:
+            parts.append("")
+            parts.append("=" * 60)
+            parts.append("ACTIVE BAC/BLF DISCOVERY PROBES")
+            parts.append("=" * 60)
+            parts.append("")
+            parts.append(self._format_discovery_data(discovery_data))
+
         formatted_text = "\n".join(parts)
 
         # Save crawl_raw.json
@@ -2134,10 +2951,13 @@ class CrawlAgent:
         try:
             # Build raw_endpoints: clean HTTP examples for each live endpoint
             raw_endpoints = self._extract_raw_endpoints(anon_data, auth_sessions)
+            discovery_endpoints = self._raw_endpoints_from_discovery(discovery_data or {})
+            raw_endpoints = self._merge_raw_endpoint_examples(raw_endpoints, discovery_endpoints)
 
             raw_payload = {
                 "target": url,
                 "raw_endpoints": raw_endpoints,
+                "discovery_probes": discovery_data or {},
                 "anonymous": anon_data,
                 "authenticated": [
                     {
@@ -2715,6 +3535,109 @@ class CrawlAgent:
 
         return "\n".join(lines).rstrip() + "\n"
 
+    @staticmethod
+    def _format_discovery_data(discovery_data: dict) -> str:
+        if not discovery_data:
+            return "No active discovery probes were run."
+
+        lines: list[str] = []
+        strategy = discovery_data.get("strategy") or {}
+        summary = discovery_data.get("summary") or {}
+        lines.append(f"Strategy: {strategy.get('name', 'bounded_read_only_bac_blf_discovery')}")
+        lines.append(f"Scope: {strategy.get('scope', 'GET/OPTIONS only')}")
+        lines.append(
+            "Summary: "
+            + ", ".join(f"{k}={v}" for k, v in summary.items())
+        )
+        lines.append("")
+        lines.append("Important rule: candidates below are only facts after a probe returns route_exists=true.")
+        lines.append("")
+
+        probes = discovery_data.get("probes") or []
+        interesting = [
+            p for p in probes
+            if p.get("route_exists") or p.get("bac_signals") or p.get("blf_signals")
+        ]
+        if not interesting:
+            lines.append("No route-like discovery responses found.")
+            return "\n".join(lines)
+
+        for probe in interesting[:120]:
+            signals = (probe.get("bac_signals") or []) + (probe.get("blf_signals") or [])
+            lines.append(
+                f"- [{probe.get('status', '?')}] {probe.get('method', '?')} {probe.get('path', '?')} "
+                f"context={probe.get('context', '?')} route_exists={probe.get('route_exists', False)} "
+                f"classification={probe.get('classification', '?')}"
+            )
+            if probe.get("candidate_sources"):
+                lines.append(f"  sources: {', '.join(probe.get('candidate_sources') or [])}")
+            if probe.get("tamper_notes"):
+                lines.append(f"  tamper: {', '.join(probe.get('tamper_notes') or [])}")
+            if signals:
+                lines.append(f"  BAC/BLF signals: {', '.join(signals)}")
+            response = probe.get("response") or {}
+            snippet = CrawlAgent._clean_html_text(response.get("body_snippet") or "")
+            if snippet:
+                lines.append(f"  body snippet: {snippet[:300]}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _raw_endpoints_from_discovery(discovery_data: dict) -> list[dict]:
+        endpoints: list[dict] = []
+        for probe in (discovery_data or {}).get("probes", []) or []:
+            if not probe.get("route_exists"):
+                continue
+            if str(probe.get("method", "")).upper() != "GET":
+                continue
+            response = probe.get("response") or {}
+            request = probe.get("request") or {}
+            endpoints.append({
+                "method": "GET",
+                "path": probe.get("path", "/"),
+                "status": probe.get("status") or 0,
+                "request": {
+                    "headers": request.get("headers") or {},
+                    "body": None,
+                },
+                "response": {
+                    "headers": response.get("headers") or {},
+                    "body_snippet": response.get("body_snippet") or "",
+                    "body_size": response.get("body_size") or 0,
+                },
+                "auth_session": probe.get("context", "active_discovery"),
+                "resource_type": "active_discovery",
+                "provenance": "active_discovery",
+                "discovery": {
+                    "classification": probe.get("classification", ""),
+                    "candidate_sources": probe.get("candidate_sources", []),
+                    "candidate_reason": probe.get("candidate_reason", ""),
+                    "bac_signals": probe.get("bac_signals", []),
+                    "blf_signals": probe.get("blf_signals", []),
+                    "tamper_notes": probe.get("tamper_notes", []),
+                },
+            })
+        return endpoints
+
+    @staticmethod
+    def _merge_raw_endpoint_examples(primary: list[dict], discovered: list[dict]) -> list[dict]:
+        merged: dict[str, dict] = {}
+
+        def rank(entry: dict) -> tuple[int, int, int]:
+            provenance = entry.get("provenance", "crawl")
+            status = int(entry.get("status") or 0)
+            status_rank = 0 if 200 <= status < 300 else 1 if status in {301, 302, 303, 307, 308, 401, 403, 405} else 2
+            auth_rank = 0 if entry.get("auth_session") != "anonymous" else 1
+            provenance_rank = 0 if provenance != "active_discovery" else 1
+            return (status_rank, auth_rank, provenance_rank)
+
+        for entry in (primary or []) + (discovered or []):
+            key = f"{str(entry.get('method', 'GET')).upper()} {entry.get('path', '/')}"
+            existing = merged.get(key)
+            if existing is None or rank(entry) < rank(existing):
+                merged[key] = entry
+
+        return sorted(merged.values(), key=lambda e: (e.get("path", ""), e.get("method", "")))
+
     def _extract_raw_endpoints(
         self,
         anon_data: dict | None,
@@ -2761,11 +3684,21 @@ class CrawlAgent:
                 # Keep the best example: prefer 2xx, then auth over anon
                 existing = seen.get(key)
                 if existing:
-                    # Prefer lower status code (2xx > 3xx > 4xx)
-                    if existing.get("status", 999) < status:
-                        continue
-                    # Prefer authenticated over anonymous
-                    if existing.get("auth_session") != "anonymous" and session_label == "anonymous":
+                    def score(entry: dict) -> tuple[int, int]:
+                        st = int(entry.get("status") or 0)
+                        if 200 <= st < 300:
+                            status_rank = 0
+                        elif st in {301, 302, 303, 307, 308, 401, 403, 405}:
+                            status_rank = 1
+                        elif st >= 500:
+                            status_rank = 3
+                        else:
+                            status_rank = 2
+                        auth_rank = 0 if entry.get("auth_session") != "anonymous" else 1
+                        return status_rank, auth_rank
+
+                    candidate_entry = {"status": status, "auth_session": session_label}
+                    if score(existing) <= score(candidate_entry):
                         continue
 
                 # Extract request body
@@ -2806,6 +3739,7 @@ class CrawlAgent:
                     },
                     "auth_session": session_label,
                     "resource_type": resource_type,
+                    "provenance": "crawl",
                 }
 
         # Process anonymous traffic

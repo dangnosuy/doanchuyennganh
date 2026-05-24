@@ -78,12 +78,14 @@ VULNHUNTER_SYSTEM_PROMPT = """Ban la chuyen gia Vulnerability Analysis — doc E
 de dua ra cac bug candidate ve BAC (Broken Access Control) va BLF (Business Logic Flaw).
 
 MUC TIEU:
-- Uu tien RECALL cao hon PRECISION.
-- Neu mot route/endpoint co dau hieu dang nghi thi CU DUA VAO OUTPUT.
-- False positive duoc CHAP NHAN.
+- Uu tien evidence-backed candidates hon viec tao nhieu bug.
+- Chi dua route/endpoint vao output neu no xuat hien trong Observed Endpoint Inventory,
+  Structured Route Families, Endpoint Dossiers, Active Discovery Probes voi route_exists=true,
+  HOAC la action endpoint suy ra truc tiep tu route/schema da observed (vi du GET /api/Quantitys co
+  quantity/limitPerUser thi co the de xuat POST/PUT/PATCH /api/Quantitys nhu ACTION_DISCOVERY).
+- Khong bien HTML/CSS/JS keyword thanh endpoint that neu recon chi ghi la signal.
 - Red/Blue/Exec se la cac thanh phan xac minh sau. Ban KHONG can confirm 100%.
-- LUON CO GANG GEN IT NHAT 8-10 bug candidates. Moi endpoint/route family nen duoc xem xet it nhat 1 bug.
-- TOI DA {max_bugs} bug candidates. KHONG dung lai o 5 — hay soan tat ca cac dau hieu nghi ngo.
+- TOI DA {max_bugs} bug candidates. Neu evidence it thi tra ve it bug, khong tu bia cho du so luong.
 
 === KIEN THUC VE CAC PATTERN ===
 {playbook}
@@ -93,8 +95,8 @@ MUC TIEU:
 
 === CACH LAM VIEC BAT BUOC ===
 1. Doc toan bo recon.md enriched, dac biet cac phan:
-   - Endpoint Inventory
-   - Endpoint Details
+   - Observed Endpoint Inventory
+   - Active Discovery Probes
    - Structured Route Families
    - Endpoint Dossiers
    - Candidate BAC/BLF Signals
@@ -110,9 +112,11 @@ MUC TIEU:
    - Cookie-based role/auth: role, user_id, session — cookie tampering candidates
    - Multi-step workflows: cart → checkout → order → payment
    - HTTP method variations: GET vs POST vs PUT vs DELETE on same endpoint
-3. Khi nghi ngo, cu dua bug candidate vao output. Khong can raw HTML/JSON exact dump.
+3. Khi nghi ngo nhung route chua co evidence/probe route_exists=true, chi duoc dua thanh bug neu
+   candidate_type=`ACTION_DISCOVERY` va phai noi ro route/schema observed nao lam can cu.
 4. Moi bug candidate phai noi ro vi sao route do dang nghi va can verify nhu the nao.
-5. MOI ROUTE FAMILY nen co IT NHAT 1 bug candidate. Vi du: neu co /admin, /cart, /order, /profile, /products
+5. Khong bat buoc moi route family phai co bug. Chi route co BAC/BLF signal ro moi tao candidate.
+6. Moi bug nen co `candidate_type`: `EVIDENCE_BACKED` hoac `ACTION_DISCOVERY`.
    thi nen co bug candidate cho TUNG nhom route.
 
 === YEU CAU QUAN TRONG ===
@@ -339,12 +343,14 @@ class VulnHunterAgent:
         messages = [
             {"role": "system", "content": _build_user_prompt(recon_content, self.playbook)},
             {"role": "user", "content": (
-                "Doc TOAN BO recon.md enriched va tra ve CAC BUG CANDIDATE co the co BAC/BLF. "
-                "Uu tien recall, false positive chap nhan duoc. "
+                "Doc TOAN BO recon.md enriched va tra ve CAC BUG CANDIDATE co evidence-backed BAC/BLF. "
+                "Khong tao bug cho endpoint chi la keyword/signal/chua duoc probe, tru khi la ACTION_DISCOVERY "
+                "suy ra truc tiep tu route/schema da observed. "
                 "Khong viet markdown, khong giai thich ngoai JSON. "
                 "Output phai bat dau bang '[' va ket thuc bang ']'. "
-                "Dung cac route dossiers va candidate signals trong recon de suy ra bug. "
-                "QUAN TRONG: Gen it nhat 8 bug candidates. Moi route family nen co 1 candidate."
+                "Chi dung Observed Endpoint Inventory, Endpoint Dossiers, hoac Active Discovery Probes route_exists=true. "
+                "Voi BLF/BAC state-changing, duoc de xuat POST/PUT/PATCH neu GET schema co quantity/price/role/userId/order/cart. "
+                "Neu evidence it thi tra ve it bug, khong can du 8 candidates."
             )},
         ]
 
@@ -505,6 +511,7 @@ class VulnHunterAgent:
                 "id": bug_id,
                 "category": bug.get("category", "BAC"),
                 "pattern_id": pattern_id,
+                "candidate_type": str(bug.get("candidate_type") or "").upper() or "",
                 "title": bug.get("title", f"Vulnerability #{i + 1}"),
                 "risk_level": risk_level,
                 "endpoint": bug.get("endpoint", ""),
@@ -534,6 +541,35 @@ class VulnHunterAgent:
                 )
                 if matched_examples:
                     enriched_bug["http_examples"] = matched_examples[:MAX_HTTP_EXAMPLES_PER_BUG]
+
+            if not enriched_bug["http_examples"]:
+                action_example = self._build_action_discovery_example(enriched_bug, raw_endpoints)
+                if action_example:
+                    enriched_bug["candidate_type"] = "ACTION_DISCOVERY"
+                    enriched_bug["http_examples"] = [action_example]
+                    if not enriched_bug.get("confidence"):
+                        enriched_bug["confidence"] = "LOW"
+                else:
+                    print(
+                        f"  {DIM}[VULN-HUNTER] Filtered no-evidence candidate: "
+                        f"{enriched_bug['id']} {enriched_bug['method']} {enriched_bug['endpoint']}{RESET}"
+                    )
+                    continue
+
+            provenances = {
+                str(ex.get("provenance", "crawl"))
+                for ex in enriched_bug.get("http_examples", [])
+                if isinstance(ex, dict)
+            }
+            if "action_discovery" in provenances:
+                enriched_bug["evidence_status"] = "ACTION_DISCOVERY"
+                enriched_bug["candidate_type"] = enriched_bug.get("candidate_type") or "ACTION_DISCOVERY"
+            elif "active_discovery" in provenances:
+                enriched_bug["evidence_status"] = "ACTIVE_DISCOVERY"
+                enriched_bug["candidate_type"] = enriched_bug.get("candidate_type") or "EVIDENCE_BACKED"
+            else:
+                enriched_bug["evidence_status"] = "CRAWL_OBSERVED"
+                enriched_bug["candidate_type"] = enriched_bug.get("candidate_type") or "EVIDENCE_BACKED"
 
             enriched.append(enriched_bug)
 
@@ -634,10 +670,78 @@ class VulnHunterAgent:
                     "response_snippet": ep.get("response", {}).get("body_snippet", ""),
                     "content_type": ep.get("response", {}).get("headers", {}).get("content-type", ""),
                     "auth_session": ep.get("auth_session", "anonymous"),
+                    "provenance": ep.get("provenance", "crawl"),
+                    "discovery": ep.get("discovery", {}),
                 }
                 matched.append(example)
 
         return matched
+
+    @staticmethod
+    def _build_action_discovery_example(bug: dict, raw_endpoints: list[dict]) -> dict | None:
+        """Keep state-changing BAC/BLF candidates when grounded in nearby observed schema."""
+        method = str(bug.get("method", "GET") or "GET").upper()
+        if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+            return None
+        endpoint = str(bug.get("endpoint", "") or "").strip()
+        if not endpoint or not raw_endpoints:
+            return None
+
+        endpoint_base = endpoint.rstrip("/")
+        endpoint_lower = endpoint_base.lower()
+        action_keywords = (
+            "cart", "basket", "checkout", "order", "payment", "transfer",
+            "wallet", "balance", "quantity", "quantitys", "coupon", "discount",
+            "profile", "user", "role", "admin",
+        )
+        if not any(k in endpoint_lower for k in action_keywords):
+            return None
+
+        best: dict | None = None
+        best_score = -1
+        for ep in raw_endpoints:
+            ep_path = str(ep.get("path", "") or "")
+            ep_lower = ep_path.lower().rstrip("/")
+            if not ep_lower:
+                continue
+            score = 0
+            if ep_lower == endpoint_lower:
+                score += 6
+            elif endpoint_lower.startswith(ep_lower) or ep_lower.startswith(endpoint_lower):
+                score += 4
+            else:
+                ep_tokens = {t for t in re.split(r"[^a-z0-9]+", ep_lower) if t}
+                bug_tokens = {t for t in re.split(r"[^a-z0-9]+", endpoint_lower) if t}
+                score += len(ep_tokens & bug_tokens)
+
+            snippet = str((ep.get("response") or {}).get("body_snippet", "") or "").lower()
+            if any(k in snippet for k in ("quantity", "limitperuser", "price", "amount", "balance", "role", "userid", "user_id", "basket", "order")):
+                score += 2
+            if ep.get("provenance") == "active_discovery":
+                score -= 1
+            if score > best_score:
+                best = ep
+                best_score = score
+
+        if not best or best_score < 2:
+            return None
+
+        return {
+            "method": best.get("method", "GET"),
+            "path": best.get("path", ""),
+            "status": best.get("status", 0),
+            "request_body": best.get("request", {}).get("body"),
+            "response_snippet": best.get("response", {}).get("body_snippet", ""),
+            "content_type": best.get("response", {}).get("headers", {}).get("content-type", ""),
+            "auth_session": best.get("auth_session", "anonymous"),
+            "provenance": "action_discovery",
+            "discovery": {
+                "candidate_endpoint": endpoint,
+                "candidate_method": method,
+                "basis": "state-changing candidate grounded in nearby observed endpoint/schema",
+                "basis_path": best.get("path", ""),
+            },
+        }
 
     @staticmethod
     def _filter_challenge_metadata_bugs(bugs: list[dict]) -> list[dict]:

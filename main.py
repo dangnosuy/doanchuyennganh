@@ -148,15 +148,6 @@ def _quiet_third_party_logging() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
-# ═════════════════════════════════════════════════════════════
-# HELPERS
-# ═════════════════════════════════════════════════════════════
-
-def banner():
-    # Legacy — replaced by log.main_banner() in main()
-    pass
-
-
 def parse_cli_args() -> argparse.Namespace:
     """Parse CLI flags without breaking the old positional prompt style."""
     parser = argparse.ArgumentParser(

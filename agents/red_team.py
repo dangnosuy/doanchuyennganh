@@ -49,17 +49,6 @@ RESET = "\033[0m"
 MAX_MSG_CHARS = 6000    # Truncate message cu
 
 
-def load_prompt(task: str) -> str:
-    try:
-        with open(f"{PROMPT_PATH}/{task}.md", "r") as f:
-            prompt = f.read()
-            if len(prompt) == 0:
-                raise Exception
-            return prompt
-    except:
-        print(f"{task}.md not found or empty. Script will now halt.")
-        exit(0)
-
 # ═══════════════════════════════════════════════════════════════
 # SYSTEM PROMPT — Red = Chien luoc gia
 # ═══════════════════════════════════════════════════════════════

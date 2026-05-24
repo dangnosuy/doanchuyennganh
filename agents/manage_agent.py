@@ -439,16 +439,6 @@ def _is_valid_red_approach(content: str) -> bool:
     return has_strategy and has_plan
 
 
-def _get_last_valid_red_content(conversation: list[dict]) -> str:
-    """Return the most recent Red strategy that is non-empty and has an execution guide/shot plan."""
-    for msg in reversed(conversation):
-        if msg["speaker"] == "REDTEAM":
-            clean = _strip_tag_display(msg["content"])
-            if _is_valid_red_approach(clean):
-                return clean
-    return ""
-
-
 def _get_last_blue_content(conversation: list[dict]) -> str:
     """Lấy nội dung message Blue Team cuối cùng."""
     for msg in reversed(conversation):
@@ -1299,6 +1289,7 @@ class ManageAgent:
                                 max_script_shots=1,
                                 allow_tool_loop=False,
                                 artifact_prefix=current_bug.get("id", "bug-unknown"),
+                                current_bug=current_bug,
                             )
                         except Exception as e:
                             result["error"] = str(e)
@@ -1365,6 +1356,7 @@ class ManageAgent:
                                 max_script_shots=1,
                                 allow_tool_loop=False,
                                 artifact_prefix=current_bug.get("id", "bug-unknown"),
+                                current_bug=current_bug,
                             )
                         except Exception as e:
                             result["error"] = str(e)
@@ -2118,15 +2110,6 @@ class ManageAgent:
     def _safe_code_block(text: str) -> str:
         return str(text or "").replace("```", "` ` `")
 
-    def _display_run_path(self, path: str | None) -> str:
-        if not path:
-            return "-"
-        path_obj = Path(path)
-        try:
-            return str(path_obj.relative_to(Path(self.run_dir)))
-        except Exception:
-            return str(path_obj)
-
     def _format_artifact_list(self, bug: dict) -> str:
         artifacts = bug.get("exploit_artifacts") or []
         if not artifacts:
@@ -2348,8 +2331,9 @@ class ManageAgent:
         exec_text = str(exec_result or "").lower()
         json_text = self._json_text(result_json)
 
-        # ── BAC-01: Admin access — cần admin marker/control ──
-        if pattern_id == "BAC-01" or ("admin" in bug_text and "bac" in category):
+        # ── BAC-01: Admin access — cần admin marker/control.
+        # Do not apply this to BAC-03 just because the IDOR target is an admin user.
+        if pattern_id == "BAC-01" or (not pattern_id and "admin" in bug_text and "bac" in category):
             if not self._has_concrete_admin_control(exec_text, json_text):
                 reason = (
                     "PROOF_QUALITY_FAIL: BAC-01/admin proof requires a concrete privileged "
@@ -2554,6 +2538,23 @@ class ManageAgent:
             return True
         if re.search(r"(cross-user|other user|user a .* user b|not owned by).{0,160}status=2\d\d", exec_text, re.IGNORECASE | re.DOTALL):
             return True
+        strong_text_markers = (
+            "horizontal idor: confirmed",
+            "horizontal idor confirmed",
+            "vertical idor: confirmed",
+            "vertical idor confirmed",
+            "cross-user access",
+            "accessed user",
+            "accessed admin",
+            "attacker (id",
+            "attacker id",
+            "read other users' pii",
+            "read admin account details",
+            "server returned exact feedback data of user",
+        )
+        if any(marker in exec_text for marker in strong_text_markers):
+            if any(owner in exec_text for owner in ("userid", "user id", "user_id", "admin id", "role: admin", "email:")):
+                return True
         return False
 
     @classmethod
@@ -2708,10 +2709,6 @@ class ManageAgent:
             if isinstance(value, (int, float)) and value != 0 and "delta" in key_lower:
                 return True
         return False
-
-    def _exec_succeeded(self, exec_result: str) -> bool:
-        """Backward-compatible success check for older callers."""
-        return self._exec_decision(exec_result, {}).get("status") == "EXPLOITED"
 
     def _recommendation_for_bug(self, bug: dict) -> str:
         text = " ".join(str(bug.get(k, "") or "") for k in ("category", "title", "endpoint", "hypothesis")).lower()
@@ -3204,11 +3201,6 @@ No bugs were successfully exploited. Reason: {reason}
                 signal.signal(sig, handler)
             except Exception:
                 continue
-
-    def _update_report_state(self, **kwargs) -> None:
-        for key, value in kwargs.items():
-            if value is not None and key in self._report_state:
-                self._report_state[key] = value
 
     def _save_report_checkpoint(self) -> None:
         report_path = Path(self.run_dir) / "report.md"

@@ -92,17 +92,6 @@ def _send_block(content: str) -> str:
     """Wrap final Exec output in the manager-readable SEND block."""
     return f"=========SEND=========\n{content.rstrip()}\n=========END-SEND========="
 
-def load_prompt(task: str) -> str:
-    try:
-        with open(f"{PROMPT_PATH}/{task}.md", "r") as f:
-            prompt = f.read()
-            if len(prompt) == 0:
-                raise Exception
-            return prompt
-    except:
-        print(f"{task}.md not found or empty. Script will now halt.")
-        exit(0)
-
 
 # ═══════════════════════════════════════════════════════════════
 # SYSTEM PROMPTS — BAC / BLF Pentest Only
@@ -758,6 +747,7 @@ class ExecAgent:
         max_script_shots: int = DEFAULT_SCRIPT_SHOTS,
         allow_tool_loop: bool = False,
         artifact_prefix: str | None = None,
+        current_bug: dict | None = None,
     ) -> str:
         """Thực thi attack workflow — LOGIN rồi EXPLOIT (hybrid: tool-loop hoặc script).
 
@@ -802,6 +792,7 @@ class ExecAgent:
             exploit_result = self._exploit_via_tools(
                 workflow_text, conversation, session_cookie,
                 artifact_prefix=artifact_prefix,
+                current_bug=current_bug,
             )
         else:
             # Legacy script-based mode
@@ -872,6 +863,7 @@ class ExecAgent:
         session_cookie: str,
         *,
         artifact_prefix: str | None = None,
+        current_bug: dict | None = None,
     ) -> str:
         """Execute exploit strategy using MCP tool-loop (adaptive, browser-aware).
 
@@ -921,6 +913,13 @@ class ExecAgent:
             strategy=workflow_text,
             max_rounds=15,
         )
+        execution_context = self._build_tool_execution_context(
+            current_bug=current_bug,
+            artifact_prefix=artifact_prefix,
+            bearer_token=bearer_token,
+            cookie_header=cookie_header,
+            auth_mechanism=auth_mechanism,
+        )
 
         print(f"{YELLOW}[EXEC-AGENT] Tool-loop exploit — auth_mechanism={auth_mechanism}{RESET}")
         if bearer_token:
@@ -929,14 +928,128 @@ class ExecAgent:
             print(f"{DIM}[EXEC-AGENT]   Cookie: {cookie_header[:60]}...{RESET}")
         print(f"{DIM}[EXEC-AGENT]   State dir: {state_dir}{RESET}")
 
-        # Run tool-loop
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Thực thi exploit strategy cho target {self.target_url}.\n"
+                    f"STATE_DIR={state_dir}\n\n"
+                    f"{execution_context}"
+                ),
+            },
+        ]
         result = self._tool_loop(
-            system_prompt=system_prompt,
-            user_message=f"Thực thi exploit strategy cho target {self.target_url}.\nSTATE_DIR={state_dir}",
-            max_rounds=15,
+            messages,
+            default_tag="REDTEAM",
+            max_tool_rounds=15,
+            mode_label="exploit",
         )
 
         return result
+
+    def _build_tool_execution_context(
+        self,
+        *,
+        current_bug: dict | None,
+        artifact_prefix: str | None,
+        bearer_token: str,
+        cookie_header: str,
+        auth_mechanism: str,
+    ) -> str:
+        """Provide Exec tool-loop the concrete crawl/dossier context it needs."""
+        lines: list[str] = []
+        lines.append("=== EXECUTION CONTEXT FROM MANAGER/CRAWL ===")
+        lines.append(f"RUN_DIR: {self.working_dir}")
+        lines.append(f"AUTH_CONTEXT_FILE: {os.path.join(self.working_dir, 'auth_context.json')}")
+        lines.append(f"CRAWL_RAW_FILE: {os.path.join(self.working_dir, 'crawl_raw.json')}")
+        lines.append(f"CRAWL_DATA_FILE: {os.path.join(self.working_dir, 'crawl_data.txt')}")
+        lines.append(f"RECON_FILE: {os.path.join(self.working_dir, 'recon.md')}")
+        lines.append(f"AUTH_MECHANISM: {auth_mechanism}")
+        if bearer_token:
+            lines.append("AUTH_HEADER_REQUIRED: Authorization: Bearer <token>")
+            lines.append(f"AUTH_BEARER_TOKEN: {bearer_token}")
+        if cookie_header:
+            lines.append(f"COOKIE_HEADER: {cookie_header}")
+        lines.append("")
+        lines.append("IMPORTANT EXECUTION RULES:")
+        lines.append("- Prefer exact http_examples/current bug dossier over broad recon prose.")
+        lines.append("- If AUTH_MECHANISM is jwt_bearer, every authenticated API request must include Authorization: Bearer token.")
+        lines.append("- Cookies named token are not a substitute for Authorization unless the endpoint demonstrably accepts cookie auth.")
+        lines.append("- Read crawl_raw.json or crawl_data.txt when the strategy lacks request shape, params, or response schema.")
+        lines.append("- If proof succeeds on a different endpoint than current bug, report it explicitly as RETARGETED/NEW_FINDING.")
+        lines.append("")
+
+        if current_bug:
+            safe_bug = {
+                k: current_bug.get(k)
+                for k in (
+                    "id", "category", "pattern_id", "candidate_type", "evidence_status",
+                    "title", "risk_level", "endpoint", "method", "auth_required",
+                    "hypothesis", "exploit_approach", "verify_method",
+                    "request_params", "form_fields", "response_clues",
+                )
+                if k in current_bug
+            }
+            lines.append("=== CURRENT BUG DOSSIER ===")
+            lines.append(json.dumps(safe_bug, ensure_ascii=False, indent=2)[:4000])
+
+            examples = current_bug.get("http_examples") or []
+            if examples:
+                lines.append("")
+                lines.append("=== CURRENT BUG HTTP EXAMPLES ===")
+                lines.append(json.dumps(examples[:4], ensure_ascii=False, indent=2)[:8000])
+
+            related = self._load_related_raw_examples(current_bug)
+            if related:
+                lines.append("")
+                lines.append("=== RELATED CRAWL RAW EXAMPLES ===")
+                lines.append(json.dumps(related[:8], ensure_ascii=False, indent=2)[:10000])
+
+        if self.recon_context:
+            lines.append("")
+            lines.append("=== RECON CONTEXT PREVIEW ===")
+            lines.append(truncate(self.recon_context, 3000))
+        return "\n".join(lines)
+
+    def _load_related_raw_examples(self, current_bug: dict | None) -> list[dict]:
+        if not current_bug:
+            return []
+        raw_path = Path(self.working_dir) / "crawl_raw.json"
+        if not raw_path.is_file():
+            return []
+        try:
+            payload = json.loads(raw_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        endpoints = payload.get("raw_endpoints") or []
+        bug_endpoint = str(current_bug.get("endpoint", "") or "").lower().rstrip("/")
+        bug_tokens = {t for t in re.split(r"[^a-z0-9]+", bug_endpoint) if t}
+        pattern = str(current_bug.get("pattern_id", "") or "").upper()
+        category = str(current_bug.get("category", "") or "").upper()
+
+        scored: list[tuple[int, dict]] = []
+        for ep in endpoints:
+            path = str(ep.get("path", "") or "").lower().rstrip("/")
+            if not path:
+                continue
+            score = 0
+            if path == bug_endpoint:
+                score += 10
+            elif bug_endpoint and (path.startswith(bug_endpoint) or bug_endpoint.startswith(path)):
+                score += 6
+            path_tokens = {t for t in re.split(r"[^a-z0-9]+", path) if t}
+            score += len(path_tokens & bug_tokens) * 2
+            snippet = str((ep.get("response") or {}).get("body_snippet", "") or "").lower()
+            if pattern.startswith("BAC") and any(k in path + snippet for k in ("user", "admin", "role", "account", "profile")):
+                score += 2
+            if category == "BLF" and any(k in path + snippet for k in ("cart", "quantity", "price", "order", "payment", "transfer", "balance", "coupon")):
+                score += 2
+            if score > 0:
+                scored.append((score, ep))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [ep for _, ep in scored[:10]]
 
     def _generate_poc_from_evidence(
         self,
@@ -1000,46 +1113,6 @@ Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
             print(f"{YELLOW}[EXEC-AGENT] PoC generation error: {e}{RESET}")
 
         return ""
-
-    def _should_start_iterative(
-        self,
-        workflow_text: str,
-        conversation: list[dict] | None = None,
-    ) -> tuple[bool, str]:
-        """Decide whether Exec should skip one-shot mode and start iterative immediately."""
-        lower = workflow_text.lower()
-        hard_keywords = (
-            "baseline", "before/after", "before and after", "compare",
-            "quantity", "qty", "cart", "checkout", "balance", "wallet",
-            "transfer", "business logic", "negative", "decrease", "increase",
-            "total", "stateful", "multi-step",
-        )
-        if any(keyword in lower for keyword in hard_keywords):
-            return True, "Workflow looks stateful or needs before/after verification."
-
-        recent_feedback = self._recent_exec_feedback(conversation)
-        if recent_feedback:
-            lower_feedback = recent_feedback.lower()
-            if any(
-                marker in lower_feedback
-                for marker in (
-                    "=== success: partial ===",
-                    "partial or unclear",
-                    "cannot parse",
-                    "failed to parse",
-                    "regex",
-                    "baseline",
-                    "verify",
-                    "total",
-                    "balance",
-                    "cart",
-                    "transfer",
-                    "runtime/script",
-                )
-            ):
-                return True, "Previous Exec output suggests partial verification or a hard workflow."
-
-        return False, ""
 
     @staticmethod
     def _result_declares_verify_completed(result: str) -> bool:
@@ -2234,13 +2307,6 @@ Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
         return m_out.group(1).encode().decode("unicode_escape", errors="ignore")
 
     @staticmethod
-    def _extract_json_string_value(raw_output: str, key: str) -> str:
-        match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', str(raw_output), re.DOTALL)
-        if not match:
-            return ""
-        return match.group(1).encode().decode("unicode_escape", errors="ignore")
-
-    @staticmethod
     def _artifact_log_path(script_path: str, suffix: str) -> str:
         return f"{script_path}{suffix}"
 
@@ -2314,16 +2380,6 @@ Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
         return "".join(lines)
 
     @staticmethod
-    def _script_preview_lines(script_content: str, max_lines: int = 12) -> list[str]:
-        lines = [line.rstrip("\n") for line in str(script_content or "").splitlines()]
-        if not lines:
-            return []
-        preview = [f"{idx:02d}: {line}" for idx, line in enumerate(lines[:max_lines], start=1)]
-        if len(lines) > max_lines:
-            preview.append(f"... ({len(lines) - max_lines} more lines)")
-        return preview
-
-    @staticmethod
     def _preview_output_lines(text: str, max_lines: int = 10) -> list[str]:
         lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
         if not lines:
@@ -2384,33 +2440,6 @@ Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
                 return "output contains weak/redirect evidence without a confirmed marker"
 
         return ""
-
-    @staticmethod
-    def _should_escalate_after_script(exploit_result: str) -> bool:
-        """Return True when a one-shot script should be followed by iterative execution."""
-        lower = exploit_result.lower()
-        if "=== success: yes ===" in lower:
-            return False
-        if "=== success: partial ===" in lower:
-            return True
-        fragile_markers = (
-            "partial or unclear",
-            "cannot parse",
-            "failed to parse",
-            "regex",
-            "not found",
-            "empty",
-            "unclear",
-            "timed out",
-            "syntax error",
-            "syntax_check: fail",
-            "script validation failed",
-            "python py_compile failed",
-            "need a corrected python exploit",
-            "command not found",
-            "script execution error",
-        )
-        return any(marker in lower for marker in fragile_markers)
 
     @staticmethod
     def _script_result_is_success(exploit_result: str) -> bool:
@@ -2635,20 +2664,6 @@ Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
         if len(interesting) > 12:
             interesting = interesting[-12:]
         return interesting
-
-    @staticmethod
-    def _recent_exec_feedback(conversation: list[dict] | None = None) -> str:
-        """Return the latest Exec-related message from the conversation, if any."""
-        if not conversation:
-            return ""
-        for msg in reversed(conversation):
-            speaker = msg.get("speaker", "")
-            content = msg.get("content", "")
-            if speaker == "AGENT" and "execution result" in content.lower():
-                return content
-            if speaker == "SYSTEM" and "manager instruction:" in content.lower():
-                return content
-        return ""
 
     def _execute_iterative_workflow(self, workflow_text: str, reason: str = "") -> str:
         """Run a multi-turn exploit loop for stateful or verification-fragile workflows."""
