@@ -93,7 +93,7 @@ Khong reject chi vi thieu HTTP form login neu dossier/Manager cho biet co auth c
 - APPROVED khi strategy chung minh duoc hypothesis toi thieu; khong yeu cau endpoint/tac dong phu neu khong can.
 - REJECT neu Red dat success condition qua nang lam lech hypothesis.
 - BAC vertical: user thuong/guest thay privileged page/control/admin marker la du; khong bat them user-list neu hypothesis chi la admin access.
-- BAC-01/admin: can control/admin API quyen cao that; status 200/generic admin/challenge metadata khong du.
+- BAC-01/admin: can control/admin API quyen cao that; status 200/generic admin/metadata marker khong du.
 - IDOR/BAC horizontal: user A/guest phai doc duoc object/data cu the cua user B; public list leak UserId/comment chi la INFO_EXPOSURE_ONLY.
 - BLF/stateful: can before/after state, non-zero delta, hoac state transition trai logic da verify.
 
@@ -122,7 +122,7 @@ Khong reject chi vi thieu HTTP form login neu dossier/Manager cho biet co auth c
 10. Verify condition mo ho: khong noi ro marker/status/delta nao xac nhan thanh cong.
 11. Khong co fallback path — chi 1 huong duy nhat ma khong co alternatives khi step fail.
 12. Bug `Auth Required: True` nhưng không có HTTP Examples, không có authenticated recon/session evidence, hoặc Red dùng credential không xuất hiện trong user prompt/dossier.
-13. Strategy dựa trên metadata lab như `/api/Challenges` chỉ vì response có tên challenge/admin marker, nhưng không chứng minh endpoint/chức năng BAC/BLF thực tế.
+13. Strategy dựa trên metadata/catalog endpoint chỉ vì response có admin/security marker, nhưng không chứng minh endpoint/chức năng BAC/BLF thực tế.
 14. BAC-03/IDOR strategy chỉ chứng minh public collection/info leak, không chứng minh object ownership bypass/cross-user access.
 15. BAC-01/admin strategy chỉ kiểm tra status 200/generic admin text, không chứng minh control/admin API cụ thể.
 
@@ -145,11 +145,12 @@ Khong reject chi vi thieu HTTP form login neu dossier/Manager cho biet co auth c
 
 === FORMAT OUTPUT ===
 Viet ngan gon (duoi 220 chu), bat dau bang duy nhat mot verdict:
-- APPROVED — bug_essence=<OK>; dossier_alignment=<OK>; verify=<OK>; ly_do=<1 cau>.
-- REJECTED — reason_type=<essence|path|auth|verify|scope>; gap=<1 loi lon nhat>; fix=<Red phai sua cu the gi>.
+- APPROVED — bug_essence=<OK>; dossier_alignment=<OK>; verify=<OK>; evidence_ref=<METHOD path/status hoac marker chinh>; ly_do=<1 cau>.
+- REJECTED — reason_type=<essence|path|auth|verify|scope>; evidence_ref=<METHOD path/status hoac missing>; gap=<1 loi lon nhat>; fix=<Red phai sua cu the gi>.
 - STOPPED — basis=<tai sao nen dung>; evidence=<dau hieu that bai/no-signal tu conversation>.
 
 Khong viet ca APPROVED lan REJECTED trong cung mot cau. Khong noi mo ho kieu "tam duoc".
+Moi verdict phai echo lai it nhat mot endpoint/method/status hoac evidence marker tu dossier de Manager audit duoc Blue da bam dung bug.
 
 ManageAgent se doc va quyet dinh buoc tiep theo. Khong can tag.
 """
@@ -272,6 +273,36 @@ class BlueTeamAgent:
             bug_str += "Response Clues:\n"
             for clue in response_clues[:8]:
                 bug_str += f"  - {clue}\n"
+
+        evidence_rules = bug.get("evidence_rules", []) or []
+        if evidence_rules:
+            bug_str += "Evidence Rules For This Bug:\n"
+            for rule in evidence_rules[:6]:
+                bug_str += f"  - {rule}\n"
+
+        graph_context = bug.get("graph_context") or {}
+        if graph_context:
+            summary = graph_context.get("summary") or {}
+            bug_str += (
+                "Guided Workflow / Graph Context:\n"
+                f"  - summary: nodes={summary.get('nodes', 0)}, "
+                f"edges={summary.get('edges', 0)}, "
+                f"business_chain={summary.get('business_chain', 0)}, "
+                f"api_hints={summary.get('api_hints', 0)}\n"
+            )
+            for step in (graph_context.get("business_chain") or [])[:5]:
+                bug_str += (
+                    f"  - business_chain[{step.get('context', '?')}]: "
+                    f"{step.get('step', '?')} -> {step.get('method', '?')} "
+                    f"{step.get('endpoint', '?')} status={step.get('status', '?')}\n"
+                )
+            for edge in (graph_context.get("edges") or [])[:5]:
+                bug_str += (
+                    f"  - edge[{edge.get('context', '?')}]: "
+                    f"{edge.get('from', '?')} -> {edge.get('to', '?')} "
+                    f"type={edge.get('type', '?')} method={edge.get('method', '-')}"
+                    f" status={edge.get('status', '-')}\n"
+                )
 
         bug_str += (
             f"{examples_text}\n\n"

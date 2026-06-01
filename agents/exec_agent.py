@@ -286,7 +286,7 @@ Ví dụ SAI (sẽ bị reject):
    - Khong tu them endpoint phu lam dieu kien thanh cong neu workflow khong yeu cau.
    - Neu da dat minimum proof cua hypothesis, in SHOT_RESULT: EXPLOITED va FINAL: EXPLOITED ngay.
    - BAC-01/admin: chi EXPLOITED khi low-privileged session thay control/admin API quyen cao that.
-     Status 200, generic "Admin", hoac challenge metadata khong du.
+     Status 200, generic "Admin", hoac metadata/catalog marker khong du.
    - IDOR/BAC horizontal: chi EXPLOITED khi user A/guest doc duoc object/data cu the cua user B.
      Public collection leak UserId/comment ma khong chung minh ownership bypass thi FINAL: PARTIAL.
    - BLF/stateful: chi EXPLOITED khi gia/balance/cart/order/state thay doi trai logic va co before/after,
@@ -348,6 +348,26 @@ Ví dụ SAI (sẽ bị reject):
    EARLY_STOP_ALLOWED: yes/no
    EARLY_STOP_REASON: <none hoac ly do bang chung da du cho BAC/IDOR read-only>
    FINAL_REASON: <1 cau giai thich vi sao EXPLOITED/PARTIAL/FAILED>
+
+10. HUMAN-READABLE PROOF OUTPUT BAT BUOC:
+   PoC duoc ban giao cho nguoi chay terminal, ho KHONG can doc code. Script phai in ra bang chung cu the:
+   - Moi request chinh:
+     PROOF_REQUEST: <METHOD path>
+     PROOF_STATUS: <HTTP status>
+     PROOF_RESPONSE: <JSON/text excerpt ngan, da redact token, chua field chung minh loi>
+   - Voi IDOR/BAC-03:
+     PROOF_IDOR: attacker_user_id=<A> victim_or_owner_user_id=<B> object_id=<id> owner_mismatch=<true/false>
+     PROOF_OTHER_USER_DATA: <JSON rut gon cua record nguoi khac: id/UserId/email/role/comment/message...>
+   - Voi BLF/stateful:
+     PROOF_STATE_BEFORE: <gia/cart/balance/quantity/order truoc>
+     PROOF_ACTION_RESPONSE: <response cua request thao tung>
+     PROOF_STATE_AFTER: <state sau>
+     PROOF_STATE_DELTA: <delta cu the, vi du total 100 -> 0 hoac quantity 5 -> 100>
+   - Voi BAC/admin/info exposure:
+     PROOF_ACCESS: anonymous_or_low_privileged=<true/false> endpoint=<path>
+     PROOF_RESPONSE: <field nhay cam/admin marker thuc te>
+   - Khong chi in "EXPLOITED". Neu khong in duoc response/object/state cu the thi ket luan PARTIAL/FAILED.
+   - Khi parse JSON, ho tro ca response list truc tiep va wrapper `{"status":"success","data": ...}`.
 
 === INPUT ===
 
@@ -811,7 +831,11 @@ class ExecAgent:
         if "final: exploited" in lower_result or "shot_result: exploited" in lower_result:
             print(f"\n{GREEN}{BOLD}[EXEC-AGENT] Phase 3: Generating PoC script...{RESET}")
             poc_script = self._generate_poc_from_evidence(
-                workflow_text, exploit_result, session_cookie, artifact_prefix,
+                workflow_text,
+                exploit_result,
+                session_cookie,
+                artifact_prefix,
+                current_bug=current_bug,
             )
             if poc_script:
                 poc_note = f"\n\n=== PoC SCRIPT ===\n{poc_script}"
@@ -906,12 +930,13 @@ class ExecAgent:
             state_dir = os.path.join(self.working_dir, "exploit_state", "current")
             os.makedirs(state_dir, exist_ok=True)
 
+        tool_round_budget = self._tool_round_budget(current_bug)
         system_prompt = EXPLOIT_TOOL_LOOP_PROMPT.format(
             bearer_token=bearer_token or "(none)",
             cookie_header=cookie_header or "(none)",
             auth_mechanism=auth_mechanism,
             strategy=workflow_text,
-            max_rounds=15,
+            max_rounds=tool_round_budget,
         )
         execution_context = self._build_tool_execution_context(
             current_bug=current_bug,
@@ -942,11 +967,22 @@ class ExecAgent:
         result = self._tool_loop(
             messages,
             default_tag="REDTEAM",
-            max_tool_rounds=15,
+            max_tool_rounds=tool_round_budget,
             mode_label="exploit",
         )
 
         return result
+
+    @staticmethod
+    def _tool_round_budget(current_bug: dict | None) -> int:
+        """Keep weak action-discovery candidates bounded without changing flow."""
+        if not current_bug:
+            return 15
+        candidate_type = str(current_bug.get("candidate_type", "") or "").upper()
+        evidence_status = str(current_bug.get("evidence_status", "") or "").upper()
+        if candidate_type == "ACTION_DISCOVERY" or evidence_status == "ACTION_DISCOVERY":
+            return 10
+        return 15
 
     def _build_tool_execution_context(
         self,
@@ -988,6 +1024,7 @@ class ExecAgent:
                     "title", "risk_level", "endpoint", "method", "auth_required",
                     "hypothesis", "exploit_approach", "verify_method",
                     "request_params", "form_fields", "response_clues",
+                    "evidence_rules", "graph_context",
                 )
                 if k in current_bug
             }
@@ -999,6 +1036,18 @@ class ExecAgent:
                 lines.append("")
                 lines.append("=== CURRENT BUG HTTP EXAMPLES ===")
                 lines.append(json.dumps(examples[:4], ensure_ascii=False, indent=2)[:8000])
+
+            graph_context = current_bug.get("graph_context") or {}
+            if isinstance(graph_context, dict) and graph_context:
+                lines.append("")
+                lines.append("=== CURRENT BUG GUIDED GRAPH CONTEXT ===")
+                lines.append(json.dumps(graph_context, ensure_ascii=False, indent=2)[:6000])
+
+            evidence_rules = current_bug.get("evidence_rules") or []
+            if evidence_rules:
+                lines.append("")
+                lines.append("=== CURRENT BUG EVIDENCE RULES ===")
+                lines.extend(f"- {rule}" for rule in evidence_rules[:8])
 
             related = self._load_related_raw_examples(current_bug)
             if related:
@@ -1057,6 +1106,7 @@ class ExecAgent:
         exploit_log: str,
         session_cookie: str,
         artifact_prefix: str | None = None,
+        current_bug: dict | None = None,
     ) -> str:
         """Generate a Python PoC script ONLY after tool-loop confirmed EXPLOITED.
 
@@ -1064,9 +1114,13 @@ class ExecAgent:
         """
         # Trim exploit log to keep relevant parts
         exploit_summary = truncate(exploit_log, 4000)
+        bug_context = self._build_poc_bug_context(current_bug)
 
         poc_prompt = f"""\
 Viết 1 Python script (requests library) REPRODUCE exploit đã verify thành công.
+
+== BUG DOSSIER ==
+{bug_context}
 
 == EXPLOIT LOG (đã verify EXPLOITED) ==
 {exploit_summary}
@@ -1082,6 +1136,24 @@ Target: {self.target_url}
 4. Lưu artifacts vào STATE_DIR (baseline.resp.txt, probe.resp.txt, result.json)
 5. KHÔNG khám phá thêm — chỉ reproduce exact requests từ log
 6. Script tối giản, chỉ cần chạy 1 lần để verify
+7. PoC dành cho người chạy terminal, nên PHẢI in bằng chứng cụ thể, không chỉ in EXPLOITED/FAILED.
+8. Mọi request chính PHẢI in:
+   - PROOF_REQUEST: <METHOD path>
+   - PROOF_STATUS: <HTTP status>
+   - PROOF_RESPONSE: <JSON/text excerpt đã truncate, chứa field chứng minh lỗi>
+9. Nếu là IDOR/BAC-03:
+   - In PROOF_IDOR: attacker_user_id=<A> victim_or_owner_user_id=<B> object_id=<id> owner_mismatch=<true/false>
+   - In PROOF_OTHER_USER_DATA: <JSON rút gọn của object/data người khác: email/role/comment/message/id/UserId...>
+10. Nếu là BLF/stateful:
+   - In PROOF_STATE_BEFORE: <giá/cart/balance/quantity/order trước khi thao túng>
+   - In PROOF_ACTION_RESPONSE: <response của request thao túng>
+   - In PROOF_STATE_AFTER: <state sau khi thao túng>
+   - In PROOF_STATE_DELTA: <delta cụ thể, ví dụ total 100 -> 0 hoặc quantity 5 -> 100>
+11. Nếu là BAC/admin/info exposure:
+   - In PROOF_ACCESS: anonymous_or_low_privileged=<true/false> endpoint=<path>
+   - In PROOF_RESPONSE: <JSON/text excerpt có field nhạy cảm hoặc admin marker thật>
+12. Khi parse JSON API, hỗ trợ cả dạng list trực tiếp và dạng wrapper `{{"status":"success","data": ...}}`.
+13. Không in full token/cookie. Nếu cần in auth, chỉ in prefix 12 ký tự và `...`.
 
 Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
 """
@@ -1090,18 +1162,39 @@ Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
             messages = [{"role": "system", "content": WORKFLOW_SCRIPT_PROMPT}]
             messages.append({"role": "user", "content": poc_prompt})
 
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.2,
-                max_tokens=3000,
-            )
-            text = response.choices[0].message.content or ""
-            # Extract Python code block
-            import re
-            match = re.search(r'```python\s*\n(.+?)```', text, re.DOTALL)
-            if match:
+            for attempt in range(2):
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=4200,
+                )
+                text = response.choices[0].message.content or ""
+                # Extract Python code block
+                match = re.search(r'```python\s*\n(.+?)```', text, re.DOTALL)
+                if not match:
+                    messages.append({
+                        "role": "user",
+                        "content": "Output thiếu ```python``` block. Hãy trả lại duy nhất một Python script hoàn chỉnh.",
+                    })
+                    continue
+
                 script = match.group(1)
+                errors = self._poc_output_contract_errors(script, workflow_text, current_bug)
+                if errors and attempt == 0:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "PoC chưa đạt output contract cho người dùng terminal:\n"
+                            + "\n".join(f"- {err}" for err in errors)
+                            + "\nHãy sửa script, giữ đúng exploit path, và in bằng chứng cụ thể."
+                        ),
+                    })
+                    continue
+                if errors:
+                    print(f"{YELLOW}[EXEC-AGENT] PoC rejected: {'; '.join(errors)}{RESET}")
+                    continue
+
                 # Save PoC script
                 poc_name = f"poc_{artifact_prefix or 'exploit'}.py"
                 poc_path = os.path.join(self.working_dir, poc_name)
@@ -1113,6 +1206,80 @@ Trả về DUY NHẤT 1 ```python``` block. KHÔNG viết gì khác.
             print(f"{YELLOW}[EXEC-AGENT] PoC generation error: {e}{RESET}")
 
         return ""
+
+    @staticmethod
+    def _build_poc_bug_context(current_bug: dict | None) -> str:
+        """Render a small bug dossier for PoC generation without bloating prompt."""
+        if not current_bug:
+            return "(none)"
+        fields = (
+            "id", "title", "category", "pattern_id", "candidate_type",
+            "evidence_status", "method", "endpoint", "auth_required",
+            "hypothesis", "verify_method",
+        )
+        payload = {key: current_bug.get(key) for key in fields if current_bug.get(key) is not None}
+        examples = current_bug.get("http_examples") or []
+        if examples:
+            payload["http_examples"] = examples[:3]
+        return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+    @staticmethod
+    def _poc_output_contract_errors(
+        script: str,
+        workflow_text: str,
+        current_bug: dict | None = None,
+    ) -> list[str]:
+        """Best-effort quality gate for generated PoC terminal output.
+
+        The PoC may still run without these markers, but a reportable PoC should
+        print the concrete response/state that proves the finding.
+        """
+        text = script or ""
+        lower = f"{workflow_text or ''}\n{json.dumps(current_bug or {}, default=str)}".lower()
+        errors: list[str] = []
+
+        required = (
+            "SHOT_RESULT:",
+            "EVIDENCE_SUMMARY:",
+            "VERIFY_COMPLETED:",
+            "FINAL_REASON:",
+            "PROOF_REQUEST:",
+            "PROOF_STATUS:",
+            "PROOF_RESPONSE:",
+        )
+        for marker in required:
+            if marker not in text:
+                errors.append(f"missing `{marker}` output")
+
+        is_idor = any(marker in lower for marker in ("idor", "bac-03", "object ownership", "owner"))
+        is_blf = any(
+            marker in lower
+            for marker in (
+                "blf", "business logic", "price", "quantity", "balance", "wallet",
+                "cart", "basket", "checkout", "order", "coupon", "delta", "before/after",
+            )
+        )
+        if is_idor:
+            if "PROOF_IDOR:" not in text:
+                errors.append("missing `PROOF_IDOR:` ownership mismatch output")
+            if "PROOF_OTHER_USER_DATA:" not in text:
+                errors.append("missing `PROOF_OTHER_USER_DATA:` leaked object output")
+        if is_blf:
+            for marker in (
+                "PROOF_STATE_BEFORE:",
+                "PROOF_ACTION_RESPONSE:",
+                "PROOF_STATE_AFTER:",
+                "PROOF_STATE_DELTA:",
+            ):
+                if marker not in text:
+                    errors.append(f"missing `{marker}` BLF before/action/after output")
+
+        try:
+            compile(text, "<generated-poc>", "exec")
+        except SyntaxError as exc:
+            errors.append(f"syntax error: {exc.msg} line {exc.lineno}")
+
+        return errors
 
     @staticmethod
     def _result_declares_verify_completed(result: str) -> bool:

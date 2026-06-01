@@ -400,7 +400,6 @@ class CrawlAgent:
                     url,
                     cookie_header=cookie_str or None,
                     storage_state_path=storage_state or None,
-                    bearer_token=login_context.get("bearer_token") or bearer_token_from_session(login_context),
                     max_pages=25,
                     max_rounds=1,
                     timeout=180,
@@ -1191,7 +1190,6 @@ class CrawlAgent:
         url: str,
         cookie_header: str | None = None,
         storage_state_path: str | None = None,
-        bearer_token: str | None = None,
         max_pages: int = 50,
         max_rounds: int = 2,
         timeout: int = 300,
@@ -1207,16 +1205,12 @@ class CrawlAgent:
         ]
         if cookie_header:
             cmd.extend(["-H", f"Cookie: {cookie_header}"])
-        if bearer_token:
-            cmd.extend(["-H", f"Authorization: Bearer {bearer_token}"])
         if storage_state_path:
             cmd.extend(["--storage-state", storage_state_path])
 
         _debug(f"Full crawler command: {' '.join(cmd)}")
         if cookie_header:
             _debug(f"Cookie header: {cookie_header[:80]}...")
-        if bearer_token:
-            _debug("Authorization bearer token: present")
         if storage_state_path:
             _debug(f"Storage state path: {storage_state_path}")
         print(f"{DIM}[CRAWL-AGENT] Running: {' '.join(cmd[:6])}...{RESET}")
@@ -1431,11 +1425,16 @@ class CrawlAgent:
             "admin", "config", "configuration", "settings",
             # Common patterns
             "categories", "reviews", "feedback", "Feedbacks",
-            "complaints", "Complaints", "questions", "answers",
+            "complaints", "Complaints",
+            "recycles", "Recycles",
+            "SecurityQuestions", "SecurityAnswers",
+            "Challenges", "Quantitys",
         ]
         # REST-style search/action endpoints
         rest_endpoints = [
             "products/search?q=",
+            "admin/application-version",
+            "admin/application-configuration",
             "languages",
             "captcha",
         ]
@@ -1883,32 +1882,14 @@ class CrawlAgent:
                         # Try to extract JWT token from response body
                         token = ""
                         token_location = ""
-                        storage_state = {}
-                        storage_path = ""
                         try:
                             data = resp.json()
                             if isinstance(data, dict):
-                                # Some APIs wrap bearer material under an authentication object.
+                                # Juice Shop style: {"authentication": {"token": "..."}}
                                 auth_obj = data.get("authentication")
                                 if isinstance(auth_obj, dict) and auth_obj.get("token"):
                                     token = str(auth_obj["token"])
                                     token_location = "body.authentication.token"
-                                    origin = f"{urlparse(target_url).scheme}://{urlparse(target_url).netloc}"
-                                    local_storage = [{"name": "token", "value": token}]
-                                    if auth_obj.get("bid") is not None:
-                                        local_storage.append({"name": "bid", "value": str(auth_obj.get("bid"))})
-                                    if auth_obj.get("umail"):
-                                        local_storage.append({"name": "email", "value": str(auth_obj.get("umail"))})
-                                    storage_state = {
-                                        "cookies": [],
-                                        "origins": [{
-                                            "origin": origin,
-                                            "localStorage": local_storage,
-                                        }],
-                                    }
-                                    state_path = storage_state_path(self.working_dir, label)
-                                    state_path.write_text(json.dumps(storage_state, ensure_ascii=False, indent=2), encoding="utf-8")
-                                    storage_path = str(state_path)
                                 # Generic: {"token": "..."}
                                 elif data.get("token"):
                                     token = str(data["token"])
@@ -1963,8 +1944,8 @@ class CrawlAgent:
                                 "auth_verified": True,
                                 "cookies": normalize_cookie_objects(cookies, target_url),
                                 "cookie_header": cookie_header_from_cookie_objects(cookies),
-                                "storage_state_path": storage_path,
-                                "storage_state": storage_state,
+                                "storage_state_path": "",
+                                "storage_state": {},
                                 "bearer_token": token,
                                 "verified_url": login_url,
                                 "notes": (
@@ -2247,10 +2228,11 @@ class CrawlAgent:
     def _dismiss_spa_overlays(page) -> None:
         """Dismiss common SPA overlays (popups, banners, cookie consent) before interacting.
 
-        Covers common SPA welcome/cookie banners, Angular CDK overlays,
-        generic modals, cookie consent bars, and close buttons.
+        Covers: Juice Shop welcome/cookie banners, Angular CDK overlays,
+        generic modals, cookie consent bars, and common close buttons.
         """
         dismiss_selectors = [
+            # Juice Shop specific
             'button.close-dialog',
             'button[aria-label="Close Welcome Banner"]',
             'a.cc-dismiss',                       # Cookie consent dismiss
@@ -2327,7 +2309,7 @@ class CrawlAgent:
         except Exception:
             pass
 
-        for path in ("/api/users/me", "/api/user/me", "/api/me", "/me", "/profile", "/account", "/my-account", "/#/profile", "/#/account"):
+        for path in ("/rest/user/whoami", "/api/users/me", "/api/me", "/profile", "/account", "/my-account", "/#/profile", "/#/basket"):
             verify_url = urljoin(target_url.rstrip("/") + "/", path.lstrip("/"))
             try:
                 if path.startswith("/#/"):
@@ -2716,15 +2698,6 @@ class CrawlAgent:
                 signals = (discovery.get("bac_signals") or []) + (discovery.get("blf_signals") or [])
                 if signals:
                     notes.append("signals: " + ", ".join(signals[:3]))
-                json_keys = response.get("json_keys") or []
-                numeric_fields = response.get("numeric_fields") or []
-                id_fields = response.get("id_fields") or []
-                if json_keys:
-                    notes.append("json: " + ", ".join(str(k) for k in json_keys[:5]))
-                if numeric_fields:
-                    notes.append("numeric: " + ", ".join(str(k) for k in numeric_fields[:4]))
-                if id_fields:
-                    notes.append("ids: " + ", ".join(str(k) for k in id_fields[:4]))
                 snippet = self._clean_html_text(response.get("body_snippet") or "")
                 if snippet and not notes:
                     notes.append(snippet[:80])
@@ -2750,16 +2723,6 @@ class CrawlAgent:
             lines.append(auth_section.rstrip())
             lines.append("")
 
-        workflow_section = self._render_workflow_graph_recon_section(raw_payload)
-        if workflow_section:
-            lines.append(workflow_section.rstrip())
-            lines.append("")
-
-        hint_section = self._render_static_api_hints_recon_section(raw_payload)
-        if hint_section:
-            lines.append(hint_section.rstrip())
-            lines.append("")
-
         structured = self._render_structured_recon_appendix(anon_data, auth_sessions)
         if structured:
             lines.append(structured.rstrip())
@@ -2771,11 +2734,10 @@ class CrawlAgent:
         lines.append("")
         lines.append("1. Normal crawl records observed pages, forms, XHR/fetch calls, cookies, params, and response clues.")
         lines.append("2. Bounded discovery probes common BAC and BLF surfaces using only GET/OPTIONS.")
-        lines.append("3. Guided workflow graph records chronological page/action/request edges for business chaining.")
-        lines.append("4. BAC coverage focuses on admin/management/API/user/role surfaces and client-visible identity cookies.")
-        lines.append("5. BLF coverage focuses on cart, checkout, order, payment, transfer, coupon, balance, price, quantity, and workflow-state surfaces.")
-        lines.append("6. Downstream agents should only create exploit strategies from rows in `Observed Endpoint Inventory`, `Guided Workflow Graph`, or active probes with `route_exists=true`.")
-        lines.append("7. Rows with only signals require verification; status 200 alone is not proof of BAC/BLF.")
+        lines.append("3. BAC coverage focuses on admin/management/API/user/role surfaces and client-visible identity cookies.")
+        lines.append("4. BLF coverage focuses on cart, checkout, order, payment, transfer, coupon, balance, price, quantity, and workflow-state surfaces.")
+        lines.append("5. Downstream agents should only create exploit strategies from rows in `Observed Endpoint Inventory` or active probes with `route_exists=true`.")
+        lines.append("6. Rows with only signals require verification; status 200 alone is not proof of BAC/BLF.")
         lines.append("")
 
         return "\n".join(lines).rstrip() + "\n"
@@ -2864,207 +2826,6 @@ class CrawlAgent:
                 lines.append(f"- Recommended body fields: `{', '.join(entry.get('recommended_body_fields') or [])}`")
                 lines.append(f"- Auth mechanism hint: `{entry.get('auth_mechanism', 'unknown')}`")
             lines.append("")
-        return "\n".join(lines).rstrip() + "\n"
-
-    @classmethod
-    def _render_workflow_graph_recon_section(cls, raw_payload: dict) -> str:
-        """Render guided crawler workflow evidence from crawl_raw.json."""
-        graphs: list[tuple[str, dict]] = []
-        anonymous = raw_payload.get("anonymous") or {}
-        if isinstance(anonymous.get("workflow_graph"), dict):
-            graphs.append(("anonymous", anonymous["workflow_graph"]))
-        for session in raw_payload.get("authenticated", []) or []:
-            if not isinstance(session, dict):
-                continue
-            data = session.get("data") or {}
-            graph = data.get("workflow_graph")
-            if isinstance(graph, dict):
-                graphs.append((f"auth:{session.get('label', 'auth')}", graph))
-
-        if not graphs:
-            return ""
-
-        lines: list[str] = []
-        lines.append("## Guided Workflow Graph")
-        lines.append("")
-        lines.append("This section is generated from the guided Playwright crawl. It is concrete runtime evidence, not model inference.")
-        lines.append("")
-        for label, graph in graphs:
-            nodes = graph.get("nodes") or []
-            edges = graph.get("edges") or []
-            lines.append(f"### `{label}`")
-            lines.append(f"- Nodes observed: {len(nodes)}")
-            lines.append(f"- Edges observed: {len(edges)}")
-
-            important_nodes = []
-            for node in nodes:
-                node_id = str(node.get("id", "") or "")
-                lower = node_id.lower()
-                if any(token in lower for token in (
-                    "login", "user", "profile", "basket", "cart", "order",
-                    "checkout", "payment", "quantity", "coupon", "admin",
-                    "product", "feedback", "complaint",
-                )):
-                    methods = ", ".join(node.get("methods") or []) or "-"
-                    important_nodes.append(f"`{node_id}` methods={methods}")
-            if important_nodes:
-                lines.append("- Business nodes: " + "; ".join(important_nodes[:20]))
-
-            important_edges = []
-            for edge in edges:
-                text = " ".join(str(edge.get(k, "") or "") for k in ("from", "to", "type", "method", "label")).lower()
-                if any(token in text for token in (
-                    "login", "user", "profile", "basket", "cart", "order",
-                    "checkout", "payment", "quantity", "coupon", "admin",
-                    "product", "feedback", "complaint",
-                )):
-                    method = f" {edge.get('method')}" if edge.get("method") else ""
-                    label_text = f" label={edge.get('label')}" if edge.get("label") else ""
-                    status = f" status={edge.get('status')}" if edge.get("status") else ""
-                    important_edges.append(
-                        f"`{edge.get('from', '?')}` -> `{edge.get('to', '?')}` "
-                        f"type={edge.get('type', '?')}{method}{status}{label_text}"
-                    )
-            if important_edges:
-                lines.append("- Business edges:")
-                for edge_line in important_edges[:30]:
-                    lines.append(f"  - {edge_line}")
-            lines.append("")
-
-        return "\n".join(lines).rstrip() + "\n"
-
-    @classmethod
-    def _render_static_api_hints_recon_section(cls, raw_payload: dict) -> str:
-        """Render static JS API hints and guided business probe steps."""
-        rows: list[tuple[str, dict]] = []
-        anonymous = raw_payload.get("anonymous") or {}
-        for hint in anonymous.get("api_hints") or []:
-            if isinstance(hint, dict):
-                rows.append(("anonymous", hint))
-        business_rows: list[tuple[str, dict]] = []
-        ai_decision_rows: list[tuple[str, dict]] = []
-        request_chain_rows: list[tuple[str, dict]] = []
-        auth_rows: list[tuple[str, dict]] = []
-        if isinstance(anonymous.get("auth_bootstrap"), dict) and anonymous.get("auth_bootstrap"):
-            auth_rows.append(("anonymous", anonymous["auth_bootstrap"]))
-        for step in anonymous.get("business_chain") or []:
-            if isinstance(step, dict):
-                business_rows.append(("anonymous", step))
-        for decision in anonymous.get("ai_decisions") or []:
-            if isinstance(decision, dict):
-                ai_decision_rows.append(("anonymous", decision))
-        for chain in anonymous.get("request_chains") or []:
-            if isinstance(chain, dict):
-                request_chain_rows.append(("anonymous", chain))
-        for session in raw_payload.get("authenticated", []) or []:
-            if not isinstance(session, dict):
-                continue
-            label = f"auth:{session.get('label', 'auth')}"
-            data = session.get("data") or {}
-            if isinstance(data.get("auth_bootstrap"), dict) and data.get("auth_bootstrap"):
-                auth_rows.append((label, data["auth_bootstrap"]))
-            for hint in data.get("api_hints") or []:
-                if isinstance(hint, dict):
-                    rows.append((label, hint))
-            for step in data.get("business_chain") or []:
-                if isinstance(step, dict):
-                    business_rows.append((label, step))
-            for decision in data.get("ai_decisions") or []:
-                if isinstance(decision, dict):
-                    ai_decision_rows.append((label, decision))
-            for chain in data.get("request_chains") or []:
-                if isinstance(chain, dict):
-                    request_chain_rows.append((label, chain))
-
-        if not rows and not business_rows and not auth_rows and not ai_decision_rows and not request_chain_rows:
-            return ""
-
-        lines: list[str] = []
-        lines.append("## Guided Auth And API Hints")
-        lines.append("")
-        lines.append("Static JS hints are not proof by themselves. Treat them as ACTION_DISCOVERY basis unless the same endpoint also appears in observed traffic.")
-        lines.append("")
-
-        if auth_rows:
-            lines.append("### Auth Bootstrap Checks")
-            lines.append("")
-            for label, item in auth_rows:
-                checks = item.get("checks") or []
-                lines.append(
-                    f"- `{label}`: has_token={bool(item.get('has_token'))}, "
-                    f"bid=`{item.get('bid', '')}`, verified={bool(item.get('verified'))}"
-                )
-                for check in checks[:5]:
-                    if check.get("error"):
-                        lines.append(f"  - `{check.get('endpoint', '?')}` error={cls._md_cell(check.get('error'))}")
-                    else:
-                        lines.append(
-                            f"  - `{check.get('endpoint', '?')}` status={check.get('status', '?')} "
-                            f"has_basket_data={check.get('has_basket_data', '-')}"
-                        )
-            lines.append("")
-
-        if business_rows:
-            lines.append("### Guided Business Chain")
-            lines.append("")
-            lines.append("| Context | Step | Method | Endpoint | Status | Before | After |")
-            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
-            for label, step in business_rows[:80]:
-                lines.append(
-                    f"| `{label}` | {cls._md_cell(step.get('step', '-'))} | "
-                    f"`{step.get('method', '?')}` | `{step.get('endpoint', '/')}` | {step.get('status', '?')} | "
-                    f"`{step.get('state_before', '-')}` | `{step.get('state_after', '-')}` |"
-                )
-            lines.append("")
-
-        if ai_decision_rows:
-            lines.append("### AI-Guided Crawl Decisions")
-            lines.append("")
-            lines.append("| Context | Step | Action | Reason | Candidates | Model |")
-            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
-            for label, decision in ai_decision_rows[:80]:
-                lines.append(
-                    f"| `{label}` | {decision.get('step', '?')} | `{decision.get('action_id', '?')}` | "
-                    f"{cls._md_cell(decision.get('reason', '-'))} | {decision.get('candidate_count', '-')} | "
-                    f"`{decision.get('model', '-')}` |"
-                )
-            lines.append("")
-
-        if request_chain_rows:
-            lines.append("### AI Request Chains")
-            lines.append("")
-            lines.append("| Context | Action | Before -> After | Emitted Requests |")
-            lines.append("| :--- | :--- | :--- | :--- |")
-            for label, chain in request_chain_rows[:60]:
-                emitted = []
-                for req in (chain.get("emitted_requests") or [])[:6]:
-                    emitted.append(
-                        f"{req.get('method', '?')} {req.get('endpoint', '?')} status={req.get('status', '?')}"
-                    )
-                lines.append(
-                    f"| `{label}` | `{chain.get('action_id', '?')}` {cls._md_cell(chain.get('label', '-'))} | "
-                    f"`{chain.get('before_endpoint', '-')}` -> `{chain.get('after_endpoint', '-')}` | "
-                    f"{cls._md_cell('; '.join(emitted) or '-')} |"
-                )
-            lines.append("")
-
-        if rows:
-            lines.append("### Static JS API Hints")
-            lines.append("")
-            lines.append("| Context | Method | Path Template | Source | Reason |")
-            lines.append("| :--- | :--- | :--- | :--- | :--- |")
-            seen: set[tuple[str, str, str]] = set()
-            for label, hint in rows[:120]:
-                key = (label, str(hint.get("method", "")), str(hint.get("path", "")))
-                if key in seen:
-                    continue
-                seen.add(key)
-                lines.append(
-                    f"| `{label}` | `{hint.get('method', '?')}` | `{hint.get('path', '/')}` | "
-                    f"`{hint.get('source', '-')}` | {cls._md_cell(hint.get('reason', '-'))} |"
-                )
-            lines.append("")
-
         return "\n".join(lines).rstrip() + "\n"
 
 
@@ -3975,9 +3736,6 @@ class CrawlAgent:
                         "headers": useful_resp_headers,
                         "body_snippet": resp_body,
                         "body_size": len(req.get("response_body") or ""),
-                        "json_keys": req.get("response_json_keys", []),
-                        "numeric_fields": req.get("response_numeric_fields", []),
-                        "id_fields": req.get("response_id_fields", []),
                     },
                     "auth_session": session_label,
                     "resource_type": resource_type,
@@ -4122,39 +3880,6 @@ class CrawlAgent:
 
             parts.append(f"Summary: {len(traffic)} total, {len(filtered)} useful, "
                          f"{len(pages)} pages, {len(api)} API, {len(forms)} forms")
-
-        ai_decisions = data.get("ai_decisions", [])
-        if ai_decisions:
-            parts.append("\n## AI-Guided Crawl Decisions")
-            for item in ai_decisions[:20]:
-                parts.append(
-                    f"  Step {item.get('step', '?')}: action={item.get('action_id', '?')} "
-                    f"reason={item.get('reason', '-')}"
-                )
-
-        request_chains = data.get("request_chains", [])
-        if request_chains:
-            parts.append("\n## AI Request Chains")
-            for chain in request_chains[:20]:
-                parts.append(
-                    f"  ACTION {chain.get('action_id', '?')} {chain.get('label', '')}: "
-                    f"{chain.get('before_endpoint', '?')} -> {chain.get('after_endpoint', '?')} "
-                    f"status={chain.get('status', '?')}"
-                )
-                for req in (chain.get("emitted_requests") or [])[:8]:
-                    parts.append(
-                        f"    - {req.get('method', '?')} {req.get('endpoint', '?')} "
-                        f"status={req.get('status', '?')} json={req.get('json_keys', [])[:5]}"
-                    )
-
-        business_chain = data.get("business_chain", [])
-        if business_chain:
-            parts.append("\n## Guided Business Chain")
-            for step in business_chain[:80]:
-                parts.append(
-                    f"  {step.get('step', '?')}: {step.get('method', '?')} {step.get('endpoint', '?')} "
-                    f"status={step.get('status', '?')} before={step.get('state_before', '-')} after={step.get('state_after', '-')}"
-                )
 
         # External links
         external = data.get("external_links", [])

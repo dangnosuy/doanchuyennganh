@@ -83,7 +83,7 @@ Ban KHONG dung tool, KHONG viet curl/code, KHONG viet review dai.
 - ANTI-OVERFITTING: khong hardcode endpoint/marker cua mot lab. Endpoint, marker, account, payload phai den tu dossier/recon/current conversation.
 - MINIMUM SUFFICIENT PROOF: chi dat dieu kien thanh cong toi thieu de chung minh hypothesis, khong bat endpoint/tac dong phu.
 - BAC vertical/admin: user thuong/guest phai thay control/admin API quyen cao that. Status 200, generic Admin,
-  hoac challenge metadata khong du.
+  hoac metadata/catalog marker khong du.
 - IDOR/BAC horizontal: user A/guest doc duoc object/data cu the cua user B la EXPLOITED.
 - BLF/stateful: thao tung duoc state/gia/balance/cart/order theo huong trai logic la EXPLOITED, phai co
   before/after hoac non-zero delta.
@@ -405,6 +405,36 @@ class RedTeamAgent:
             bug_text += "  Suggested Generic Attack Variants:\n"
             for variant in attack_variants[:8]:
                 bug_text += f"    - {variant}\n"
+
+        evidence_rules = bug.get("evidence_rules", []) or []
+        if evidence_rules:
+            bug_text += "  Evidence Rules For This Bug:\n"
+            for rule in evidence_rules[:6]:
+                bug_text += f"    - {rule}\n"
+
+        graph_context = bug.get("graph_context") or {}
+        if graph_context:
+            summary = graph_context.get("summary") or {}
+            bug_text += (
+                "  Guided Workflow / Graph Context:\n"
+                f"    - summary: nodes={summary.get('nodes', 0)}, "
+                f"edges={summary.get('edges', 0)}, "
+                f"business_chain={summary.get('business_chain', 0)}, "
+                f"api_hints={summary.get('api_hints', 0)}\n"
+            )
+            for step in (graph_context.get("business_chain") or [])[:5]:
+                bug_text += (
+                    f"    - business_chain[{step.get('context', '?')}]: "
+                    f"{step.get('step', '?')} -> {step.get('method', '?')} "
+                    f"{step.get('endpoint', '?')} status={step.get('status', '?')}\n"
+                )
+            for edge in (graph_context.get("edges") or [])[:5]:
+                bug_text += (
+                    f"    - edge[{edge.get('context', '?')}]: "
+                    f"{edge.get('from', '?')} -> {edge.get('to', '?')} "
+                    f"type={edge.get('type', '?')} method={edge.get('method', '-')}"
+                    f" status={edge.get('status', '-')}\n"
+                )
 
         bug_text += (
             f"{examples_text}\n\n"

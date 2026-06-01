@@ -5,6 +5,7 @@ __pycache__/
 
 # Project runtime outputs
 workspace/
+reports/
 *.har
 cookiejar*.txt
 cookies.txt

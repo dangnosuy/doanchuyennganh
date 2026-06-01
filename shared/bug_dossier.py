@@ -21,6 +21,10 @@ REQUEST_PARAM_LIMIT = 20
 FORM_FIELD_LIMIT = 20
 RESPONSE_CLUE_LIMIT = 8
 COOKIE_SURFACE_LIMIT = 8
+GRAPH_NODE_LIMIT = 8
+GRAPH_EDGE_LIMIT = 12
+BUSINESS_CHAIN_LIMIT = 8
+API_HINT_LIMIT = 8
 
 IDENTITY_COOKIE_NAMES = {
     "role", "roles", "user_id", "userid", "user", "uid", "account_id",
@@ -350,11 +354,159 @@ def _request_text(record: dict) -> str:
     return "\n".join(lines)
 
 
+def _request_text_from_example(example: dict, endpoint: str = "", method: str = "") -> str:
+    existing = example.get("request")
+    if isinstance(existing, str) and existing.strip():
+        return existing
+
+    raw_method = str(example.get("method") or method or "GET").upper()
+    raw_path = str(example.get("path") or endpoint or "/").strip() or "/"
+    if raw_path.startswith("http://") or raw_path.startswith("https://"):
+        parsed = urlparse(raw_path)
+        raw_path = parsed.path or "/"
+        if parsed.query:
+            raw_path += "?" + parsed.query
+
+    lines = [f"{raw_method} {raw_path} HTTP/1.1"]
+    body = example.get("request_body")
+    if body is None and isinstance(example.get("request"), dict):
+        body = example.get("request", {}).get("body")
+    if body:
+        lines.append("")
+        lines.append(str(body)[:1200])
+    return "\n".join(lines)
+
+
+def _path_from_request_text(request_text: str) -> str:
+    first = str(request_text or "").splitlines()[0] if request_text else ""
+    parts = first.split()
+    if len(parts) >= 2 and parts[0].isalpha():
+        return parts[1]
+    return ""
+
+
+def normalize_http_example(example: dict, endpoint: str = "", method: str = "") -> dict:
+    """Return one HTTP example with both current and legacy prompt fields.
+
+    VulnHunter currently emits compact examples as method/path/status, while
+    Red/Blue/Manager prompts historically read request/response_status. Keep
+    both forms so all agents see the same evidence.
+    """
+    if not isinstance(example, dict):
+        return {}
+
+    normalized = dict(example)
+    raw_method = str(normalized.get("method") or method or "GET").upper()
+    request_text = _request_text_from_example(normalized, endpoint=endpoint, method=raw_method)
+    path = str(normalized.get("path") or _path_from_request_text(request_text) or endpoint or "/")
+    status = normalized.get("response_status", normalized.get("status"))
+    session = (
+        normalized.get("session_label")
+        or normalized.get("auth_session")
+        or normalized.get("context")
+        or "anonymous"
+    )
+    response_snippet = normalized.get("response_snippet")
+    if response_snippet is None and isinstance(normalized.get("response"), dict):
+        response_snippet = normalized.get("response", {}).get("body_snippet", "")
+    response_snippet = str(response_snippet or "")
+    if len(response_snippet) > RESPONSE_SNIPPET_LIMIT:
+        response_snippet = response_snippet[:RESPONSE_SNIPPET_LIMIT] + "..."
+
+    content_type = normalized.get("content_type")
+    if not content_type and isinstance(normalized.get("response"), dict):
+        headers = normalized.get("response", {}).get("headers", {}) or {}
+        content_type = headers.get("content-type") or headers.get("Content-Type") or ""
+
+    provenance = str(normalized.get("provenance") or "crawl")
+    why = str(normalized.get("why_relevant") or "").strip()
+    if not why:
+        bits = [f"{raw_method} {path}", f"provenance={provenance}", f"session={session}"]
+        if normalized.get("discovery"):
+            bits.append("has_discovery_basis")
+        why = "; ".join(bits)
+
+    normalized.update({
+        "method": raw_method,
+        "path": path,
+        "status": status,
+        "request": request_text,
+        "response_status": status,
+        "response_snippet": response_snippet,
+        "content_type": content_type or "",
+        "auth_session": session,
+        "session_label": session,
+        "provenance": provenance,
+        "why_relevant": why,
+    })
+    return normalized
+
+
+def _normalize_http_examples(examples: list[dict], endpoint: str, method: str) -> list[dict]:
+    normalized: list[dict] = []
+    for example in examples or []:
+        item = normalize_http_example(example, endpoint=endpoint, method=method)
+        if item:
+            normalized.append(item)
+        if len(normalized) >= HTTP_EXAMPLES_LIMIT:
+            break
+    return normalized
+
+
 def _path_regex(endpoint: str) -> re.Pattern[str]:
     path = urlparse(endpoint if "://" in endpoint else f"http://x{endpoint}").path or endpoint or "/"
     path = re.sub(r"\{[^}/]+\}", r"[^/]+", path)
     path = re.sub(r"<[^>/]+>", r"[^/]+", path)
     return re.compile(rf"^{path}$", re.IGNORECASE)
+
+
+def _family_path(path: str) -> str:
+    path = str(path or "").split("?", 1)[0].rstrip("/") or "/"
+    parts = []
+    for segment in path.split("/"):
+        if not segment:
+            continue
+        if re.fullmatch(r"\d+", segment):
+            parts.append("{id}")
+        else:
+            parts.append(segment)
+    return "/" + "/".join(parts) if parts else "/"
+
+
+def _endpoint_path(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text if "://" in text else f"http://x{text}")
+    path = parsed.path or text
+    if parsed.query:
+        path += "?" + parsed.query
+    return path.rstrip("/") or "/"
+
+
+def _endpoint_tokens(path: str) -> set[str]:
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", str(path or "").lower())
+        if token and token not in {"id", "bid", "uuid"}
+    }
+
+
+def _endpoint_matches(endpoint: str, candidate: str) -> bool:
+    endpoint_path = _endpoint_path(endpoint)
+    candidate_path = _endpoint_path(candidate)
+    if not endpoint_path or not candidate_path:
+        return False
+    try:
+        if _path_regex(endpoint_path).match(candidate_path):
+            return True
+    except Exception:
+        pass
+    if _family_path(endpoint_path).lower() == _family_path(candidate_path).lower():
+        return True
+    endpoint_tokens = _endpoint_tokens(endpoint_path)
+    candidate_tokens = _endpoint_tokens(candidate_path)
+    return bool(endpoint_tokens and endpoint_tokens <= candidate_tokens)
 
 
 def _match_records(endpoint: str, method: str, crawl_payload: dict) -> list[dict]:
@@ -411,13 +563,20 @@ def _build_http_examples(records: list[dict], endpoint: str) -> list[dict]:
             why += f" with authenticated session {record['_session_label']}"
         if response_clues:
             why += "; " + "; ".join(response_clues[:2])
-        examples.append({
+        examples.append(normalize_http_example({
+            "method": record.get("method", "GET"),
+            "path": urlparse(record.get("url", "")).path or endpoint,
+            "status": record.get("response_status"),
+            "request_body": record.get("postData"),
+            "content_type": content_type,
+            "auth_session": record.get("_session_label", "anonymous"),
+            "provenance": "crawl",
             "request": _request_text(record),
             "response_status": record.get("response_status"),
             "response_snippet": (body[:RESPONSE_SNIPPET_LIMIT] + "...") if len(body) > RESPONSE_SNIPPET_LIMIT else body,
             "why_relevant": why,
             "session_label": record.get("_session_label", "anonymous"),
-        })
+        }, endpoint=endpoint, method=str(record.get("method", "GET"))))
         if len(examples) >= HTTP_EXAMPLES_LIMIT:
             break
     return examples
@@ -614,6 +773,268 @@ def _derive_attack_variants(
     return deduped[:8]
 
 
+def _graph_payloads(crawl_payload: dict) -> list[tuple[str, dict]]:
+    payloads: list[tuple[str, dict]] = []
+    anonymous = crawl_payload.get("anonymous") or {}
+    if isinstance(anonymous, dict):
+        payloads.append(("anonymous", anonymous))
+    for auth_entry in crawl_payload.get("authenticated", []) or []:
+        if not isinstance(auth_entry, dict):
+            continue
+        label = str(auth_entry.get("label", "authenticated") or "authenticated")
+        data = auth_entry.get("data") or {}
+        if isinstance(data, dict):
+            payloads.append((f"auth:{label}", data))
+    return payloads
+
+
+def _compact_graph_node(label: str, node: dict) -> dict:
+    return {
+        "context": label,
+        "id": node.get("id", ""),
+        "kind": node.get("kind", ""),
+        "methods": node.get("methods") or [],
+        "title": node.get("title", ""),
+    }
+
+
+def _compact_graph_edge(label: str, edge: dict) -> dict:
+    return {
+        "context": label,
+        "from": edge.get("from", ""),
+        "to": edge.get("to", ""),
+        "type": edge.get("type", ""),
+        "method": edge.get("method", ""),
+        "status": edge.get("status", ""),
+        "label": edge.get("label", ""),
+    }
+
+
+def _collect_graph_context(crawl_payload: dict, endpoint: str, method: str) -> dict:
+    """Collect workflow graph/API hint evidence relevant to one bug endpoint."""
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    business_chain: list[dict] = []
+    api_hints: list[dict] = []
+    seen_nodes: set[tuple[str, str]] = set()
+    seen_edges: set[tuple[str, str, str, str, str]] = set()
+    seen_steps: set[tuple[str, str, str, str]] = set()
+    seen_hints: set[tuple[str, str, str]] = set()
+    bug_method = str(method or "").upper()
+
+    for label, payload in _graph_payloads(crawl_payload):
+        graph = payload.get("workflow_graph") or {}
+        if isinstance(graph, dict):
+            for node in graph.get("nodes") or []:
+                if not isinstance(node, dict):
+                    continue
+                node_id = str(node.get("id") or node.get("url") or "")
+                if not _endpoint_matches(endpoint, node_id):
+                    continue
+                marker = (label, node_id)
+                if marker in seen_nodes:
+                    continue
+                seen_nodes.add(marker)
+                nodes.append(_compact_graph_node(label, node))
+
+            for edge in graph.get("edges") or []:
+                if not isinstance(edge, dict):
+                    continue
+                edge_method = str(edge.get("method") or "").upper()
+                if bug_method and edge_method and edge_method != bug_method:
+                    method_score = 0
+                else:
+                    method_score = 1
+                touches_endpoint = (
+                    _endpoint_matches(endpoint, str(edge.get("from") or ""))
+                    or _endpoint_matches(endpoint, str(edge.get("to") or ""))
+                )
+                if not touches_endpoint and not method_score:
+                    continue
+                if not touches_endpoint:
+                    continue
+                marker = (
+                    label,
+                    str(edge.get("from") or ""),
+                    str(edge.get("to") or ""),
+                    str(edge.get("type") or ""),
+                    str(edge.get("method") or ""),
+                )
+                if marker in seen_edges:
+                    continue
+                seen_edges.add(marker)
+                edges.append(_compact_graph_edge(label, edge))
+
+        for step in payload.get("business_chain") or []:
+            if not isinstance(step, dict):
+                continue
+            step_endpoint = str(step.get("endpoint") or "")
+            step_method = str(step.get("method") or "").upper()
+            if not _endpoint_matches(endpoint, step_endpoint):
+                continue
+            if bug_method and step_method and step_method != bug_method:
+                continue
+            marker = (label, str(step.get("step") or ""), step_method, step_endpoint)
+            if marker in seen_steps:
+                continue
+            seen_steps.add(marker)
+            business_chain.append({
+                "context": label,
+                "step": step.get("step", ""),
+                "method": step.get("method", ""),
+                "endpoint": step_endpoint,
+                "status": step.get("status", ""),
+            })
+
+        for hint in payload.get("api_hints") or []:
+            if not isinstance(hint, dict):
+                continue
+            hint_path = str(hint.get("path") or "")
+            hint_method = str(hint.get("method") or "").upper()
+            if not _endpoint_matches(endpoint, hint_path):
+                continue
+            if bug_method and hint_method and hint_method != bug_method:
+                continue
+            marker = (label, hint_method, hint_path)
+            if marker in seen_hints:
+                continue
+            seen_hints.add(marker)
+            api_hints.append({
+                "context": label,
+                "method": hint.get("method", ""),
+                "path": hint_path,
+                "source": hint.get("source", ""),
+                "reason": hint.get("reason", ""),
+            })
+
+    context = {
+        "nodes": nodes[:GRAPH_NODE_LIMIT],
+        "edges": edges[:GRAPH_EDGE_LIMIT],
+        "business_chain": business_chain[:BUSINESS_CHAIN_LIMIT],
+        "api_hints": api_hints[:API_HINT_LIMIT],
+    }
+    context["summary"] = {
+        "nodes": len(nodes),
+        "edges": len(edges),
+        "business_chain": len(business_chain),
+        "api_hints": len(api_hints),
+    }
+    return context
+
+
+FLOW_CONTEXT_LIMIT = 4
+
+
+def _collect_flow_context(run_dir: str, endpoint: str, method: str) -> dict:
+    """Collect matching flows from business_flows.json for one bug endpoint."""
+    flows_path = Path(run_dir) / "business_flows.json"
+    if not flows_path.exists():
+        return {}
+    try:
+        data = json.loads(flows_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    flows = data.get("flows", [])
+    if not isinstance(flows, list):
+        return {}
+
+    bug_method = str(method or "").upper()
+    matched_flows: list[dict] = []
+
+    for flow in flows:
+        if not isinstance(flow, dict):
+            continue
+        flow_steps = flow.get("steps", [])
+        if not isinstance(flow_steps, list):
+            continue
+
+        touches_endpoint = False
+        for step in flow_steps:
+            step_endpoint = str(step.get("endpoint") or "")
+            step_method = str(step.get("method") or "").upper()
+            if _endpoint_matches(endpoint, step_endpoint):
+                if bug_method and step_method and step_method != bug_method:
+                    continue
+                touches_endpoint = True
+                break
+
+        if not touches_endpoint:
+            continue
+
+        flow_summary = {
+            "id": flow.get("id", ""),
+            "name": flow.get("name", ""),
+            "type": flow.get("type", ""),
+            "confidence": flow.get("confidence", ""),
+            "step_count": len(flow_steps),
+            "vulnerable_steps": [
+                {
+                    "step_order": vs.get("step_order", ""),
+                    "pattern": vs.get("pattern", ""),
+                    "reason": vs.get("reason", ""),
+                    "test_payload": vs.get("test_payload"),
+                }
+                for vs in flow.get("vulnerable_steps", [])
+                if isinstance(vs, dict)
+            ],
+            "matching_steps": [
+                {
+                    "order": s.get("order", ""),
+                    "step_name": s.get("step_name", ""),
+                    "endpoint": s.get("endpoint", ""),
+                    "method": s.get("method", ""),
+                    "state_before": s.get("state_before"),
+                    "state_after": s.get("state_after"),
+                    "state_change_verified": s.get("state_change_verified", False),
+                }
+                for s in flow_steps
+                if isinstance(s, dict) and _endpoint_matches(endpoint, str(s.get("endpoint") or ""))
+            ],
+            "all_endpoints": [
+                str(s.get("endpoint", "")) for s in flow_steps
+                if isinstance(s, dict) and s.get("endpoint")
+            ],
+        }
+        matched_flows.append(flow_summary)
+
+    if not matched_flows:
+        return {}
+
+    total_vuln_steps = sum(
+        len(f.get("vulnerable_steps", [])) for f in matched_flows
+    )
+    return {
+        "flows": matched_flows[:FLOW_CONTEXT_LIMIT],
+        "summary": {
+            "flow_count": len(matched_flows),
+            "total_vulnerable_steps": total_vuln_steps,
+        },
+    }
+
+
+def _derive_evidence_rules(bug: dict, http_examples: list[dict], graph_context: dict) -> list[str]:
+    provenances = {
+        str(example.get("provenance", "crawl") or "crawl")
+        for example in http_examples or []
+        if isinstance(example, dict)
+    }
+    rules: list[str] = []
+    if "action_discovery" in provenances or str(bug.get("candidate_type", "")).upper() == "ACTION_DISCOVERY":
+        rules.append("ACTION_DISCOVERY: grounded by nearby crawl/static evidence; Exec must probe before treating it as vulnerable.")
+    if "active_discovery" in provenances:
+        rules.append("ACTIVE_DISCOVERY: route-like read-only probe exists; status alone is not proof.")
+    if "crawl" in provenances:
+        rules.append("CRAWL_OBSERVED: request/response was captured during browser or guided API crawl.")
+    if (graph_context or {}).get("business_chain"):
+        rules.append("BUSINESS_CHAIN: endpoint appears in guided authenticated workflow; preserve method and state order.")
+    if str(bug.get("pattern_id", "")).upper().startswith("BAC-03"):
+        rules.append("BAC-03 proof needs cross-user/object ownership evidence, not only status 200.")
+    if str(bug.get("pattern_id", "")).upper().startswith("BLF"):
+        rules.append("BLF proof needs before/after state, non-zero delta, or invalid state transition.")
+    return rules[:6]
+
+
 def _normalize_endpoint(bug: dict, records: list[dict]) -> str:
     endpoint = str(bug.get("endpoint", "")).strip()
     if endpoint:
@@ -748,6 +1169,23 @@ def enrich_bugs(run_dir: str, bugs: list[dict]) -> list[dict]:
                 cookie_attack_surface,
             )
 
+        http_examples = _normalize_http_examples(http_examples, endpoint, method)
+        graph_context = bug.get("graph_context")
+        if not isinstance(graph_context, dict) or not graph_context:
+            graph_context = _collect_graph_context(crawl_payload, endpoint, method)
+
+        # Inject flow_context from business_flows.json
+        flow_context = _collect_flow_context(run_dir, endpoint, method)
+        if flow_context:
+            graph_context["flow_context"] = flow_context
+            gc_summary = graph_context.get("summary", {})
+            if isinstance(gc_summary, dict):
+                gc_summary["flows"] = len(flow_context.get("flows", []))
+
+        evidence_rules = bug.get("evidence_rules")
+        if not isinstance(evidence_rules, list) or not evidence_rules:
+            evidence_rules = _derive_evidence_rules(bug, http_examples, graph_context)
+
         enriched = dict(bug)
         enriched.update({
             "id": bug.get("id") or f"BUG-{idx + 1:03d}",
@@ -761,6 +1199,8 @@ def enrich_bugs(run_dir: str, bugs: list[dict]) -> list[dict]:
             "exploit_approach": _infer_exploit_approach(bug, endpoint, payload),
             "verify_method": _infer_verify_method(bug, endpoint, response_clues),
             "http_examples": http_examples[:HTTP_EXAMPLES_LIMIT],
+            "graph_context": graph_context,
+            "evidence_rules": evidence_rules,
             "auth_required": auth_required,
             "auth_credentials_needed": auth_credentials_needed,
             "request_params": request_params[:REQUEST_PARAM_LIMIT],

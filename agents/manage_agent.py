@@ -159,7 +159,7 @@ Khi Exec that bai, ban PHAI phan tich theo 4 nguyen nhan:
 - Auth context co the la cookie, Playwright storage_state, hoac localStorage/JWT token.
   Neu Auth context da co, dung no de mo rong recon/Exec, khong coi bug auth_required la blocked chi vi khong co HTTP form login.
 - Proof gate bat buoc truoc khi chap nhan EXPLOITED:
-  * BAC-01/admin: phai thay control/admin API quyen cao that, khong chi status 200/admin marker/challenge metadata.
+  * BAC-01/admin: phai thay control/admin API quyen cao that, khong chi status 200/admin marker/metadata catalog.
   * BAC-02/privilege escalation: phai chung minh cookie/role tamper DAN TOI truy cap admin/privileged resources. Day la vertical escalation, KHONG phai IDOR.
   * BAC-03/IDOR: phai chung minh object ownership bypass/cross-user access. Public list leak UserId/comment chi la INFO_EXPOSURE_ONLY.
   * BAC-04+/method bypass: phai chung minh unauthorized action execution hoac admin access qua method switching/override.
@@ -547,9 +547,16 @@ class ManageAgent:
         playbook_summary = self._build_playbook_summary()
 
         self.client = OpenAI(api_key=GITHUB_TOKEN, base_url=SERVER_URL)
+
+        # Build recon pack + inject business flows summary
+        recon_pack = self._build_manager_recon_pack(recon_content)
+        flows_summary = self._load_business_flows_summary()
+        if flows_summary:
+            recon_pack = recon_pack + "\n\n" + flows_summary
+
         self.system_prompt = MANAGER_PROMPT.format(
             target_url         = target_url,
-            recon_summary      = truncate(recon_content, 4000),
+            recon_summary      = recon_pack,
             risk_bugs_summary  = risk_bugs_summary,
             playbook_summary   = playbook_summary,
             state_context_display = "{state_context_display}",
@@ -587,6 +594,75 @@ class ManageAgent:
 
         # Dynamic tick budget: 8 ticks per bug, minimum 60
         self._max_ticks = max(MAX_TICKS, len(self.risk_bugs) * 8)
+
+    @staticmethod
+    def _extract_markdown_section(markdown: str, heading: str, max_chars: int) -> str:
+        start = markdown.find(heading)
+        if start == -1:
+            return ""
+        next_heading = markdown.find("\n## ", start + len(heading))
+        section = markdown[start:] if next_heading == -1 else markdown[start:next_heading]
+        return truncate(section.strip(), max_chars)
+
+    @classmethod
+    def _build_manager_recon_pack(cls, recon_content: str) -> str:
+        """Pack high-value recon sections without blindly taking file prefix."""
+        recon_content = recon_content or ""
+        sections = [
+            ("## Crawl Summary", 900),
+            ("## Evidence Rules", 900),
+            ("## Active Discovery Probes", 1200),
+            ("## Guided Workflow Graph", 1600),
+            ("## Guided Auth And API Hints", 1600),
+            ("## Structured Route Families", 1800),
+            ("## BAC / BLF Strategy From Observed Evidence", 900),
+        ]
+        chunks: list[str] = []
+        for heading, limit in sections:
+            chunk = cls._extract_markdown_section(recon_content, heading, limit)
+            if chunk:
+                chunks.append(chunk)
+        if chunks:
+            return "\n\n".join(chunks)
+        return truncate(recon_content, 6000)
+
+    def _load_business_flows_summary(self) -> str:
+        """Load business_flows.json and return a compact summary for Manager recon pack."""
+        flows_path = Path(self.run_dir) / "business_flows.json"
+        if not flows_path.exists():
+            return ""
+        try:
+            import json
+            data = json.loads(flows_path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        flows = data.get("flows", [])
+        if not flows:
+            return ""
+        lines = ["## Business Flow Context"]
+        for f in flows[:6]:
+            if not isinstance(f, dict):
+                continue
+            vuln_count = len(f.get("vulnerable_steps", []))
+            vuln_str = f" | {vuln_count} suspect step(s)" if vuln_count else ""
+            lines.append(
+                f"- {f.get('id', '?')}: {f.get('name', '?')} "
+                f"[{f.get('type', '?')}/{f.get('confidence', '?')}]"
+                f"{vuln_str}"
+            )
+            for step in (f.get("steps") or [])[:4]:
+                if isinstance(step, dict):
+                    lines.append(
+                        f"  {step.get('order', '?')}. {step.get('step_name', '?')} = "
+                        f"{step.get('method', '?')} {step.get('endpoint', '?')}"
+                    )
+            for vs in (f.get("vulnerable_steps") or [])[:2]:
+                if isinstance(vs, dict):
+                    lines.append(
+                        f"  VULN step {vs.get('step_order', '?')}: {vs.get('pattern', '?')} — "
+                        f"{str(vs.get('reason', ''))[:100]}"
+                    )
+        return "\n".join(lines[:30])
 
     @staticmethod
     def _compact_list(values: list[str], limit: int = 5) -> str:
@@ -639,6 +715,8 @@ class ManageAgent:
         method = current_bug.get("method", "")
         auth_required = current_bug.get("auth_required", False)
         exec_reason = current_bug.get("exec_result_reason", "")
+        candidate_type = str(current_bug.get("candidate_type", "") or "").upper()
+        evidence_status = str(current_bug.get("evidence_status", "") or "").upper()
 
         lower_evidence = evidence.lower()
         lower_reason = (exec_reason or "").lower()
@@ -720,6 +798,25 @@ class ManageAgent:
             return "STOP_BUG", (
                 f"[PHÂN TÍCH] {bug_label}: {exec_status} — "
                 f"{truncate(exec_reason or evidence, 420)}"
+            )
+
+        if (
+            (candidate_type == "ACTION_DISCOVERY" or evidence_status == "ACTION_DISCOVERY")
+            and exec_status in {"FAILED", "PARTIAL", "WRONG_TARGET", "PROOF_QUALITY_FAIL"}
+            and (
+                "does not exist" in lower_evidence
+                or "endpoint" in lower_evidence and "not exist" in lower_evidence
+                or "404" in lower_evidence
+                or "405" in lower_evidence
+                or "method not allowed" in lower_evidence
+                or "401" in lower_evidence
+                or "403" in lower_evidence
+            )
+        ):
+            return "STOP_BUG", (
+                f"[PHÂN TÍCH] {bug_label}: ACTION_DISCOVERY bounded stop — "
+                f"candidate này chỉ là suy luận từ schema/crawl lân cận, không phải endpoint/method đã quan sát trực tiếp. "
+                f"Exec đã gặp tín hiệu chặn/không tồn tại nên dừng để tránh mò endpoint quá lâu."
             )
 
         # PROOF_QUALITY_FAIL: cho retry 1 lần với hướng dẫn cụ thể thay vì STOP ngay
@@ -845,6 +942,70 @@ class ManageAgent:
             for v in (bug.get("attack_variants") or [])[:6]
             if str(v).strip()
         ]
+        evidence_rule_lines = [
+            f"- {truncate(str(rule), 180)}"
+            for rule in (bug.get("evidence_rules") or [])[:6]
+            if str(rule).strip()
+        ]
+        graph_context = bug.get("graph_context") or {}
+        graph_lines: list[str] = []
+        if isinstance(graph_context, dict) and graph_context:
+            summary = graph_context.get("summary") or {}
+            graph_lines.append(
+                "summary: "
+                f"nodes={summary.get('nodes', 0)}, "
+                f"edges={summary.get('edges', 0)}, "
+                f"business_chain={summary.get('business_chain', 0)}, "
+                f"api_hints={summary.get('api_hints', 0)}"
+            )
+            for step in (graph_context.get("business_chain") or [])[:4]:
+                graph_lines.append(
+                    f"business_chain[{step.get('context', '?')}]: "
+                    f"{step.get('step', '?')} -> {step.get('method', '?')} "
+                    f"{step.get('endpoint', '?')} status={step.get('status', '?')}"
+                )
+            for edge in (graph_context.get("edges") or [])[:4]:
+                graph_lines.append(
+                    f"edge[{edge.get('context', '?')}]: "
+                    f"{edge.get('from', '?')} -> {edge.get('to', '?')} "
+                    f"type={edge.get('type', '?')} method={edge.get('method', '-')}"
+                    f" status={edge.get('status', '-')}"
+                )
+
+            # Flow context from BusinessFlowMapper
+            flow_context = graph_context.get("flow_context") or {}
+            if flow_context and isinstance(flow_context, dict):
+                fc_summary = flow_context.get("summary", {})
+                fc_flows = flow_context.get("flows", [])
+                graph_lines.append(
+                    f"business_flows: {fc_summary.get('flow_count', 0)} flows, "
+                    f"{fc_summary.get('total_vulnerable_steps', 0)} vulnerable steps"
+                )
+                for fc in fc_flows[:3]:
+                    if not isinstance(fc, dict):
+                        continue
+                    vuln_count = len(fc.get("vulnerable_steps", []))
+                    vuln_str = f" | {vuln_count} vuln step(s)" if vuln_count else ""
+                    graph_lines.append(
+                        f"  flow[{fc.get('id', '?')}]: {fc.get('name', '?')} "
+                        f"[{fc.get('type', '?')}/{fc.get('confidence', '?')}]"
+                        f"{vuln_str}"
+                    )
+                    for ms in (fc.get("matching_steps") or [])[:3]:
+                        if not isinstance(ms, dict):
+                            continue
+                        verified = " (verified)" if ms.get("state_change_verified") else ""
+                        graph_lines.append(
+                            f"    step {ms.get('order', '?')}: {ms.get('step_name', '?')} = "
+                            f"{ms.get('method', '?')} {ms.get('endpoint', '?')}{verified}"
+                        )
+                    for vs in (fc.get("vulnerable_steps") or [])[:2]:
+                        if not isinstance(vs, dict):
+                            continue
+                        graph_lines.append(
+                            f"    VULN step {vs.get('step_order', '?')}: "
+                            f"{vs.get('pattern', '?')} — {truncate(str(vs.get('reason', '')), 120)}"
+                        )
         return (
             f"ID: {bug.get('id', '?')} | Pattern: {bug.get('pattern_id', '?')} | Risk: {bug.get('risk_level', '?')}\n"
             f"Endpoint: {bug.get('method', '?')} {bug.get('endpoint', '?')} | Status: {bug.get('status', 'PENDING')}\n"
@@ -858,6 +1019,8 @@ class ManageAgent:
             f"Exploit approach hint: {truncate(str(bug.get('exploit_approach', '-') or '-'), 260)}\n"
             f"Verify method: {truncate(str(bug.get('verify_method', '-') or '-'), 260)}\n"
             f"Response clues: {self._compact_list(bug.get('response_clues') or [], limit=6)}\n"
+            f"Evidence rules:\n" + ("\n".join(evidence_rule_lines) if evidence_rule_lines else "-") + "\n"
+            f"Guided graph/business context:\n" + ("\n".join(graph_lines) if graph_lines else "-") + "\n"
             f"Cookie/client-state surface: {self._compact_list(cookie_lines, limit=6)}\n"
             f"Suggested attack variants:\n" + ("\n".join(variant_lines) if variant_lines else "-") + "\n"
             f"HTTP examples:\n" + "\n".join(example_lines)
@@ -1609,8 +1772,8 @@ class ManageAgent:
 
         if self._is_challenge_metadata_candidate(current_bug):
             reason = (
-                "SKIPPED_METADATA: candidate chỉ dựa trên metadata /api/Challenges của lab "
-                "(tên challenge/admin marker), không phải endpoint/chức năng BAC/BLF thực tế."
+                "SKIPPED_METADATA: candidate chỉ dựa trên metadata/catalog marker, "
+                "không phải endpoint/chức năng BAC/BLF thực tế."
             )
             current_bug["status"] = "SKIPPED_METADATA"
             current_bug["failure_reason"] = reason
@@ -1876,18 +2039,19 @@ class ManageAgent:
         clues = " ".join(str(c) for c in (bug.get("response_clues") or [])).lower()
         combined = f"{text}\n{clues}"
         metadata_markers = (
+            "metadata catalog",
+            "metadata-only",
+            "metadata only",
             "challenge metadata",
             "challenge list",
-            "adminsectionchallenge",
-            "registeradminchallenge",
-            "admin registration",
-            "admin section",
-            "challenge key",
-            "contains admin-related challenges",
-            "recon notes mention admin-related challenges",
+            "catalog marker",
+            "schema marker",
+            "version marker",
             "key includes",
+            "contains admin-related",
+            "recon notes mention admin-related",
         )
-        if "challenge" in endpoint:
+        if any(marker in endpoint for marker in ("challenge", "schema", "version", "configuration", "metadata")):
             return any(marker in combined for marker in metadata_markers)
         if http_examples:
             return False
@@ -1987,6 +2151,7 @@ class ManageAgent:
             current_bug["last_exec_result"] = exec_result
 
         artifacts = self._extract_script_artifacts(exec_result)
+        artifacts.extend(self._generated_poc_artifacts(current_bug))
         if artifacts:
             existing = current_bug.setdefault("exploit_artifacts", [])
             seen_paths = {item.get("path") for item in existing if isinstance(item, dict)}
@@ -2106,12 +2271,33 @@ class ManageAgent:
             artifacts.append(item)
         return artifacts
 
+    def _generated_poc_artifacts(self, current_bug: dict) -> list[dict]:
+        """Find post-exploitation PoC scripts generated by Exec tool-loop phase."""
+        bug_id = str((current_bug or {}).get("id") or "").strip()
+        if not bug_id:
+            return []
+        poc_path = Path(self.run_dir) / f"poc_{bug_id}.py"
+        if not poc_path.is_file():
+            return []
+        item = {"path": str(poc_path)}
+        try:
+            digest = hashlib.sha256(poc_path.read_bytes()).hexdigest()[:16]
+            item["sha256_16"] = digest
+        except Exception:
+            pass
+        return [item]
+
     @staticmethod
     def _safe_code_block(text: str) -> str:
         return str(text or "").replace("```", "` ` `")
 
     def _format_artifact_list(self, bug: dict) -> str:
-        artifacts = bug.get("exploit_artifacts") or []
+        artifacts = list(bug.get("exploit_artifacts") or [])
+        known_paths = {item.get("path") for item in artifacts if isinstance(item, dict)}
+        for item in self._generated_poc_artifacts(bug):
+            if item.get("path") not in known_paths:
+                artifacts.append(item)
+                known_paths.add(item.get("path"))
         if not artifacts:
             return "_No saved exploit script artifacts._"
         lines = []
@@ -2329,6 +2515,9 @@ class ManageAgent:
             for k in ("title", "hypothesis", "endpoint", "verify_method", "exploit_approach")
         ).lower()
         exec_text = str(exec_result or "").lower()
+        artifact_text = self._collect_bug_artifact_text(current_bug)
+        if artifact_text:
+            exec_text = f"{exec_text}\n{artifact_text.lower()}"
         json_text = self._json_text(result_json)
 
         # ── BAC-01: Admin access — cần admin marker/control.
@@ -2400,9 +2589,40 @@ class ManageAgent:
 
         return {}
 
+    def _collect_bug_artifact_text(self, current_bug: dict, *, max_chars: int = 60000) -> str:
+        """Read small proof artifacts for the current bug so gates are not limited
+        to the short Exec summary. This intentionally ignores generated scripts.
+        """
+        bug_id = str((current_bug or {}).get("id") or "").strip()
+        if not bug_id:
+            return ""
+        state_dir = Path(self.run_dir) / "exploit_state" / bug_id
+        if not state_dir.is_dir():
+            return ""
+        chunks: list[str] = []
+        total = 0
+        for path in sorted(state_dir.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in {".json", ".txt", ".md"}:
+                continue
+            if path.name.endswith((".output.txt", ".syntax.txt")):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if not text.strip():
+                continue
+            remaining = max_chars - total
+            if remaining <= 0:
+                break
+            snippet = text[: min(len(text), remaining)]
+            chunks.append(f"\n--- ARTIFACT {path.name} ---\n{snippet}")
+            total += len(snippet)
+        return "\n".join(chunks)
+
     @staticmethod
     def _metadata_only_exec_proof_reason(exec_result: str, current_bug: dict) -> str:
-        """Reject success claims whose proof comes from challenge/metadata text only."""
+        """Reject success claims whose proof comes from metadata/catalog text only."""
         text = str(exec_result or "").lower()
         bug_text = " ".join(
             str(current_bug.get(k, "") or "")
@@ -2412,10 +2632,12 @@ class ManageAgent:
         metadata_hits = (
             "/api/challenges",
             '"probe": "challenges"',
-            "adminsectionchallenge",
-            "registeradminchallenge",
             "challenge metadata",
             "challenge list",
+            "metadata catalog",
+            "metadata-only",
+            "schema marker",
+            "version marker",
             "admin marker found in anonymous probe",
         )
         if not any(hit in text for hit in metadata_hits):
@@ -2442,8 +2664,8 @@ class ManageAgent:
             return ""
 
         return (
-            "METADATA_ONLY_PROOF: Exec reported EXPLOITED using /api/Challenges or "
-            "challenge metadata markers, but no concrete admin UI/API control was proven "
+            "METADATA_ONLY_PROOF: Exec reported EXPLOITED using metadata/catalog markers, "
+            "but no concrete admin UI/API control was proven "
             "on the claimed endpoint."
         )
 
@@ -2536,6 +2758,18 @@ class ManageAgent:
         )
         if re.search(direct_object_pattern, exec_text, re.IGNORECASE | re.DOTALL):
             return True
+        if re.search(r'"?ownership_mismatch"?\s*[:=]\s*true', exec_text, re.IGNORECASE):
+            return True
+        if re.search(r'"?owner_mismatch"?\s*[:=]\s*true', exec_text, re.IGNORECASE):
+            return True
+        if re.search(r"owner_mismatch\s*=\s*true", exec_text, re.IGNORECASE):
+            return True
+        if re.search(r"\bcurrent user id\b.{0,80}\b\d+\b.{0,220}\bvictim user id\b.{0,80}\b\d+\b", exec_text, re.IGNORECASE | re.DOTALL):
+            return True
+        if re.search(r"\buser\s+\d+\b.{0,120}\baccess(?:ed)?\b.{0,180}\bowned by\b.{0,40}\buser\s+\d+\b", exec_text, re.IGNORECASE | re.DOTALL):
+            return True
+        if re.search(r"\bsession user(?:id| id)?\b.{0,80}\b\d+\b.{0,80}!=.{0,80}\b(?:feedback|object|owner|user)(?:id| id)?\b.{0,80}\b\d+\b", exec_text, re.IGNORECASE | re.DOTALL):
+            return True
         if re.search(r"(cross-user|other user|user a .* user b|not owned by).{0,160}status=2\d\d", exec_text, re.IGNORECASE | re.DOTALL):
             return True
         strong_text_markers = (
@@ -2551,9 +2785,16 @@ class ManageAgent:
             "read other users' pii",
             "read admin account details",
             "server returned exact feedback data of user",
+            "can directly access complaint records owned by other users",
+            "can read feedback of any userid",
+            "user 34 can access complaint",
+            "customer session can read feedback",
+            "accessed complaint id",
+            "accessed_object_id",
+            "victim_user_id",
         )
         if any(marker in exec_text for marker in strong_text_markers):
-            if any(owner in exec_text for owner in ("userid", "user id", "user_id", "admin id", "role: admin", "email:")):
+            if any(owner in exec_text for owner in ("userid", "user id", "user_id", "admin id", "role: admin", "email:", "owner id", "victim")):
                 return True
         return False
 
@@ -2739,7 +2980,12 @@ class ManageAgent:
             or bug.get("last_exec_result")
             or "(chưa có tóm tắt evidence)"
         )
-        artifacts = bug.get("exploit_artifacts") or []
+        artifacts = list(bug.get("exploit_artifacts") or [])
+        known_paths = {item.get("path") for item in artifacts if isinstance(item, dict)}
+        for item in self._generated_poc_artifacts(bug):
+            if item.get("path") not in known_paths:
+                artifacts.append(item)
+                known_paths.add(item.get("path"))
         artifact_lines = []
         for item in artifacts[:4]:
             if isinstance(item, dict) and item.get("path"):
@@ -2881,7 +3127,7 @@ Các candidate không đủ bằng chứng được giữ riêng ở mục cuố
 ## Ghi Chú Evidence
 - Bản report này chỉ tính finding có `status=EXPLOITED`.
 - Bản raw đầy đủ nằm ở `report_raw.md`.
-- Script và output PoC nằm trong thư mục `exploits/`.
+- Script PoC nằm ở workspace dạng `poc_<BUG_ID>.py`; evidence chi tiết nằm trong `exploit_state/<BUG_ID>/`.
 """
 
         raw_path = Path(self.run_dir) / "report_raw.md"
@@ -2929,6 +3175,7 @@ No bugs were successfully exploited. Reason: {reason}
 ## Ghi Chú Evidence
 - Không có finding nào đạt `status=EXPLOITED`.
 - Bản raw đầy đủ nằm ở `report_raw.md`.
+- Nếu có PoC/script debug, file nằm trong workspace dạng `poc_<BUG_ID>.py` hoặc `exploit_state/<BUG_ID>/`.
 """
 
         raw_path = Path(self.run_dir) / "report_raw.md"

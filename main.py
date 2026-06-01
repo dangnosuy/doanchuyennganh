@@ -262,6 +262,23 @@ def phase_recon(user_prompt: str, run_dir: str) -> tuple[str, str, str]:
         crawl.shutdown()
 
     log.info(f"Trinh sát hoàn tất: {recon_path}")
+
+    # ── BusinessFlowMapper: map crawl data to structured business flows ──
+    log.sub_phase("BUSINESS FLOW MAPPER — Phân tích quy trình nghiệp vụ")
+    try:
+        import json
+        from shared.business_flow_mapper import run as run_flow_mapper
+        crawl_raw_path = Path(run_dir) / "crawl_raw.json"
+        if crawl_raw_path.exists():
+            with open(crawl_raw_path, "r", encoding="utf-8") as f:
+                _crawl_raw = json.load(f)
+            _flows = run_flow_mapper(run_dir, _crawl_raw, target_url)
+            log.info(f"BusinessFlowMapper: {_flows.get('flow_count', 0)} flows mapped")
+        else:
+            log.warn("crawl_raw.json not found — skipping BusinessFlowMapper")
+    except Exception as _e:
+        log.warn(f"BusinessFlowMapper failed: {_e} — continuing pipeline")
+
     log.sub_phase("VULN HUNTER — Nhận diện lỗ hổng")
 
     # Skip VulnHunter if risk-bug.json already exists with bugs
