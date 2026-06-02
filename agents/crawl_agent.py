@@ -2755,6 +2755,11 @@ class CrawlAgent:
             lines.append(workflow_section.rstrip())
             lines.append("")
 
+        coverage_section = self._render_graph_coverage_recon_section(raw_payload)
+        if coverage_section:
+            lines.append(coverage_section.rstrip())
+            lines.append("")
+
         hint_section = self._render_static_api_hints_recon_section(raw_payload)
         if hint_section:
             lines.append(hint_section.rstrip())
@@ -2929,6 +2934,70 @@ class CrawlAgent:
                 lines.append("- Business edges:")
                 for edge_line in important_edges[:30]:
                     lines.append(f"  - {edge_line}")
+            lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
+
+    @classmethod
+    def _render_graph_coverage_recon_section(cls, raw_payload: dict) -> str:
+        rows: list[tuple[str, dict, dict]] = []
+        anonymous = raw_payload.get("anonymous") or {}
+        if isinstance(anonymous.get("graph_coverage"), dict):
+            rows.append(("anonymous", anonymous["graph_coverage"], anonymous.get("crawl_memory") or {}))
+        for session in raw_payload.get("authenticated", []) or []:
+            if not isinstance(session, dict):
+                continue
+            data = session.get("data") or {}
+            if isinstance(data.get("graph_coverage"), dict):
+                rows.append((f"auth:{session.get('label', 'auth')}", data["graph_coverage"], data.get("crawl_memory") or {}))
+
+        if not rows:
+            return ""
+
+        lines: list[str] = []
+        lines.append("## Crawl Graph Coverage Evaluation")
+        lines.append("")
+        lines.append("This deterministic evaluator scores graph coverage after crawling and lists gaps for the next crawl or vuln-hunting pass.")
+        lines.append("")
+        lines.append("| Context | Score | Nodes | Edges | Surfaces Covered | State-Changing Edges | Request Chains | Coverage Gaps |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+        for label, coverage, memory in rows:
+            surfaces = coverage.get("surfaces") or {}
+            covered = [
+                name for name, item in surfaces.items()
+                if isinstance(item, dict) and item.get("covered")
+            ]
+            gaps = [
+                name for name, item in surfaces.items()
+                if isinstance(item, dict) and not item.get("covered")
+            ]
+            if not gaps:
+                gaps = memory.get("coverage_gaps") or []
+            lines.append(
+                f"| `{label}` | {coverage.get('score', 0)} | {coverage.get('node_count', 0)} | "
+                f"{coverage.get('edge_count', 0)} | {cls._md_cell(', '.join(covered) or '-')} | "
+                f"{coverage.get('state_changing_edge_count', 0)} | {coverage.get('request_chain_edge_count', 0)} | "
+                f"{cls._md_cell(', '.join(gaps) or '-')} |"
+            )
+        lines.append("")
+
+        for label, coverage, memory in rows:
+            recommendations = coverage.get("recommendations") or []
+            repeated = memory.get("repeated_endpoint_hits") or []
+            if not recommendations and not repeated:
+                continue
+            lines.append(f"### `{label}` Coverage Follow-Up")
+            if recommendations:
+                for item in recommendations[:8]:
+                    lines.append(f"- {cls._md_cell(item)}")
+            if repeated:
+                compact = ", ".join(
+                    f"{item.get('endpoint')} ({item.get('hits')})"
+                    for item in repeated[:8]
+                    if isinstance(item, dict)
+                )
+                if compact:
+                    lines.append(f"- Repeated endpoint hits to de-prioritize: {cls._md_cell(compact)}")
             lines.append("")
 
         return "\n".join(lines).rstrip() + "\n"
@@ -4155,6 +4224,21 @@ class CrawlAgent:
                     f"  {step.get('step', '?')}: {step.get('method', '?')} {step.get('endpoint', '?')} "
                     f"status={step.get('status', '?')} before={step.get('state_before', '-')} after={step.get('state_after', '-')}"
                 )
+
+        graph_coverage = data.get("graph_coverage", {})
+        if graph_coverage:
+            parts.append("\n## Crawl Graph Coverage")
+            parts.append(
+                f"  Score: {graph_coverage.get('score', 0)} "
+                f"(nodes={graph_coverage.get('node_count', 0)}, edges={graph_coverage.get('edge_count', 0)})"
+            )
+            surfaces = graph_coverage.get("surfaces") or {}
+            covered = [name for name, item in surfaces.items() if isinstance(item, dict) and item.get("covered")]
+            gaps = [name for name, item in surfaces.items() if isinstance(item, dict) and not item.get("covered")]
+            parts.append(f"  Covered surfaces: {covered}")
+            parts.append(f"  Coverage gaps: {gaps}")
+            for recommendation in (graph_coverage.get("recommendations") or [])[:8]:
+                parts.append(f"  - {recommendation}")
 
         # External links
         external = data.get("external_links", [])

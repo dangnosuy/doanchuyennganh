@@ -81,6 +81,25 @@ SAFE_HASH_ROUTES = (
     "#/checkout",
     "#/contact",
 )
+BUSINESS_SURFACE_KEYWORDS = {
+    "access_control": ("admin", "manage", "dashboard", "role", "permission", "users", "account", "profile"),
+    "commerce": ("cart", "basket", "checkout", "order", "payment", "invoice", "refund"),
+    "value_logic": ("coupon", "discount", "promo", "quantity", "price", "amount", "balance", "wallet", "transfer"),
+    "workflow_state": ("approve", "approval", "status", "cancel", "return", "shipping", "stock", "inventory"),
+}
+STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+@dataclass
+class CrawlMemory:
+    """Compact state memory used to avoid crawl loops and expose coverage gaps."""
+    visited_endpoints: set[str] = field(default_factory=set)
+    tried_actions: set[tuple[str, str, str, str]] = field(default_factory=set)
+    no_effect_actions: set[tuple[str, str, str]] = field(default_factory=set)
+    emitted_endpoints: set[str] = field(default_factory=set)
+    state_changing_endpoints: set[str] = field(default_factory=set)
+    covered_surfaces: set[str] = field(default_factory=set)
+    repeated_endpoint_hits: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -97,6 +116,7 @@ class GuidedState:
     api_hints: list[dict[str, Any]] = field(default_factory=list)
     business_chain: list[dict[str, Any]] = field(default_factory=list)
     auth_bootstrap: dict[str, Any] = field(default_factory=dict)
+    memory: CrawlMemory = field(default_factory=CrawlMemory)
     notes: list[str] = field(default_factory=list)
 
 
@@ -175,6 +195,64 @@ def _compact_endpoint_list(items: list[dict[str, Any]], limit: int = 10) -> list
         if url:
             result.append(_endpoint(url))
     return result
+
+
+def _surface_matches(text: str) -> list[str]:
+    lower = (text or "").lower()
+    return [
+        surface
+        for surface, keywords in BUSINESS_SURFACE_KEYWORDS.items()
+        if any(keyword in lower for keyword in keywords)
+    ]
+
+
+def _remember_endpoint(state: GuidedState, url_or_endpoint: str, method: str = "") -> None:
+    if not url_or_endpoint:
+        return
+    endpoint = _endpoint(url_or_endpoint) if "://" in str(url_or_endpoint) else str(url_or_endpoint)
+    state.memory.repeated_endpoint_hits[endpoint] = state.memory.repeated_endpoint_hits.get(endpoint, 0) + 1
+    state.memory.visited_endpoints.add(endpoint)
+    if method.upper() in STATE_CHANGING_METHODS:
+        state.memory.state_changing_endpoints.add(endpoint)
+    for surface in _surface_matches(f"{method} {endpoint}"):
+        state.memory.covered_surfaces.add(surface)
+
+
+def _remember_candidate(state: GuidedState, candidate: dict[str, Any], after_url: str, emitted_count: int) -> None:
+    identity = _candidate_identity(candidate)
+    state.memory.tried_actions.add(identity)
+    no_effect_key = (
+        str(candidate.get("current_endpoint") or ""),
+        str(candidate.get("action_type") or ""),
+        str(candidate.get("label") or "").strip().lower(),
+    )
+    changed_endpoint = str(candidate.get("current_endpoint") or "") != _endpoint(after_url)
+    if emitted_count <= 0 and not changed_endpoint:
+        state.memory.no_effect_actions.add(no_effect_key)
+    for surface in _surface_matches(
+        " ".join(str(candidate.get(k, "") or "") for k in ("label", "target_endpoint", "risk"))
+    ):
+        state.memory.covered_surfaces.add(surface)
+
+
+def _memory_snapshot(state: GuidedState) -> dict[str, Any]:
+    high_repeat = [
+        {"endpoint": endpoint, "hits": hits}
+        for endpoint, hits in sorted(state.memory.repeated_endpoint_hits.items(), key=lambda item: item[1], reverse=True)
+        if hits >= 3
+    ][:10]
+    gaps = sorted(set(BUSINESS_SURFACE_KEYWORDS) - state.memory.covered_surfaces)
+    return {
+        "visited_endpoint_count": len(state.memory.visited_endpoints),
+        "visited_endpoints": sorted(state.memory.visited_endpoints)[-30:],
+        "tried_action_count": len(state.memory.tried_actions),
+        "no_effect_action_count": len(state.memory.no_effect_actions),
+        "state_changing_endpoint_count": len(state.memory.state_changing_endpoints),
+        "state_changing_endpoints": sorted(state.memory.state_changing_endpoints)[:30],
+        "covered_surfaces": sorted(state.memory.covered_surfaces),
+        "coverage_gaps": gaps,
+        "repeated_endpoint_hits": high_repeat,
+    }
 
 
 def _append_unique(items: list[dict[str, Any]], item: dict[str, Any], keys: tuple[str, ...]) -> None:
@@ -421,12 +499,14 @@ def _install_network_capture(page: Any, state: GuidedState) -> None:
         entry = request_meta.pop(request, None)
         if entry is not None:
             state.http_traffic.append(entry)
+            _remember_endpoint(state, str(entry.get("url") or ""), str(entry.get("method") or ""))
 
     def on_request_failed(request: Any) -> None:
         entry = request_meta.pop(request, None)
         if entry is not None:
             entry["failed"] = True
             state.http_traffic.append(entry)
+            _remember_endpoint(state, str(entry.get("url") or ""), str(entry.get("method") or ""))
 
     page.on("request", on_request)
     page.on("response", on_response)
@@ -437,6 +517,7 @@ def _install_network_capture(page: Any, state: GuidedState) -> None:
 def _capture_page(page: Any, state: GuidedState, label: str, response: Any | None = None) -> None:
     if len(state.pages) >= state.max_pages:
         return
+    _remember_endpoint(state, page.url, "GET")
     try:
         links = page.eval_on_selector_all(
             "a[href]",
@@ -594,6 +675,9 @@ def _no_effect_candidate_identities(state: GuidedState) -> set[tuple[str, str, s
 def _fallback_candidate(candidates: list[dict[str, Any]], state: GuidedState | None = None) -> dict[str, Any] | None:
     explored = _explored_candidate_identities(state) if state else set()
     no_effect = _no_effect_candidate_identities(state) if state else set()
+    memory_tried = state.memory.tried_actions if state else set()
+    memory_no_effect = state.memory.no_effect_actions if state else set()
+    uncovered_surfaces = (set(BUSINESS_SURFACE_KEYWORDS) - state.memory.covered_surfaces) if state else set()
 
     def utility(candidate: dict[str, Any]) -> int:
         text = " ".join(
@@ -601,15 +685,24 @@ def _fallback_candidate(candidates: list[dict[str, Any]], state: GuidedState | N
             for k in ("label", "target_endpoint", "action_type", "risk")
         ).lower()
         value = int(candidate.get("score") or 0)
-        if _candidate_identity(candidate) in explored:
+        identity = _candidate_identity(candidate)
+        if identity in explored or identity in memory_tried:
             value -= 120
         no_effect_key = (
             str(candidate.get("current_endpoint") or ""),
             str(candidate.get("action_type") or ""),
             str(candidate.get("label") or "").strip().lower(),
         )
-        if no_effect_key in no_effect:
+        if no_effect_key in no_effect or no_effect_key in memory_no_effect:
             value -= 150
+        candidate_surfaces = set(candidate.get("memory_surfaces") or _surface_matches(text))
+        if candidate_surfaces & uncovered_surfaces:
+            value += 32
+        target_endpoint = str(candidate.get("target_endpoint") or "")
+        if state and target_endpoint and target_endpoint not in state.memory.visited_endpoints:
+            value += 22
+        elif state and target_endpoint:
+            value -= min(30, state.memory.repeated_endpoint_hits.get(target_endpoint, 0) * 8)
         if candidate.get("target_endpoint") == candidate.get("current_endpoint"):
             value -= 18
             if candidate.get("action_type") == "navigate":
@@ -645,6 +738,9 @@ def _extract_action_candidates(page: Any, state: GuidedState) -> list[dict[str, 
     def add_candidate(item: dict[str, Any]) -> None:
         item["action_id"] = f"A{len(candidates) + 1:02d}"
         item["current_endpoint"] = current_endpoint
+        memory_text = " ".join(str(item.get(k, "") or "") for k in ("label", "target_endpoint", "risk"))
+        item["memory_surfaces"] = _surface_matches(memory_text)
+        item["memory_seen"] = _candidate_identity(item) in state.memory.tried_actions
         item["score"] = _candidate_score(item)
         candidates.append(item)
 
@@ -836,6 +932,8 @@ def _append_request_chain(
         for req in state.http_traffic[start_request_index:start_request_index + 20]
         if isinstance(req, dict) and req.get("url")
     ]
+    for req in emitted:
+        _remember_endpoint(state, str(req.get("endpoint") or ""), str(req.get("method") or ""))
     changed_endpoint = _endpoint(before_url) != _endpoint(after_url)
     chain = {
         "action_id": candidate.get("action_id", ""),
@@ -885,6 +983,7 @@ def _append_request_chain(
             "action_type": "navigate",
             "reason": reason or candidate.get("reason", ""),
         })
+    _remember_candidate(state, candidate, after_url, len(emitted))
 
 
 def _execute_action_candidate(page: Any, state: GuidedState, candidate: dict[str, Any], timeout_ms: int, reason: str) -> bool:
@@ -1056,6 +1155,8 @@ def _build_planner_messages(state: GuidedState, candidates: list[dict[str, Any]]
             "method": c.get("method", ""),
             "fields": c.get("fields", []),
             "score": c.get("score", 0),
+            "memory_seen": c.get("memory_seen", False),
+            "memory_surfaces": c.get("memory_surfaces", []),
         }
         for c in candidates
     ]
@@ -1083,10 +1184,13 @@ def _build_planner_messages(state: GuidedState, candidates: list[dict[str, Any]]
         "recent_actions": recent_actions,
         "recent_requests": recent_requests,
         "known_business_chain_len": len(state.business_chain),
+        "crawl_memory": _memory_snapshot(state),
         "already_explored_actions": explored,
         "candidates": compact_candidates,
         "selection_policy": [
             "Prefer actions that reveal account/profile/cart/order/admin/product workflow map.",
+            "Prefer actions that cover crawl_memory.coverage_gaps.",
+            "Avoid candidates with memory_seen=true unless no other useful candidate remains.",
             "Prefer a new endpoint or action not already present in recent_actions.",
             "Prefer bounded add-to-cart/search/profile/order navigation over generic homepage links.",
             "Avoid login/register/home unless no higher-value workflow candidates remain.",
@@ -1484,6 +1588,92 @@ def _build_workflow_graph(state: GuidedState) -> dict[str, Any]:
     }
 
 
+def _evaluate_graph_coverage(state: GuidedState, graph: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Score post-crawl graph coverage for BAC/BLF-oriented follow-up planning."""
+    graph = graph or _build_workflow_graph(state)
+    nodes = graph.get("nodes") or []
+    edges = graph.get("edges") or []
+    node_ids = [str(node.get("id", "") or "") for node in nodes if isinstance(node, dict)]
+    edge_texts = [
+        " ".join(str(edge.get(key, "") or "") for key in ("from", "to", "type", "method", "label"))
+        for edge in edges
+        if isinstance(edge, dict)
+    ]
+    combined_by_surface = {
+        surface: "\n".join(node_ids + edge_texts)
+        for surface in BUSINESS_SURFACE_KEYWORDS
+    }
+    surfaces: dict[str, dict[str, Any]] = {}
+    for surface, keywords in BUSINESS_SURFACE_KEYWORDS.items():
+        text = combined_by_surface[surface].lower()
+        matched = [keyword for keyword in keywords if keyword in text]
+        surface_nodes = [
+            node_id for node_id in node_ids
+            if any(keyword in node_id.lower() for keyword in keywords)
+        ][:20]
+        surface_edges = [
+            edge for edge in edges
+            if any(keyword in " ".join(str(edge.get(k, "") or "") for k in ("from", "to", "label")).lower() for keyword in keywords)
+        ][:20]
+        surfaces[surface] = {
+            "covered": bool(matched),
+            "matched_keywords": matched,
+            "nodes": surface_nodes,
+            "edge_count": len(surface_edges),
+        }
+
+    state_changing_edges = [
+        edge for edge in edges
+        if str(edge.get("method", "") or "").upper() in STATE_CHANGING_METHODS
+    ]
+    request_chain_edges = [edge for edge in edges if edge.get("type") in {"request_chain", "chain_request"}]
+    form_edges = [edge for edge in edges if edge.get("type") == "form"]
+    dead_end_pages = []
+    outgoing: dict[str, int] = {}
+    for edge in edges:
+        frm = str(edge.get("from", "") or "")
+        if frm:
+            outgoing[frm] = outgoing.get(frm, 0) + 1
+    for node in nodes:
+        node_id = str(node.get("id", "") or "")
+        if node.get("kind") == "page" and outgoing.get(node_id, 0) == 0:
+            dead_end_pages.append(node_id)
+
+    covered_count = sum(1 for surface in surfaces.values() if surface["covered"])
+    score = 0
+    score += min(40, covered_count * 10)
+    score += min(20, len(request_chain_edges) * 4)
+    score += min(15, len(state_changing_edges) * 5)
+    score += min(15, len(form_edges) * 3)
+    score += min(10, len(state.memory.state_changing_endpoints) * 3)
+    score = min(100, score)
+
+    recommendations: list[str] = []
+    missing = [name for name, item in surfaces.items() if not item["covered"]]
+    for surface in missing:
+        recommendations.append(f"Explore {surface} routes/actions if in scope.")
+    if not state_changing_edges and not state.memory.state_changing_endpoints:
+        recommendations.append("No observed state-changing workflow edge; expand safe form/action planning.")
+    if not request_chain_edges:
+        recommendations.append("No guided request chains; increase AI steps or inspect candidate extraction.")
+    if dead_end_pages:
+        recommendations.append("Some page nodes have no outgoing edges; review crawler navigation/candidate extraction.")
+
+    return {
+        "score": score,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "covered_surface_count": covered_count,
+        "surface_count": len(surfaces),
+        "surfaces": surfaces,
+        "state_changing_edge_count": len(state_changing_edges),
+        "request_chain_edge_count": len(request_chain_edges),
+        "form_edge_count": len(form_edges),
+        "dead_end_pages": dead_end_pages[:20],
+        "recommendations": recommendations[:12],
+    }
+
+
 def run_guided_crawl(args: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
     target = args.url.rstrip("/")
@@ -1508,6 +1698,8 @@ def run_guided_crawl(args: argparse.Namespace) -> dict[str, Any]:
             "ai_decisions": [],
             "request_chains": [],
             "workflow_graph": {"nodes": [], "edges": []},
+            "crawl_memory": {},
+            "graph_coverage": {"score": 0, "node_count": 0, "edge_count": 0, "recommendations": []},
         }
 
     cookies: list[dict[str, Any]] = []
@@ -1555,6 +1747,8 @@ def run_guided_crawl(args: argparse.Namespace) -> dict[str, Any]:
         state.notes.append(f"Guided crawler interrupted: {exc}")
 
     _progress_done()
+    workflow_graph = _build_workflow_graph(state)
+    graph_coverage = _evaluate_graph_coverage(state, workflow_graph)
     return {
         "ok": True,
         "target": target,
@@ -1568,7 +1762,9 @@ def run_guided_crawl(args: argparse.Namespace) -> dict[str, Any]:
         "action_candidates": state.action_candidates,
         "ai_decisions": state.ai_decisions,
         "request_chains": state.request_chains,
-        "workflow_graph": _build_workflow_graph(state),
+        "workflow_graph": workflow_graph,
+        "crawl_memory": _memory_snapshot(state),
+        "graph_coverage": graph_coverage,
         "api_hints": state.api_hints,
         "business_chain": state.business_chain,
         "auth_bootstrap": state.auth_bootstrap,

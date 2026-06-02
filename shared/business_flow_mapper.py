@@ -298,6 +298,10 @@ class BusinessFlowMapper:
         # Business chain
         compact["business_chain"] = session.get("business_chain", [])
 
+        # Deterministic graph coverage/memory summary
+        compact["graph_coverage"] = session.get("graph_coverage", {})
+        compact["crawl_memory"] = session.get("crawl_memory", {})
+
         return compact
 
     def _build_llm_messages(self, payload: dict) -> list[dict]:
@@ -485,6 +489,32 @@ class BusinessFlowMapper:
                     endpoint = step.get("endpoint", "")
                     status = step.get("status", "")
                     lines.append(f"  {step_name} | {method} {endpoint} | status={status}")
+
+        # ── Graph Coverage Evaluation ──
+        for label in ("anonymous", "authenticated"):
+            has_coverage = False
+            for session in _iter_sessions(label):
+                coverage = session.get("graph_coverage", {})
+                if not isinstance(coverage, dict) or not coverage:
+                    continue
+                if not has_coverage:
+                    lines.append(f"\n## {label.upper()} GRAPH COVERAGE")
+                    has_coverage = True
+                surfaces = coverage.get("surfaces") or {}
+                covered = [
+                    name for name, item in surfaces.items()
+                    if isinstance(item, dict) and item.get("covered")
+                ]
+                gaps = [
+                    name for name, item in surfaces.items()
+                    if isinstance(item, dict) and not item.get("covered")
+                ]
+                lines.append(
+                    f"  score={coverage.get('score', 0)} nodes={coverage.get('node_count', 0)} "
+                    f"edges={coverage.get('edge_count', 0)} covered={covered} gaps={gaps}"
+                )
+                for rec in (coverage.get("recommendations") or [])[:8]:
+                    lines.append(f"    recommendation={_trim(rec, 140)}")
 
         data_text = "\n".join(lines)
 

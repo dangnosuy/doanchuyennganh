@@ -181,6 +181,41 @@ class GuidedCrawlerContractTests(unittest.TestCase):
 
         self.assertEqual(selected["action_id"], "A02")
 
+    def test_memory_aware_fallback_prefers_uncovered_surface(self):
+        state = crawler.GuidedState(target="http://localhost:3000", max_pages=5)
+        state.memory.covered_surfaces.add("commerce")
+        state.memory.tried_actions.add((
+            "/#/cart",
+            "navigate",
+            "cart",
+            "/#/cart",
+        ))
+
+        selected = crawler._fallback_candidate([
+            {
+                "action_id": "A01",
+                "action_type": "navigate",
+                "label": "Cart",
+                "current_endpoint": "/#/cart",
+                "target_endpoint": "/#/cart",
+                "risk": "read_only_navigation",
+                "score": 50,
+                "memory_surfaces": ["commerce"],
+            },
+            {
+                "action_id": "A02",
+                "action_type": "navigate",
+                "label": "Admin dashboard",
+                "current_endpoint": "/#/cart",
+                "target_endpoint": "/#/admin",
+                "risk": "read_only_navigation",
+                "score": 20,
+                "memory_surfaces": ["access_control"],
+            },
+        ], state)
+
+        self.assertEqual(selected["action_id"], "A02")
+
     def test_request_chain_projects_to_business_chain_and_graph(self):
         state = crawler.GuidedState(target="http://localhost:3000", max_pages=5)
         state.http_traffic.append({
@@ -212,6 +247,29 @@ class GuidedCrawlerContractTests(unittest.TestCase):
         self.assertEqual(state.business_chain[0]["endpoint"], "/cart/add")
         self.assertTrue(any(edge.get("type") == "request_chain" for edge in graph["edges"]))
         self.assertTrue(any(edge.get("type") == "chain_request" for edge in graph["edges"]))
+
+    def test_graph_coverage_evaluator_reports_business_gaps(self):
+        state = crawler.GuidedState(target="http://localhost:3000", max_pages=5)
+        state.pages.append({
+            "url": "http://localhost:3000/#/cart",
+            "title": "Cart",
+            "links": [{"href": "http://localhost:3000/#/checkout"}],
+            "forms": [],
+        })
+        state.http_traffic.append({
+            "method": "PUT",
+            "url": "http://localhost:3000/api/cart-items/12",
+            "response_status": 200,
+            "parent_url": "http://localhost:3000/#/cart",
+        })
+
+        graph = crawler._build_workflow_graph(state)
+        coverage = crawler._evaluate_graph_coverage(state, graph)
+
+        self.assertGreater(coverage["score"], 0)
+        self.assertTrue(coverage["surfaces"]["commerce"]["covered"])
+        self.assertFalse(coverage["surfaces"]["access_control"]["covered"])
+        self.assertIn("Explore access_control routes/actions if in scope.", coverage["recommendations"])
 
 
 class CrawlReconWorkflowSectionTests(unittest.TestCase):
@@ -263,6 +321,35 @@ class CrawlReconWorkflowSectionTests(unittest.TestCase):
         self.assertIn("Guided Auth And API Hints", section)
         self.assertIn("cart_update_quantity", section)
         self.assertIn("/api/cart-items/{id}", section)
+
+    def test_recon_renders_graph_coverage(self):
+        raw_payload = {
+            "anonymous": {
+                "crawl_memory": {
+                    "coverage_gaps": ["access_control"],
+                    "repeated_endpoint_hits": [{"endpoint": "/#/cart", "hits": 4}],
+                },
+                "graph_coverage": {
+                    "score": 45,
+                    "node_count": 4,
+                    "edge_count": 5,
+                    "state_changing_edge_count": 1,
+                    "request_chain_edge_count": 2,
+                    "surfaces": {
+                        "commerce": {"covered": True},
+                        "access_control": {"covered": False},
+                    },
+                    "recommendations": ["Explore access_control routes/actions if in scope."],
+                },
+            }
+        }
+
+        section = CrawlAgent._render_graph_coverage_recon_section(raw_payload)
+
+        self.assertIn("Crawl Graph Coverage Evaluation", section)
+        self.assertIn("45", section)
+        self.assertIn("access_control", section)
+        self.assertIn("/#/cart", section)
 
 
 class VulnHunterEvidenceTests(unittest.TestCase):
