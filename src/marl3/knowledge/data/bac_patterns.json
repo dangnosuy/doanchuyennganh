@@ -1,0 +1,145 @@
+[
+    {
+        "id": "BAC-01",
+        "name": "Unprotected Admin / Sensitive Functionality",
+        "severity": "CRITICAL",
+        "description": "Admin or sensitive endpoints are accessible to low-privilege or unauthenticated users because the server relies on URL obscurity instead of server-side authorization checks.",
+        "indicators": [
+            "robots.txt or sitemap.xml reveals admin/management paths",
+            "JavaScript bundles expose hidden URLs (adminPanelTag, isAdmin checks)",
+            "Endpoints /admin, /management, /console, /dashboard respond 2xx to non-admin users",
+            "Response headers reveal framework with default admin panel"
+        ],
+        "technique": [
+            "1. Recon: parse robots.txt, sitemap.xml, JS bundles for hidden paths",
+            "2. Access admin paths directly with a low-privilege or anonymous session",
+            "3. If redirected, capture the response body before the redirect (may leak content)",
+            "4. Try path variations: /Admin, /ADMIN, /admin/, /admin/dashboard",
+            "5. Check JS source for variables: isAdmin, adminPanel, role, privilege"
+        ],
+        "variations": [
+            "Path case-sensitivity bypass: /Admin vs /admin",
+            "Trailing/double slash: /admin// or /admin/./",
+            "URL encoding: /%61dmin",
+            "Path traversal prefix: /static/../admin, /api/../admin"
+        ],
+        "required_proof_markers": ["PRIVILEGED_ACCESS"],
+        "success_condition": "Low-privilege or anonymous actor receives 2xx on an admin endpoint and the response body contains privileged data (user list, config, secrets)."
+    },
+    {
+        "id": "BAC-02",
+        "name": "Parameter-Based Access Control (Privilege Escalation)",
+        "severity": "CRITICAL",
+        "description": "The server trusts a client-supplied role/privilege parameter rather than validating against the authenticated session, allowing an attacker to elevate their role.",
+        "indicators": [
+            "URL parameters encode role/admin: ?role=user, ?admin=false, ?access=1",
+            "Cookie contains role indicator: isAdmin=false, role=user, access_level=1",
+            "Request body JSON includes role/privilege/admin field",
+            "Response reveals current role in body or cookie"
+        ],
+        "technique": [
+            "1. Log in with a low-privilege account; capture the full request/response",
+            "2. Locate role parameters in: URL params, cookies, request body, hidden fields",
+            "3. Modify values: role=admin, isAdmin=true, access_level=99, admin=1",
+            "4. Replay the modified request",
+            "5. Confirm the response exposes admin functionality or sensitive data"
+        ],
+        "variations": [
+            "Cookie tampering: isAdmin=false → isAdmin=true",
+            "Inject new parameter: &admin=true, &role=administrator",
+            "Switch content-type and send JSON body instead of form data",
+            "Tamper JWT payload when signature is not verified (alg:none)"
+        ],
+        "required_proof_markers": ["AUTH_BYPASS", "PRIVILEGED_ACCESS"],
+        "success_condition": "After modifying the role parameter the response grants elevated access or returns data only available to admins."
+    },
+    {
+        "id": "BAC-03",
+        "name": "Insecure Direct Object Reference (IDOR)",
+        "severity": "HIGH",
+        "description": "An authenticated but low-privilege actor can access or modify another user's resources by substituting a predictable identifier (user ID, order ID, document ID) in the request.",
+        "indicators": [
+            "URLs or request bodies contain numeric/GUID object IDs: /api/orders/1234, userId=5",
+            "Endpoint accepts IDs as path params: /api/users/{id}, /api/orders/{orderId}",
+            "ID values appear to be sequential or predictable",
+            "Authenticated endpoints return objects with owner fields (userId, ownerId, email)"
+        ],
+        "technique": [
+            "1. Establish two sessions: user_a (attacker) and user_b (victim)",
+            "2. With user_b, create or identify a resource and note its ID",
+            "3. With user_a, call the endpoint substituting user_b's resource ID",
+            "4. If the response returns user_b's data → IDOR confirmed",
+            "5. Test write operations: PUT/PATCH/DELETE on user_b's resource with user_a's session"
+        ],
+        "variations": [
+            "Encoded IDs: base64, hash — decode to find sequential patterns",
+            "Nested object references: /api/users/1/orders/2 — substitute both IDs",
+            "POST body IDOR: submit JSON with another user's userId",
+            "Mass assignment: include id field in PUT body to reassign ownership"
+        ],
+        "required_proof_markers": ["OWNERSHIP_BYPASS"],
+        "success_condition": "Attacker actor receives 2xx response containing victim's private data (owner field matches victim ID, not attacker ID)."
+    },
+    {
+        "id": "BAC-04",
+        "name": "HTTP Method Override",
+        "severity": "MEDIUM",
+        "description": "The server respects X-HTTP-Method-Override or _method parameter, allowing an attacker to send a destructive verb (DELETE, PUT) disguised as a safe one (GET, POST).",
+        "indicators": [
+            "Server accepts X-HTTP-Method-Override or X-Method-Override headers",
+            "POST endpoints accept _method URL parameter",
+            "API framework docs mention method tunnelling support"
+        ],
+        "technique": [
+            "1. Identify a resource endpoint that responds to DELETE or PUT",
+            "2. Send a POST request with header X-HTTP-Method-Override: DELETE",
+            "3. Alternatively add query param: ?_method=DELETE",
+            "4. Check whether the resource was deleted or modified"
+        ],
+        "variations": [
+            "_method=PUT in body",
+            "X-HTTP-Method: DELETE",
+            "X-Tunneled-Method: DELETE"
+        ],
+        "required_proof_markers": ["AUTH_BYPASS"],
+        "success_condition": "Server executes the overridden method and the response confirms the action (204, deleted resource, modified state)."
+    },
+    {
+        "id": "BAC-05",
+        "name": "Function-Level Access Control (Horizontal Privilege Escalation)",
+        "severity": "HIGH",
+        "description": "A user can invoke functions or endpoints that are only meant for users with the same role but different accounts — accessing another account's data or performing actions on their behalf.",
+        "indicators": [
+            "Bulk user management endpoints: /api/admin/users",
+            "Account settings reachable by other users via predictable path",
+            "User IDs exposed in responses that belong to other accounts"
+        ],
+        "technique": [
+            "1. Map all endpoints exposed to authenticated users",
+            "2. For each endpoint that takes a user/account identifier, substitute another user's ID",
+            "3. Test modification endpoints: change email, password reset, profile update",
+            "4. Look for bulk-data endpoints that return multiple users' data"
+        ],
+        "required_proof_markers": ["OWNERSHIP_BYPASS", "SENSITIVE_FIELD_EXPOSED"],
+        "success_condition": "Actor can read or modify a different user's account data without authorization."
+    },
+    {
+        "id": "BAC-06",
+        "name": "Forced Browsing / Missing Function-Level Access Control",
+        "severity": "HIGH",
+        "description": "Pages or API routes for privileged functions exist but are not linked to in the UI for low-privilege users. The server does not enforce authorization on these routes.",
+        "indicators": [
+            "JavaScript reveals conditional UI for admin users (feature flags, role checks)",
+            "Guessable paths: /api/admin/*, /api/internal/*, /api/v2/debug/*",
+            "Directory listing exposed",
+            "Swagger/OpenAPI spec reveals endpoints not shown in UI"
+        ],
+        "technique": [
+            "1. Extract all paths from JS bundles, Swagger spec, robots.txt",
+            "2. Attempt access with a low-privilege session to each discovered path",
+            "3. Record status codes and response bodies for unexpected 2xx responses"
+        ],
+        "required_proof_markers": ["PRIVILEGED_ACCESS"],
+        "success_condition": "Low-privilege actor reaches a function-level admin endpoint and receives a useful response (200 with data or 200 with admin UI fragment)."
+    }
+]

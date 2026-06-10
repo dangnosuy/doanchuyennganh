@@ -1,0 +1,144 @@
+[
+    {
+        "id": "BLF-01",
+        "name": "Client-Side Validation Bypass (Price/Quantity Tampering)",
+        "severity": "HIGH",
+        "description": "The server accepts price, quantity, or discount values directly from the client request without server-side re-validation, allowing an attacker to purchase items for arbitrary amounts.",
+        "indicators": [
+            "Price or quantity appears in hidden form fields or request body",
+            "JavaScript validates input before sending (client-side only)",
+            "Request contains calculated parameters (total, subtotal, tax)",
+            "Dropdown restricts values but backend does not re-validate"
+        ],
+        "technique": [
+            "1. Intercept the purchase/checkout request",
+            "2. Locate price/quantity/amount in request body",
+            "3. Modify values: price=0, price=-100, quantity=0, discount=100",
+            "4. Submit the modified request",
+            "5. Check the server response and the resulting order state"
+        ],
+        "variations": [
+            "Negative price to gain credit: price=-1000",
+            "Extreme quantity causing integer overflow: quantity=99999999",
+            "Currency switch: USD → lower-value currency",
+            "Remove CSRF token / nonce and see if check is skipped"
+        ],
+        "required_proof_markers": ["PRICE_MANIPULATION", "STATE_DELTA"],
+        "success_condition": "Server accepts the tampered value and creates an order at the manipulated price or quantity; state_delta confirms the discrepancy."
+    },
+    {
+        "id": "BLF-02",
+        "name": "Unconventional Input Handling",
+        "severity": "HIGH",
+        "description": "The application applies client-side validation but does not mirror it server-side, allowing submission of out-of-range, negative, zero, or type-mismatched values.",
+        "indicators": [
+            "Numeric fields with client-side min/max but no server validation signal",
+            "Quantity or price accepts decimal or negative numbers",
+            "Form regex validation only on the client"
+        ],
+        "technique": [
+            "1. Try excessively long input: email 300 chars, name 10000 chars",
+            "2. Try negative numbers: quantity=-1, amount=-500",
+            "3. Try decimals: quantity=1.5, amount=0.001",
+            "4. Try zero: quantity=0, price=0",
+            "5. Try special values: null, NaN, Infinity, empty string",
+            "6. Try type mismatch: send a string where a number is expected, an array instead of string"
+        ],
+        "required_proof_markers": ["QUANTITY_TAMPER", "STATE_DELTA"],
+        "success_condition": "Server processes an invalid value and the resulting application state reflects the tampered input."
+    },
+    {
+        "id": "BLF-03",
+        "name": "Workflow Sequence Bypass (State-Skipping)",
+        "severity": "HIGH",
+        "description": "The application has a multi-step business workflow (e.g., cart → payment → confirmation). The server does not enforce that prior steps are completed, allowing an attacker to jump directly to a later step.",
+        "indicators": [
+            "Multi-step checkout, registration, or approval workflow",
+            "Each step is a separate API endpoint",
+            "Step completion is tracked client-side or via a mutable status parameter",
+            "No server-side check for previous-step completion"
+        ],
+        "technique": [
+            "1. Map the full workflow: identify all step endpoints and their order",
+            "2. Complete step 1 legitimately; capture request for step 3",
+            "3. Submit the step 3 request without completing step 2",
+            "4. Alternatively, replay an earlier completed-step request to revert state and skip forward"
+        ],
+        "required_proof_markers": ["STATE_SKIP", "STATE_DELTA"],
+        "success_condition": "Attacker reaches the final workflow step (e.g., order confirmation) without completing an intermediate required step; state_delta shows the skipped step was never recorded."
+    },
+    {
+        "id": "BLF-04",
+        "name": "Time-of-Check to Time-of-Use (TOCTOU) Race Condition",
+        "severity": "HIGH",
+        "description": "A resource check (balance, coupon validity, stock count) is performed at request time T1 but the deduction happens at T2. Sending concurrent requests exploits the window between T1 and T2.",
+        "indicators": [
+            "Coupon or discount code can be used once",
+            "Account balance checked before deduction in separate operations",
+            "API allows concurrent requests to the same transaction endpoint"
+        ],
+        "technique": [
+            "1. Identify a one-use resource: coupon code, referral credit, gift card",
+            "2. Send multiple simultaneous requests (thread pool / async) before the deduction commits",
+            "3. Check whether the resource was consumed multiple times"
+        ],
+        "required_proof_markers": ["STATE_DELTA"],
+        "success_condition": "Multiple successful responses are received for a one-use resource; state_delta shows the balance/coupon was deducted more than once or not at all despite multiple uses."
+    },
+    {
+        "id": "BLF-05",
+        "name": "Coupon / Discount Abuse",
+        "severity": "MEDIUM",
+        "description": "Coupon validation logic is insufficient: codes can be reused, stacked, applied retroactively, or brute-forced because the server performs weak uniqueness checks.",
+        "indicators": [
+            "Discount applied via a code field in the request body",
+            "No per-account or per-order usage tracking visible in error messages",
+            "Sequential or guessable coupon codes"
+        ],
+        "technique": [
+            "1. Apply a valid coupon, complete the order",
+            "2. Attempt to re-apply the same coupon on a new order",
+            "3. Try applying multiple coupons simultaneously to the same cart",
+            "4. Try brute-forcing 4-6 digit numeric coupon codes",
+            "5. Try applying a coupon retroactively to a completed order"
+        ],
+        "required_proof_markers": ["PRICE_MANIPULATION", "STATE_DELTA"],
+        "success_condition": "The same coupon is accepted more than once, or multiple coupons stack to produce a price below zero."
+    },
+    {
+        "id": "BLF-06",
+        "name": "Negative Quantity / Refund Abuse",
+        "severity": "HIGH",
+        "description": "Submitting a negative quantity in a purchase or refund request causes the server to credit the attacker's account instead of debiting it.",
+        "indicators": [
+            "Refund or return endpoint accepts quantity parameter",
+            "Shopping cart API accepts arbitrary item counts",
+            "No server-side minimum quantity validation"
+        ],
+        "technique": [
+            "1. Add an item to cart with quantity=-1 or submit a refund for more than was purchased",
+            "2. Proceed through checkout",
+            "3. Observe account balance or credit change"
+        ],
+        "required_proof_markers": ["QUANTITY_TAMPER", "STATE_DELTA"],
+        "success_condition": "Account balance increases or a credit is applied when a negative quantity order is submitted."
+    },
+    {
+        "id": "BLF-07",
+        "name": "Insufficient Inventory / Stock Check",
+        "severity": "MEDIUM",
+        "description": "The server does not atomically verify available stock before committing a reservation, allowing purchase of more items than are in stock.",
+        "indicators": [
+            "Stock count displayed in UI or returned by API",
+            "High-traffic flash sales with limited inventory",
+            "Purchase endpoint accepts quantity without transactional stock lock"
+        ],
+        "technique": [
+            "1. Note the displayed available stock count",
+            "2. Submit a purchase for a quantity greater than available stock",
+            "3. Alternatively, fire concurrent purchase requests to over-subscribe inventory"
+        ],
+        "required_proof_markers": ["QUANTITY_TAMPER", "STATE_DELTA"],
+        "success_condition": "Order is accepted for a quantity exceeding available stock; state_delta shows the inventory was not correctly decremented."
+    }
+]
