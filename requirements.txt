@@ -7,3 +7,6 @@ requests
 ddgs
 mcp
 readabilipy
+tenacity
+langgraph
+langchain-core
