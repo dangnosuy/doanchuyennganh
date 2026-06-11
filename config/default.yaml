@@ -1,0 +1,47 @@
+llm:
+  base_url: "http://localhost:20128/v1"
+  api_key: "dummy"
+  models:
+    crawler: "minimax-m2.5:cloud"
+    hunter: "minimax-m2.5:cloud"
+    red: "minimax-m2.5:cloud"
+    blue: "minimax-m2.5:cloud"
+    exec: "minimax-m2.5:cloud"
+    verifier: "minimax-m2.5:cloud"
+    reporter: "minimax-m2.5:cloud"
+  timeout_s: 120
+  max_retries: 3
+
+debate:
+  max_rounds: 3
+  max_exec_retries: 1
+  max_verify_retries: 1   # 1 lần re-debate (verify→debate) — đủ self-correct, tránh nhân chi phí LLM
+  per_bug_wall_clock_s: 600
+
+verifier:
+  count: 3
+  temperature: 0.0
+
+execution:
+  http_timeout_s: 30
+  max_redirects: 5
+  user_agent: "marl3-pentest/1.0"
+
+recon:
+  max_pages: 60
+  max_depth: 4
+  body_store_max_mb: 500
+
+workspace:
+  base_dir: "./workspace"
+
+logging:
+  level: "INFO"
+  file: "run.log"
+
+memory:
+  longterm_enabled: true
+  db_path: "~/.local/share/marl3/memory.db"   # persists across runs
+  embedding_enabled: true                       # B2: semantic retrieval (fastembed, local CPU)
+  promote_min_successes: 3
+  promote_min_targets: 2
