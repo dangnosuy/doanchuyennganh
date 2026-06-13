@@ -1,707 +1,780 @@
 # BẢN NHÁP BÁO CÁO ĐỒ ÁN CHUYÊN NGÀNH
 
-# Đề tài: Xây dựng hệ thống đa tác tử sử dụng mô hình ngôn ngữ lớn để hỗ trợ phát hiện lỗ hổng Broken Access Control và Business Logic Flaw trên ứng dụng web
+# Đề tài: Xây dựng hệ thống đa tác tử dùng LangGraph và mô hình ngôn ngữ lớn để phát hiện, khai thác và chứng minh lỗ hổng Broken Access Control và Business Logic Flaw trên ứng dụng web
 
-## 1. Tổng quan đề tài
+## Phần mở đầu
+
+### Trang bìa
+
+Tên đề tài đề xuất: **Xây dựng hệ thống đa tác tử dùng LangGraph và mô hình ngôn ngữ lớn để phát hiện, khai thác và chứng minh lỗ hổng Broken Access Control và Business Logic Flaw trên ứng dụng web**.
+
+Thông tin cần hoàn thiện khi nộp bản chính thức:
+
+- Trường/Khoa/Bộ môn.
+- Tên học phần hoặc đồ án chuyên ngành.
+- Họ tên sinh viên thực hiện.
+- Mã số sinh viên.
+- Giảng viên hướng dẫn.
+- Niên khóa và thời gian thực hiện.
+
+### Trang bìa phụ
+
+Trang bìa phụ có thể giữ cùng nội dung với trang bìa chính nhưng trình bày theo mẫu của khoa. Nếu cần, phần này có thể bổ sung lời cam kết về phạm vi sử dụng hệ thống: công cụ chỉ được dùng trong môi trường được cấp quyền, phục vụ học tập, nghiên cứu và kiểm thử bảo mật hợp pháp.
+
+### Lời cảm ơn
+
+Em xin gửi lời cảm ơn đến giảng viên hướng dẫn đã hỗ trợ định hướng đề tài, góp ý về kiến trúc hệ thống và giúp em hoàn thiện nội dung đồ án. Em cũng xin cảm ơn các tài liệu, công cụ mã nguồn mở và môi trường lab bảo mật đã cung cấp nền tảng để nghiên cứu các lỗ hổng kiểm soát truy cập và logic nghiệp vụ trong ứng dụng web.
+
+Trong quá trình thực hiện, đề tài có tham khảo các khái niệm về kiểm thử xâm nhập, hệ thống đa tác tử, LangGraph, mô hình ngôn ngữ lớn, DAST, Red Team/Blue Team, cũng như các mô hình lưu trữ bằng chứng HTTP phục vụ xác minh. Những kiến thức này giúp em xây dựng được một prototype có khả năng điều phối nhiều bước từ trinh sát đến báo cáo.
+
+### Nội dung
+
+Báo cáo tập trung trình bày hệ thống \verb|marl3|, một công cụ kiểm thử bảo mật ứng dụng web theo kiến trúc đa tác tử, sử dụng LangGraph để điều phối pipeline và LLM để hỗ trợ các tác vụ cần suy luận ngữ cảnh. Hệ thống nhắm vào hai nhóm lỗ hổng chính: Broken Access Control và Business Logic Flaw.
+
+Nội dung chính gồm:
+
+- Lý do chọn đề tài và vấn đề của kiểm thử BAC/BLF.
+- Cơ sở lý thuyết về BAC, BLF, LLM, LangGraph, evidence-based verification và long-term memory.
+- Thiết kế hệ thống \verb|marl3|: pipeline chính, per-bug graph, contracts, recon, hunt, debate, exec, verify, report.
+- Cài đặt và triển khai trong repo hiện tại.
+- Kết quả đạt được, hạn chế và hướng phát triển.
+
+### Danh sách hình ảnh
+
+Các hình nên đưa vào báo cáo chính thức:
+
+- Hình 1.1. Tổng quan bài toán phát hiện BAC/BLF trên ứng dụng web.
+- Hình 3.1. Kiến trúc tổng thể hệ thống \verb|marl3|.
+- Hình 3.2. Pipeline LangGraph chính: \verb|recon -> hunt -> coordinate -> bugs -> report|.
+- Hình 3.3. Per-bug subgraph: \verb|debate -> exec -> verify|.
+- Hình 3.4. Luồng dữ liệu giữa các object: \verb|ReconArtifact -> BugDossier -> Evidence -> Finding|.
+- Hình 3.5. Hai tầng xác minh: ProofGate và VerifierPanel.
+- Hình 3.6. Mô hình BodyStore lưu HTTP body theo SHA-256.
+- Hình 3.7. Long-term memory chống overfit: same-target tier và cross-target tier.
+
+### Danh sách bảng biểu
+
+Các bảng nên đưa vào báo cáo chính thức:
+
+- Bảng 1.1. So sánh các hướng nghiên cứu/công cụ liên quan.
+- Bảng 2.1. Các dạng lỗi BAC tiêu biểu.
+- Bảng 2.2. Các dạng lỗi BLF tiêu biểu.
+- Bảng 3.1. Vai trò các node/agent trong hệ thống.
+- Bảng 3.2. Các contracts dữ liệu chính trong \verb|marl3|.
+- Bảng 3.3. Artifact sinh ra trong workspace.
+- Bảng 3.4. Các trạng thái xử lý bug.
+- Bảng 4.1. Môi trường và công cụ triển khai.
+- Bảng 4.2. Tiêu chí đánh giá hệ thống.
+- Bảng 5.1. Ưu điểm, hạn chế và hướng phát triển.
+
+### Danh mục từ viết tắt
+
+| Từ viết tắt | Ý nghĩa |
+|---|---|
+| BAC | Broken Access Control |
+| BLF | Business Logic Flaw |
+| LLM | Large Language Model |
+| DAST | Dynamic Application Security Testing |
+| PoC | Proof of Concept |
+| API | Application Programming Interface |
+| HTTP | HyperText Transfer Protocol |
+| IDOR | Insecure Direct Object Reference |
+| SPA | Single Page Application |
+| CLI | Command Line Interface |
+| JSON | JavaScript Object Notation |
+| PII | Personally Identifiable Information |
+
+### Danh mục từ tạm dịch
+
+| Thuật ngữ | Cách dùng trong báo cáo |
+|---|---|
+| Recon | Trinh sát/thu thập bằng chứng |
+| Hunt | Sinh giả thuyết lỗ hổng |
+| Coordinate | Xếp hàng và liên kết phụ thuộc |
+| Debate | Tranh luận/kiểm duyệt chiến lược |
+| Execution | Thực thi khai thác |
+| Verify | Xác minh bằng chứng |
+| Report | Báo cáo |
+| Evidence | Bằng chứng thực thi |
+| ProofGate | Cổng kiểm chứng tất định |
+| BodyStore | Kho lưu nội dung HTTP body |
+| BugDossier | Phiếu nghi vấn lỗ hổng |
+| Finding | Kết quả đánh giá cuối cho một bug |
+
+## Tóm tắt đồ án
+
+Đề tài xây dựng \verb|marl3|, một prototype công cụ kiểm thử bảo mật ứng dụng web tập trung vào hai nhóm lỗ hổng Broken Access Control và Business Logic Flaw. Đây là hai nhóm lỗi khó phát hiện tự động vì cần hiểu ngữ cảnh quyền truy cập, vai trò người dùng, dữ liệu sở hữu, chuỗi hành động nghiệp vụ và trạng thái trước/sau. Không giống các lỗi injection có thể kiểm tra bằng payload cố định, BAC và BLF yêu cầu hệ thống phải thu thập dữ liệu thật, lập giả thuyết có căn cứ, thực thi thử nghiệm và chứng minh bằng request/response.
+
+Kiến trúc hiện tại của dự án theo README là package \verb|marl3|, đặt trong \verb|src/marl3|, dùng LangGraph làm xương sống điều phối. Pipeline chính gồm các node \verb|recon|, \verb|hunt|, \verb|coordinate|, \verb|bugs|, \verb|report|. Trong node \verb|bugs|, hệ thống chạy per-bug subgraph gồm \verb|debate|, \verb|exec|, \verb|verify|. Điểm quan trọng là quyết định chuyển node do code routing function xử lý, không phải do LLM tự quyết định. LLM chỉ hoạt động trong từng nhiệm vụ hẹp: Hunter sinh BugDossier, Red lập chiến lược, Blue phản biện, Exec dùng tools gửi request, VerifierPanel đưa nhận xét tư vấn.
+
+Hệ thống sử dụng các contracts Pydantic để chuẩn hóa dữ liệu: \verb|ReconArtifact|, \verb|Endpoint|, \verb|HttpExchange|, \verb|AuthDiff|, \verb|BusinessFlow|, \verb|BugDossier|, \verb|Evidence|, \verb|ProofMarker|, \verb|Verdict|, \verb|Finding|. HTTP body được lưu lossless trong \verb|BodyStore| theo SHA-256, giúp không mất bằng chứng khi response dài. Exec ghi mọi request/response vào \verb|Evidence| thông qua \verb|RecordingHttpClient|. Verdict cuối cùng được quyết định bởi ProofGate tất định đọc structured evidence, còn VerifierPanel LLM chỉ đóng vai trò tư vấn và được ghi vào report.
+
+Kết quả của đề tài là một kiến trúc có thể chạy end-to-end trong môi trường được phép: crawl target, sinh recon, tạo bug candidates, tranh luận Red/Blue, thực thi exploit, xác minh bằng ProofGate và tạo \verb|report.md|, \verb|findings.json|, PoC HTTP. Hệ thống vẫn còn hạn chế như test mới cho \verb|src/marl3| chưa đầy đủ, crawler hiện thiên về HTTP-native server-rendered app, cần benchmark ground truth và cần mở rộng ProofGate cho nhiều pattern BAC/BLF hơn. Tuy vậy, kiến trúc hiện tại đã tạo nền tảng rõ ràng cho một công cụ pentest tự động có kiểm soát, dựa trên evidence thật và giảm phụ thuộc vào phán đoán chủ quan của LLM.
+
+## Chương 1. Tổng quan đề tài
 
 ### 1.1. Lý do chọn đề tài
 
-Ứng dụng web hiện đại ngày càng phức tạp do có nhiều vai trò người dùng, nhiều trạng thái phiên, nhiều bước nghiệp vụ và nhiều API nội bộ. Các lỗ hổng như Broken Access Control và Business Logic Flaw thường không chỉ nằm ở một endpoint riêng lẻ mà xuất hiện trong mối quan hệ giữa người dùng, quyền truy cập, dữ liệu sở hữu, trạng thái giao dịch và chuỗi hành động nghiệp vụ. Vì vậy, việc kiểm thử thủ công nhóm lỗi này đòi hỏi người kiểm thử phải hiểu rõ chức năng của hệ thống, theo dõi nhiều request/response, so sánh hành vi giữa các phiên người dùng và kiểm chứng kết quả bằng bằng chứng cụ thể.
+Các ứng dụng web hiện đại có cấu trúc phức tạp hơn nhiều so với các website tĩnh truyền thống. Một chức năng đơn giản như mua hàng có thể liên quan đến nhiều bước: xem sản phẩm, thêm vào giỏ, cập nhật số lượng, áp mã giảm giá, checkout, thanh toán, tạo đơn hàng, hủy đơn hoặc hoàn tiền. Tương tự, một hệ thống tài khoản có thể có nhiều loại người dùng như anonymous, user thường, user khác, nhân viên và admin. Điều này làm cho lỗ hổng bảo mật không còn chỉ nằm ở một tham số đầu vào mà nằm trong quan hệ giữa người dùng, object, quyền, trạng thái và thứ tự hành động.
 
-Trong bối cảnh đó, mô hình ngôn ngữ lớn có khả năng hỗ trợ phân tích ngữ cảnh, lập kế hoạch, phản biện và viết mã kiểm thử. Tuy nhiên, nếu chỉ dùng một agent duy nhất thì hệ thống dễ gặp các vấn đề như suy luận thiếu kiểm chứng, bỏ sót ngữ cảnh, lập kế hoạch quá rộng hoặc thực thi thiếu bằng chứng. Do đó, đề tài lựa chọn hướng tiếp cận đa tác tử, trong đó mỗi agent đảm nhận một vai trò chuyên biệt: trinh sát, sinh giả thuyết lỗ hổng, lập chiến lược tấn công, phản biện chiến lược, thực thi khai thác và tổng hợp báo cáo.
+Broken Access Control xảy ra khi ứng dụng không kiểm soát đúng ai được phép làm gì. Ví dụ user thường truy cập được trang admin, user A đọc được đơn hàng của user B, hoặc cookie role có thể sửa thành admin. Business Logic Flaw xảy ra khi ứng dụng xử lý đúng về mặt kỹ thuật nhưng sai quy tắc nghiệp vụ. Ví dụ server chấp nhận số lượng âm, cho dùng lại coupon một lần, cho checkout khi chưa thanh toán, hoặc cho hoàn tiền nhiều lần.
 
-Dự án MARL được xây dựng nhằm mô phỏng một quy trình kiểm thử xâm nhập tự động có kiểm soát, tập trung vào hai nhóm lỗi chính: Broken Access Control và Business Logic Flaw. Hệ thống không hướng đến việc thay thế hoàn toàn chuyên gia bảo mật, mà đóng vai trò như một trợ lý tự động giúp thu thập bằng chứng, tạo giả thuyết, thử nghiệm có kiểm soát và lưu lại artifact phục vụ phân tích.
+Các scanner tự động truyền thống thường gửi payload cố định vào từng field. Cách này phù hợp với injection nhưng không đủ cho BAC/BLF vì hai nhóm lỗi này cần ngữ cảnh. Một request \verb|GET /orders/1| chỉ có ý nghĩa nếu biết order 1 thuộc ai và actor hiện tại là ai. Một request \verb|POST /coupon/apply| chỉ có ý nghĩa nếu biết coupon đã dùng chưa, order đã checkout chưa và trạng thái sau request thay đổi như thế nào.
 
-### 1.2. Mục tiêu, đối tượng và phạm vi nghiên cứu
+Mô hình ngôn ngữ lớn có khả năng đọc ngữ cảnh và lập kế hoạch, nhưng không nên được tin tuyệt đối. LLM có thể bịa endpoint, hiểu sai response hoặc tự tin kết luận khi chưa đủ bằng chứng. Vì vậy, đề tài chọn hướng kết hợp LLM với code tất định: LLM hỗ trợ suy luận trong từng node, còn code điều phối pipeline và ProofGate quyết định verdict dựa trên dữ liệu thật.
 
-#### 1.2.1. Mục tiêu nghiên cứu
+### 1.2. Các nghiên cứu liên quan
 
-Mục tiêu tổng quát của đề tài là xây dựng một hệ thống đa tác tử sử dụng mô hình ngôn ngữ lớn để hỗ trợ kiểm thử bảo mật ứng dụng web, tập trung vào phát hiện và kiểm chứng các lỗ hổng BAC và BLF.
+Các hướng liên quan đến đề tài gồm:
 
-Các mục tiêu cụ thể gồm:
+- Công cụ DAST như OWASP ZAP, Burp Scanner, Nikto.
+- Web crawler và HTTP proxy dùng trong kiểm thử ứng dụng web.
+- Các lab bảo mật như OWASP Juice Shop, PortSwigger Web Security Academy.
+- Red Team/Blue Team trong kiểm thử bảo mật.
+- Multi-agent framework như LangGraph, CrewAI.
+- LLM tool-calling trong tự động hóa pentest.
+- Proof-of-concept generation và evidence-based reporting.
 
-- Xây dựng pipeline tự động từ đầu đến cuối: nhận target, crawl, phân tích recon, sinh bug candidate, tranh luận chiến lược, thực thi PoC và tạo báo cáo.
-- Thiết kế kiến trúc đa tác tử có phân vai rõ ràng, gồm CrawlAgent, VulnHunterAgent, ManageAgent, RedTeamAgent, BlueTeamAgent, ExecAgent và PolicyAgent.
-- Xây dựng cơ chế trinh sát ứng dụng web bằng Playwright, thu thập HTTP traffic, forms, links, buttons, API hints, workflow graph và business chain.
-- Tích hợp AI-guided crawler để chọn hành động có giá trị từ danh sách candidate đã được kiểm soát an toàn.
-- Xây dựng cơ chế sinh giả thuyết lỗ hổng dựa trên recon, raw crawl, workflow graph, business flows và playbook BAC/BLF.
-- Xây dựng cơ chế Red/Blue debate để chiến lược tấn công được phản biện trước khi thực thi.
-- Xây dựng cơ chế ExecAgent sinh script khai thác, tự xác minh kết quả và lưu lại artifact request/response.
-- Xây dựng memory, context compression và graph coverage evaluator nhằm giảm lặp, giảm token và tăng chất lượng ngữ cảnh cho các agent sau.
+Điểm khác biệt của \verb|marl3| là hệ thống không để một agent LLM quản lý toàn bộ quy trình. LangGraph định nghĩa state machine bằng code; LLM chỉ xử lý từng phần nhỏ. Hệ thống cũng không để LLM quyết định exploit thành công hay thất bại. ProofGate đọc structured Evidence và đưa ra verdict.
 
-#### 1.2.2. Đối tượng nghiên cứu
+#### Bảng: So sánh các hướng nghiên cứu liên quan
 
-Đối tượng nghiên cứu của đề tài gồm:
+| Hướng tiếp cận | Điểm mạnh | Hạn chế với BAC/BLF | Cách \verb|marl3| xử lý |
+|---|---|---|---|
+| Scanner payload truyền thống | Nhanh, tự động, tốt với injection | Thiếu ngữ cảnh role/workflow | Thu thập ReconArtifact, AuthDiff, WorkflowGraph |
+| Manual pentest | Chính xác, hiểu nghiệp vụ | Tốn thời gian, khó lặp lại | Tự động hóa recon, hunt, exec, report |
+| Một LLM agent duy nhất | Linh hoạt, dễ prototype | Dễ ảo giác, khó kiểm soát trạng thái | Chia node/agent, routing bằng LangGraph |
+| Agent manager bằng LLM | Có thể tự điều phối | Rủi ro chuyển trạng thái sai | Code routing function quyết định node tiếp theo |
+| LLM verifier | Có khả năng đọc ngữ nghĩa | Có thể phán sai, không ổn định | ProofGate là authority, VerifierPanel advisory |
+| Memory transcript | Dễ lưu lịch sử | Dài, nhiễu, overfit target | Long-term memory lưu episode đã qua ProofGate |
 
-- Ứng dụng web có route, form, API, cookie, token và session.
-- Hai nhóm lỗ hổng bảo mật:
-  - Broken Access Control: IDOR, vượt quyền, truy cập ngang hàng, truy cập route quản trị, sửa đổi cookie/role, thiếu kiểm tra sở hữu tài nguyên.
-  - Business Logic Flaw: thao túng giá, số lượng, coupon, workflow skip, trạng thái đơn hàng, refund, transfer, approval hoặc các bước nghiệp vụ nhiều trạng thái.
-- Mô hình đa tác tử sử dụng LLM trong quy trình kiểm thử bảo mật.
-- Artifact kỹ thuật phục vụ kiểm chứng: crawl_raw.json, recon.md, risk-bug.json, business_flows.json, exploit_state, PoC script và report.md.
+### 1.3. Mục tiêu, đối tượng và phạm vi nghiên cứu
 
-#### 1.2.3. Phạm vi nghiên cứu
+#### 1.3.1. Mục tiêu nghiên cứu
 
-Phạm vi triển khai tập trung vào kiểm thử ứng dụng web trong môi trường được phép, ví dụ lab nội bộ, target local hoặc môi trường thực nghiệm được cấu hình sẵn. Hệ thống ưu tiên các phương pháp kiểm thử có kiểm soát, có giới hạn và có bằng chứng.
+Mục tiêu tổng quát là xây dựng một hệ thống multi-agent dùng LangGraph và LLM để hỗ trợ phát hiện, khai thác và chứng minh BAC/BLF trên ứng dụng web.
 
-Đề tài không tập trung vào các nhóm lỗi như SQL Injection, XSS, SSRF, XXE, lỗi cấu hình header hoặc khai thác hệ thống ngoài phạm vi web workflow. Các hành động phá hoại như xóa dữ liệu, thanh toán thật, xóa tài khoản, logout cưỡng bức hoặc thao tác phá hủy đều được crawler hạn chế bằng keyword policy.
+Các mục tiêu cụ thể:
 
-### 1.3. Phương pháp nghiên cứu
+- Xây dựng CLI \verb|marl3| với các lệnh \verb|run|, \verb|crawl|, \verb|memory|.
+- Xây dựng pipeline chính bằng LangGraph: \verb|recon -> hunt -> coordinate -> bugs -> report|.
+- Xây dựng per-bug subgraph: \verb|debate -> exec -> verify|, có loop quay lại debate khi proof fail.
+- Xây dựng HTTP-native recon crawler thu thập endpoint, forms, auth sessions, auth diffs, workflow graph, business flows.
+- Lưu mọi HTTP body lossless bằng BodyStore và BodyRef.
+- Sinh BugDossier từ ReconArtifact bằng kết hợp deterministic seeds và LLM Hunter.
+- Dùng Red/Blue debate để tạo chiến lược đã được phản biện trước execution.
+- Dùng ExecutionRunner và RecordingHttpClient để gửi request thật, ghi Evidence, sinh PoC.
+- Dùng ProofGate tất định để quyết định kết quả, VerifierPanel để bổ sung nhận xét độc lập.
+- Sinh report có thể audit gồm \verb|report.md|, \verb|findings.json|, PoC HTTP.
+- Thiết kế long-term memory chống overfit giữa các target.
 
-#### 1.3.1. Nghiên cứu lý thuyết
+#### 1.3.2. Đối tượng nghiên cứu
 
-Đề tài nghiên cứu các khái niệm nền tảng sau:
+Đối tượng nghiên cứu gồm:
 
-- Kiểm thử xâm nhập ứng dụng web.
-- Broken Access Control và Business Logic Flaw.
-- Reconnaissance, endpoint discovery, workflow mapping.
-- Multi-agent system và vai trò của agent trong quy trình tự động hóa.
-- Red Team/Blue Team debate trong việc kiểm soát chất lượng chiến lược.
-- Prompt engineering và tool-calling cho LLM.
-- Cơ chế quản lý context, memory và artifact trong hệ thống LLM.
-- Cơ chế xác minh khai thác bằng script tự kiểm chứng.
+- Ứng dụng web có route, form, cookie, session, API endpoint và nhiều vai trò.
+- Các nhóm lỗi BAC: sensitive data exposure, privilege escalation, IDOR, forced browsing, ownership bypass.
+- Các nhóm lỗi BLF: value tampering, quantity tampering, coupon reuse, workflow skip, refund/cancel abuse.
+- Pipeline multi-agent dùng LangGraph.
+- Các dữ liệu trung gian: ReconArtifact, BugDossier, Evidence, Verdict, Finding.
 
-#### 1.3.2. Mô phỏng thực nghiệm
+#### 1.3.3. Phạm vi nghiên cứu
 
-Hệ thống được triển khai thành một prototype có thể chạy bằng dòng lệnh. Người dùng truyền prompt chứa URL và tùy chọn credentials. Pipeline thực hiện các bước:
+Phạm vi hệ thống là kiểm thử ứng dụng web trong môi trường được cấp quyền, ví dụ lab local hoặc target demo. Hệ thống không hướng đến brute force, phá hoại dữ liệu, DDoS hoặc khai thác ngoài phạm vi BAC/BLF. Các request state-changing cần được giới hạn trong target được phép.
 
-```text
-User Prompt
-  -> CrawlAgent
-  -> BusinessFlowMapper
-  -> VulnHunterAgent
-  -> ManageAgent
-  -> RedTeamAgent
-  -> BlueTeamAgent
-  -> ExecAgent
-  -> Report
-```
+Về codebase, báo cáo lấy package \verb|src/marl3| làm kiến trúc chính vì README hiện tại mô tả \verb|marl3| là hệ thống LangGraph-powered. Repo vẫn còn lớp legacy như \verb|main.py|, \verb|agents/|, \verb|tools/crawler.py|, \verb|shared/| từ giai đoạn trước. Những file này có giá trị lịch sử và một số test contract, nhưng không phải trọng tâm kiến trúc mới.
 
-Các thử nghiệm được thực hiện với ứng dụng web local hoặc target được cấp quyền. Hệ thống tạo workspace riêng cho mỗi lần chạy để lưu log, dữ liệu crawl, recon, danh sách bug, script khai thác, bằng chứng request/response và báo cáo cuối.
+### 1.4. Phương pháp nghiên cứu
 
-#### 1.3.3. Thu thập, phân tích và tổng hợp
+Phương pháp nghiên cứu gồm:
 
-Dữ liệu được thu thập từ Playwright browser crawl, HTTP request/response, HTML forms, API JSON keys, static JavaScript hints, auth context và workflow graph. Sau đó, dữ liệu được chuyển thành nhiều lớp artifact:
+- Nghiên cứu lý thuyết về BAC, BLF, DAST, multi-agent, LangGraph, LLM tool-calling và proof gate.
+- Phân tích yêu cầu từ bài toán BAC/BLF: cần nhiều actor, nhiều request, state trước/sau và evidence thật.
+- Thiết kế pipeline dạng state graph để tránh để LLM tự điều phối.
+- Thiết kế contracts Pydantic để dữ liệu truyền giữa node rõ ràng.
+- Cài đặt prototype trong package \verb|src/marl3|.
+- Thực nghiệm trên target local/demo và lưu artifact.
+- Đánh giá qua khả năng thu thập recon, sinh candidate, thực thi, xác minh và báo cáo.
 
-- `crawl_raw.json`: dữ liệu raw có cấu trúc.
-- `crawl_data.txt`: dữ liệu crawl dạng text để đọc nhanh.
-- `recon.md`: báo cáo trinh sát có cấu trúc.
-- `business_flows.json`: các luồng nghiệp vụ được ánh xạ từ evidence.
-- `risk-bug.json`: danh sách giả thuyết lỗ hổng.
-- `report.md`: báo cáo cuối sau khi thực thi.
+### 1.5. Những điểm mới của đề tài
 
-Các artifact này giúp hệ thống vừa có ngữ cảnh cho LLM, vừa có bằng chứng để người dùng kiểm tra lại.
+Các điểm mới/chính của đề tài:
 
-### 1.4. Các nghiên cứu liên quan
+- Dùng LangGraph để điều phối multi-agent pipeline bằng code, không để LLM quyết định routing.
+- Tách rõ các phase: recon, hunt, coordinate, debate, exec, verify, report.
+- Dùng per-bug subgraph có retry theo \verb|PROOF_QUALITY_FAIL|.
+- Dùng BodyStore lossless cho HTTP body, tránh cắt mất bằng chứng.
+- Dùng ProofGate tất định là authority cho verdict.
+- VerifierPanel chỉ tư vấn, không override gate.
+- Dùng long-term memory chỉ học từ episode đã qua ProofGate.
+- Chia memory thành same-target và cross-target để chống overfit.
+- Report được xây từ Finding objects có cấu trúc, không phải từ timeline text.
 
-Các hướng nghiên cứu liên quan gồm:
+### 1.6. Cấu trúc đồ án chuyên ngành
 
-- Công cụ kiểm thử web tự động như crawler, spider, proxy scanner và dynamic application security testing.
-- Các nền tảng lab bảo mật như PortSwigger Web Security Academy, OWASP Juice Shop hoặc các ứng dụng web cố tình có lỗi.
-- Kỹ thuật Red Team/Blue Team trong kiểm thử bảo mật.
-- Multi-agent framework như CrewAI hoặc các mô hình task orchestration.
-- Ứng dụng LLM trong pentest, gồm lập kế hoạch khai thác, sinh payload, đọc log, viết script và tổng hợp báo cáo.
+Báo cáo gồm 5 chương:
 
-Điểm khác biệt của MARL là kết hợp nhiều lớp: crawler có graph, VulnHunter sinh candidate, Red/Blue tranh luận chiến lược, Exec tự xác minh bằng script và Manager điều phối state machine. Hệ thống tập trung vào BAC/BLF, tức nhóm lỗi cần hiểu ngữ cảnh nghiệp vụ thay vì chỉ dò payload kỹ thuật đơn lẻ.
+- Chương 1 trình bày tổng quan đề tài.
+- Chương 2 trình bày cơ sở lý thuyết.
+- Chương 3 trình bày phương pháp và thiết kế hệ thống.
+- Chương 4 trình bày thực nghiệm và triển khai.
+- Chương 5 trình bày đánh giá, hạn chế và hướng phát triển.
 
-### 1.5. Cấu trúc Đồ án Chuyên ngành
+## Chương 2. Cơ sở lý thuyết
 
-Cấu trúc của báo cáo được chia thành 5 chương như sau:
+### 2.1. Tổng quan về kiểm thử bảo mật ứng dụng web
 
-- Chương 1: Tổng quan đề tài. Trình bày lý do chọn đề tài, mục tiêu, đối tượng, phạm vi, phương pháp nghiên cứu và các nghiên cứu liên quan.
-- Chương 2: Cơ sở lý thuyết. Trình bày các khái niệm nền tảng về kiểm thử ứng dụng web, BAC, BLF, LLM, multi-agent, Red/Blue debate, workflow graph và artifact-based verification.
-- Chương 3: Phân tích và thiết kế hệ thống. Trình bày kiến trúc MARL, vai trò từng agent, pipeline 5 giai đoạn, dữ liệu vào/ra và máy trạng thái xử lý bug.
-- Chương 4: Cài đặt và thực nghiệm. Trình bày môi trường, cấu trúc mã nguồn, các module chính, cơ chế crawl, sinh bug, tranh luận, thực thi và kết quả kiểm thử.
-- Chương 5: Kết luận và hướng phát triển. Tổng kết kết quả đạt được, hạn chế hiện tại và các hướng cải tiến.
+Kiểm thử bảo mật ứng dụng web là quá trình đánh giá khả năng chống chịu của ứng dụng trước các hành vi truy cập trái phép, thao túng dữ liệu hoặc lạm dụng logic nghiệp vụ. Một quy trình kiểm thử thường gồm trinh sát, xác định bề mặt tấn công, tạo giả thuyết, thực thi thử nghiệm, xác minh và báo cáo.
 
-## 2. Cơ sở lý thuyết
-
-### 2.1. Kiểm thử xâm nhập ứng dụng web
-
-Kiểm thử xâm nhập ứng dụng web là quá trình đánh giá bảo mật của một website hoặc API bằng cách mô phỏng hành vi của kẻ tấn công trong phạm vi được phép. Quy trình thường gồm trinh sát, xác định bề mặt tấn công, xây dựng giả thuyết, khai thác thử, xác minh tác động và viết báo cáo.
-
-Trong đề tài này, kiểm thử không chỉ dựa vào một request riêng lẻ mà còn dựa vào chuỗi tương tác:
-
-```text
-Page/Route -> User Action -> HTTP Request -> State Change -> Business Flow
-```
-
-Cách tiếp cận này phù hợp với BAC và BLF vì nhiều lỗi chỉ xuất hiện khi hiểu quan hệ giữa tài khoản, vai trò, tài nguyên và trạng thái nghiệp vụ.
+Với BAC/BLF, việc kiểm thử cần chú trọng context. Một response 200 không đủ để nói có lỗi; cần biết actor là ai, endpoint gì, object thuộc ai, trạng thái trước/sau ra sao và điều kiện nghiệp vụ nào bị vi phạm.
 
 ### 2.2. Broken Access Control
 
-Broken Access Control là nhóm lỗi xảy ra khi ứng dụng không kiểm soát đúng quyền truy cập của người dùng. Một số dạng phổ biến:
+Broken Access Control là lỗi khi ứng dụng không áp dụng đúng chính sách phân quyền.
 
-- IDOR: người dùng thay đổi ID trong URL hoặc body để truy cập tài nguyên không thuộc sở hữu.
-- Horizontal access control: người dùng cùng cấp truy cập dữ liệu của nhau.
-- Vertical access control: người dùng thường truy cập chức năng quản trị.
-- Forced browsing: truy cập trực tiếp route/API không được hiển thị trên giao diện.
-- Role/cookie tampering: chỉnh sửa cookie hoặc token chứa role/privilege.
-- Missing ownership check: server chỉ kiểm tra đăng nhập nhưng không kiểm tra chủ sở hữu đối tượng.
+#### 2.2.1. Các dạng BAC tiêu biểu
 
-Trong MARL, BAC được phát hiện thông qua route admin, user/profile/account endpoint, object ID fields, role/cookie hints, response chứa dữ liệu định danh và so sánh anonymous/authenticated/tampered contexts.
+| Mã | Dạng lỗi | Mô tả | Bằng chứng cần có |
+|---|---|---|---|
+| BAC-01 | Sensitive data exposure | Actor không đủ quyền nhận dữ liệu nhạy cảm | 2xx response chứa PII/sensitive fields |
+| BAC-02 | Privilege escalation | Tamper cookie/param để có quyền cao hơn | Blocked -> allowed sau tamper |
+| BAC-03 | IDOR | Truy cập object của người khác qua ID | Owner field khác attacker identity |
+| BAC-06 | Forced browsing | Vào route/admin endpoint bị ẩn | Low-priv actor truy cập được privileged content |
+
+#### 2.2.2. Yêu cầu xác minh BAC
+
+Để xác minh BAC cần:
+
+- Ghi rõ actor/session.
+- Ghi rõ endpoint và method.
+- Có baseline hoặc thông tin quyền dự kiến.
+- Có response body thật.
+- Có proof marker như \verb|OWNERSHIP_BYPASS|, \verb|PRIVILEGED_ACCESS|, \verb|AUTH_BYPASS|, \verb|SENSITIVE_FIELD_EXPOSED|.
 
 ### 2.3. Business Logic Flaw
 
-Business Logic Flaw là lỗi xảy ra khi ứng dụng cho phép người dùng thực hiện chuỗi hành động trái với quy tắc nghiệp vụ. Ví dụ:
+Business Logic Flaw xảy ra khi server cho phép một thao tác trái với quy tắc nghiệp vụ.
 
-- Thay đổi số lượng sản phẩm vượt giới hạn.
-- Áp dụng coupon nhiều lần.
-- Bỏ qua bước checkout/payment.
-- Thao túng price, amount, balance.
-- Chuyển trạng thái order/refund/approval trái phép.
-- Race condition trong thao tác mua hàng hoặc chuyển tiền.
+| Mã | Dạng lỗi | Ví dụ | Bằng chứng cần có |
+|---|---|---|---|
+| BLF-01 | Price/amount tamper | Gửi amount âm | 2xx + state delta hoặc accepted invalid value |
+| BLF-05 | Coupon reuse | Dùng lại coupon sau checkout/cancel | Cùng code accepted nhiều lần với consume event |
+| BLF-06 | Quantity tamper | Quantity âm hoặc cực lớn | 2xx + quantity/state thay đổi |
+| BLF-03 | State skip | Bỏ qua bước bắt buộc | State transition không hợp lệ |
 
-BLF khó phát hiện bằng scanner truyền thống vì cần hiểu luồng nghiệp vụ và trạng thái trước/sau. Do đó, MARL xây dựng workflow graph, request chains và business_chain để liên kết hành động người dùng với request thật và state transition.
+BLF cần ordered exchanges và state snapshot. Vì vậy Evidence trong \verb|marl3| hỗ trợ \verb|state_before|, \verb|state_after|, \verb|state_delta|.
 
-### 2.4. Mô hình ngôn ngữ lớn và tool-calling
+### 2.4. LangGraph và mô hình điều phối bằng StateGraph
 
-Mô hình ngôn ngữ lớn có khả năng đọc ngữ cảnh, tổng hợp thông tin, lập kế hoạch và viết mã. Tuy nhiên, LLM không nên được xem là nguồn sự thật tuyệt đối. Trong MARL, LLM được ràng buộc bởi artifact và tool:
+LangGraph cho phép xây dựng pipeline dưới dạng đồ thị có trạng thái. Trong \verb|marl3|, pipeline chính gồm:
 
-- CrawlAgent thu thập bằng chứng thật.
-- VulnHunter chỉ sinh candidate từ evidence.
-- RedTeam lập chiến lược dựa trên bug dossier.
-- BlueTeam phản biện chiến lược.
-- ExecAgent chạy script và tự xác minh.
-- Manager đọc verdict và evidence để quyết định.
+\begin{verbatim}
+START -> recon -> hunt -> coordinate -> bugs -> report -> END
+\end{verbatim}
 
-Như vậy, LLM được dùng để suy luận và điều phối, còn bằng chứng kỹ thuật nằm trong request/response, graph và artifact.
+Node \verb|bugs| chạy subgraph cho từng BugDossier:
 
-### 2.5. Hệ thống đa tác tử
+\begin{verbatim}
+START -> debate -> exec -> verify -> END
+\end{verbatim}
 
-Hệ thống đa tác tử là kiến trúc trong đó nhiều agent độc lập đảm nhận các vai trò khác nhau. Trong MARL, các agent không tự điều phối lẫn nhau mà giao tiếp thông qua ManageAgent. Điều này giúp giảm coupling, dễ kiểm soát state machine và dễ thay thế từng agent.
+Routing là các hàm Python đọc state, ví dụ \verb|_after_debate|, \verb|_after_exec|, \verb|_after_verify|. Điều này giúp hệ thống ổn định hơn so với việc hỏi LLM “nên làm gì tiếp”.
 
-Vai trò chính:
+### 2.5. LLM trong hệ thống bảo mật
 
-- CrawlAgent: thu thập dữ liệu target.
-- VulnHunterAgent: sinh danh sách bug candidate.
-- ManageAgent: điều phối toàn bộ pipeline.
-- RedTeamAgent: lập chiến lược khai thác.
-- BlueTeamAgent: phản biện chiến lược.
-- ExecAgent: thực thi và xác minh PoC.
-- PolicyAgent: kiểm soát luật nội bộ.
-- MemoryStore và ContextManager: lưu ngữ cảnh, nén hội thoại, giảm token.
+LLM được dùng trong các vai trò cần suy luận:
 
-### 2.6. Red/Blue debate
+- Hunter đọc recon và sinh BugDossier.
+- Red viết strategy.
+- Blue phản biện strategy.
+- Exec chọn tool/request theo response.
+- VerifierPanel đánh giá evidence ở mức tư vấn.
+- Reporter tạo summary dễ đọc.
 
-Red/Blue debate là cơ chế trong đó RedTeam đề xuất chiến lược tấn công, còn BlueTeam đánh giá tính rõ ràng, khả thi và điều kiện xác minh. Nếu chiến lược thiếu endpoint, payload, session, verify condition hoặc bằng chứng liên quan, BlueTeam có thể reject và yêu cầu RedTeam sửa.
+Tuy nhiên, LLM không phải nguồn sự thật cuối cùng. Output của LLM cần được parse, validate, enrich hoặc kiểm chứng bằng code.
 
-Mục tiêu của debate không phải kéo dài cuộc hội thoại, mà là tạo một cổng kiểm chất lượng trước khi ExecAgent chạy PoC. Điều này giúp giảm khả năng Exec thực thi một kế hoạch mơ hồ hoặc không có tiêu chí thành công.
+### 2.6. Evidence, ProofMarker và ProofGate
 
-### 2.7. Workflow graph và graph coverage
+Evidence là object ghi lại toàn bộ quá trình thực thi một bug. Evidence gồm:
 
-Workflow graph biểu diễn các node và edge của ứng dụng:
+- bug_id, pattern_id, category, endpoint, method.
+- ordered exchanges.
+- proof_markers.
+- state_before, state_after, state_delta.
+- session_context.
+- verdict_status.
 
-- Node: page, route, endpoint, workflow step.
-- Edge: link, form, request, observed action, request chain, business chain.
+ProofGate đọc Evidence và sinh Verdict. Nếu đủ required markers thì \verb|EXPLOITED|; nếu có marker nhưng thiếu marker bắt buộc thì có thể \verb|INFO_EXPOSURE_ONLY|; nếu không có marker thỏa thì \verb|FAILED| hoặc \verb|PROOF_QUALITY_FAIL| ở node verify.
 
-Graph coverage evaluator đánh giá mức độ bao phủ của crawl theo các surface:
+### 2.7. BodyStore và lưu bằng chứng lossless
 
-- `access_control`: admin, role, permission, users, account, profile.
-- `commerce`: cart, basket, checkout, order, payment, invoice, refund.
-- `value_logic`: coupon, discount, quantity, price, amount, balance, wallet, transfer.
-- `workflow_state`: approval, status, cancel, return, shipping, stock.
+BodyStore lưu mọi HTTP body dưới dạng file nhị phân theo hash SHA-256. BodyRef là con trỏ đến body đó. Cách này có các lợi ích:
 
-Evaluator giúp hệ thống biết phần nào của ứng dụng đã được khảo sát và phần nào còn thiếu.
+- Không cắt body giữa chừng.
+- Dễ deduplicate.
+- Giảm RAM trong object.
+- Cho phép ProofGate và report đọc lại full response.
+- Dễ audit vì body thật nằm trên đĩa.
 
-## 3. Phân tích và thiết kế hệ thống
+### 2.8. Long-term memory chống overfit
 
-### 3.1. Tổng quan hệ thống MARL
+Long-term memory không lưu transcript tùy tiện. Nó lưu Episode sau khi ProofGate đã xác minh. Một Episode gồm target fingerprint, pattern_id, endpoint_family, method, outcome, payload, proof_markers, summary, run_id.
 
-MARL là hệ thống kiểm thử bảo mật ứng dụng web theo mô hình multi-agent. Luồng chính:
+Memory có hai tầng:
 
-```text
-Người dùng nhập prompt + URL
-  -> main.py tạo workspace và gọi CrawlAgent
-  -> CrawlAgent crawl anonymous/authenticated và tạo recon
-  -> BusinessFlowMapper ánh xạ business flows
-  -> VulnHunterAgent sinh risk-bug.json
-  -> ManageAgent lấy từng bug trong queue
-  -> RedTeamAgent viết chiến lược
-  -> BlueTeamAgent review chiến lược
-  -> ExecAgent thực thi PoC
-  -> ManageAgent tổng hợp report
-```
+- Same-target: reuse payload cụ thể chỉ trên cùng target fingerprint.
+- Cross-target: chỉ inject technique trừu tượng nếu kỹ thuật đã thành công trên đủ số target khác nhau.
+
+Điều này giúp hệ thống học từ kinh nghiệm mà không hardcode endpoint/payload của target cũ vào target mới.
+
+### 2.9. Các nghiên cứu liên quan
+
+Các nghiên cứu/công cụ liên quan gồm DAST, Burp Suite, OWASP ZAP, web crawler, lab bảo mật, LLM agents và multi-agent orchestration. \verb|marl3| kế thừa ý tưởng từ các hệ thống này nhưng nhấn mạnh ba nguyên tắc: artifact lossless, code routing, data-driven verdict.
+
+## Chương 3. Phương pháp và thiết kế hệ thống
 
-Hệ thống dùng server OpenAI-compatible để gọi model. Trong repo có `server/server.py` đóng vai trò proxy FastAPI, nhận request theo chuẩn OpenAI Chat Completions và chuyển tiếp đến backend tương ứng.
+#### Hình: Kiến trúc hệ thống
 
-### 3.2. Kiến trúc 5 giai đoạn
+Sơ đồ kiến trúc đề xuất đưa vào báo cáo:
 
-#### 3.2.1. Giai đoạn 1: Recon
+\begin{verbatim}
+User CLI
+  |
+  v
+marl3.cli
+  |
+  v
+LangGraph Main Pipeline
+  |-- recon
+  |-- hunt
+  |-- coordinate
+  |-- bugs
+  |     |-- debate
+  |     |-- exec
+  |     |-- verify
+  |-- report
+  |
+  v
+Workspace artifacts
+\end{verbatim}
+
+### 3.1. Tổng quan
+
+Package chính của hệ thống nằm trong \verb|src/marl3|. Các nhóm module chính:
+
+\begin{verbatim}
+src/marl3/
+├── cli.py
+├── config.py
+├── workspace.py
+├── state.py
+├── graph/
+├── contracts/
+├── recon/
+├── dossier/
+├── debate/
+├── execution/
+├── verify/
+├── report/
+├── memory/
+├── llm/
+├── prompts/
+└── knowledge/
+\end{verbatim}
+
+CLI tạo config, workspace, LLM client rồi gọi LangGraph pipeline. Các node đọc/ghi state và artifact vào workspace.
+
+### 3.2. CLI, config và workspace
+
+#### Hình: Luồng khởi tạo pipeline
+
+\begin{verbatim}
+marl3 run prompt
+  -> parse URL/credentials
+  -> load config/default.yaml
+  -> create RunWorkspace
+  -> create LLMClient
+  -> make PipelineState
+  -> pipeline.ainvoke(state)
+\end{verbatim}
+
+\verb|config/default.yaml| cấu hình model theo role:
+
+- crawler
+- hunter
+- red
+- blue
+- exec
+- verifier
+- reporter
+
+Ngoài ra còn có debate budget, verifier count, execution timeout, recon max pages, body store size, workspace base dir và long-term memory settings.
+
+\verb|RunWorkspace| quản lý mọi file:
+
+| Artifact | Mục đích |
+|---|---|
+| \verb|recon.json| | ReconArtifact machine-readable |
+| \verb|recon.md| | Recon human-readable |
+| \verb|sessions.json| | Auth profiles/session data |
+| \verb|bodies/| | HTTP bodies lossless |
+| \verb|bugs.json| | BugDossier list |
+| \verb|memory.json| | Per-run memory |
+| \verb|evidence/<BUG_ID>/evidence.json| | Evidence từng bug |
+| \verb|debates/<BUG_ID>.md| | Debate transcript/summary |
+| \verb|pocs/poc_<BUG_ID>.txt| | PoC HTTP |
+| \verb|findings.json| | Finding objects |
+| \verb|report.md| | Báo cáo cuối |
+| \verb|run.log| | Log |
+| \verb|usage.json| | Thống kê usage |
+
+### 3.3. RECON phase
+
+Recon phase dùng \verb|GuidedCrawler| trong \verb|src/marl3/recon/crawler.py|. Crawler hiện tại là HTTP-native crawler dùng \verb|httpx| và HTML parsing. Nó phù hợp với ứng dụng server-rendered hoặc các endpoint có thể phát hiện qua HTML/script.
+
+Các bước chính:
+
+1. Chuẩn hóa credentials.
+2. Anonymous crawl bằng link/form parsing.
+3. Probe các path có giá trị cho BAC/BLF như \verb|/admin|, \verb|/profile|, \verb|/cart|, \verb|/checkout|, \verb|/api/v1/users|, \verb|/api/v1/orders/1|.
+4. Soft-404 filtering.
+5. Submit forms với synthetic values.
+6. Safe-probe JS-discovered endpoints.
+7. Login từng credential trong session riêng.
+8. Authenticated crawl và probe.
+9. Tính endpoints, auth_diffs, workflow_graph, business_flows, api_hints.
+10. Ghi \verb|recon.json| và \verb|recon.md|.
+
+#### Hình: Recon data flow
+
+\begin{verbatim}
+HTTP responses
+  -> HttpExchange
+  -> BodyStore
+  -> Endpoint extraction
+  -> AuthDiff
+  -> WorkflowGraph
+  -> BusinessFlow
+  -> ReconArtifact
+\end{verbatim}
+
+### 3.4. HUNT phase
+
+Hunt phase dùng \verb|VulnCandidateGenerator|. Input là ReconArtifact và optional lessons từ long-term memory. Candidate được tạo từ hai nguồn:
+
+- Deterministic seeds: admin path, ID path, auth-gated path, numeric field, state-changing JS/form action.
+- LLM Hunter: đọc recon và playbook để sinh candidate có hypothesis và exploit approach.
+
+Sau khi LLM sinh output, hệ thống parse JSON, normalize pattern, dedupe và attach HttpExample/EvidenceRule. Dossier sau đó được enrich thêm graph context ở node hunt.
+
+#### Bảng: BugDossier fields
+
+| Field | Ý nghĩa |
+|---|---|
+| \verb|id| | Mã bug, ví dụ BUG-001 |
+| \verb|category| | BAC hoặc BLF |
+| \verb|pattern_id| | BAC-03, BLF-05... |
+| \verb|endpoint| | Endpoint family |
+| \verb|method| | HTTP method |
+| \verb|hypothesis| | Giả thuyết cụ thể |
+| \verb|exploit_approach| | Cách thử khai thác |
+| \verb|auth| | Yêu cầu attacker/victim/admin role |
+| \verb|http_examples| | Exchange thật từ recon |
+| \verb|graph_context| | Node/chain/state fields liên quan |
+| \verb|evidence_rules| | Marker cần thỏa |
+| \verb|confidence| | Độ tin cậy candidate |
+
+### 3.5. COORDINATE phase
+
+Coordinate phase gọi \verb|rank_and_link|. Mục tiêu là xếp candidate theo ưu tiên và gắn phụ thuộc. Ví dụ:
+
+- Candidate có severity cao xử lý trước.
+- Candidate có evidence rõ hơn xử lý trước.
+- Candidate BLF chain cần endpoint/cart/order liên quan thì được liên kết với context phù hợp.
+- Candidate có dependency có thể được gắn vào \verb|graph_context.depends_on| hoặc \verb|enables|.
+
+### 3.6. DEBATE phase
+
+Debate phase có Red và Blue. Red viết strategy, execution guide và success condition. Blue kiểm tra kế hoạch.
+
+Red cần dựa trên recon và dossier, không được bịa endpoint. Blue có thể:
+
+- APPROVE: chiến lược đủ rõ.
+- REVISE: cần sửa.
+- STOP hoặc INSUFFICIENT_CONTEXT: không đủ evidence để thử.
+
+Khi verify fail và quay lại debate, verifier rationale được đưa vào context để Red sửa đúng vấn đề proof gate đã chỉ ra.
+
+### 3.7. EXEC phase
+
+Exec phase dùng \verb|ExecutionRunner|. Runner tạo Evidence, RecordingHttpClient, ToolBridge, BodyStore và AuthSessionStore.
+
+Các cơ chế bảo vệ Exec:
+
+- Inject endpoint schema từ recon.
+- Inject known values từ body store.
+- Inject exec memory từ MemoryStore.
+- Inject long-term skills từ LongTermMemory.
+- Chain steering cho BLF nhiều bước.
+- Không cho BLF dừng nếu chưa có tampering POST hoặc chưa đủ state-changing chain.
+- Deterministic fallback cho BLF nếu LLM không thực hiện tamper.
+- Deterministic fallback cho BAC-02 nếu cookie tamper bị LLM tạo sai.
+- Sinh PoC sau mỗi run từ Evidence.
 
-Giai đoạn Recon có nhiệm vụ thu thập thông tin target. CrawlAgent parse prompt để lấy URL, credentials và focus. Sau đó agent thực hiện:
+### 3.8. VERIFY phase
 
-- Anonymous crawl.
-- Login nếu có credentials.
-- Authenticated crawl cho từng account.
-- Bounded BAC/BLF discovery probes bằng GET/OPTIONS.
-- Lưu crawl_raw.json, crawl_data.txt, recon.md.
-- Chạy BusinessFlowMapper và VulnHunterAgent để sinh business_flows.json và risk-bug.json.
+Verify phase có hai tầng:
 
-Guided crawler trong `tools/crawler.py` sử dụng Playwright để mở trình duyệt, capture network traffic, trích links/forms/buttons và thực hiện một số hành động an toàn. LLM planner chỉ được chọn từ danh sách candidate đã được crawler trích xuất và lọc policy.
+\begin{verbatim}
+Evidence
+  -> ProofGate  -> authority verdict
+  -> VerifierPanel -> advisory rationale
+\end{verbatim}
 
-#### 3.2.2. Giai đoạn 2: Candidate queue
+ProofGate hiện có các nhóm rule chính:
 
-ManageAgent đọc `risk-bug.json`, enrich từng candidate bằng context từ `crawl_raw.json`, graph context, evidence rules và auth context. Các bug được sắp xếp thành hàng đợi xử lý. Candidate có thể thuộc hai nhóm:
+- \verb|BACProofGate|: IDOR, admin/forced browsing, param/cookie escalation, generic BAC.
+- \verb|BLFProofGate|: price tamper, coupon abuse, quantity tamper, state skip, generic BLF.
 
-- Evidence-backed: có request/endpoint quan sát trực tiếp.
-- Action-discovery: có cơ sở từ API hints hoặc route graph nhưng cần kiểm chứng thêm.
+VerifierPanel gồm nhiều VerifierAgent chạy song song. Panel không quyết định cuối cùng, nhưng giúp report có góc nhìn định tính.
 
-#### 3.2.3. Giai đoạn 3: Red/Blue debate
+### 3.9. REPORT phase
 
-Với mỗi bug, ManageAgent giao bug dossier cho RedTeamAgent. RedTeamAgent viết chiến lược khai thác và execution shot plan. Sau đó ManageAgent gửi chiến lược cho BlueTeamAgent.
+ReportBuilder đọc list Finding, sort exploited trước, ghi \verb|findings.json| và \verb|report.md|. Với mỗi finding exploited hoặc info exposure, report hiển thị:
 
-BlueTeamAgent có thể:
+- Pattern.
+- Severity.
+- Endpoint.
+- Status.
+- Summary.
+- Evidence exchanges.
+- Proof markers.
+- Verifier panel.
+- PoC HTTP.
 
-- APPROVED: chiến lược đủ rõ để Exec chạy.
-- REJECTED: chiến lược thiếu thông tin, Red cần sửa.
-- STOPPED: candidate không còn đáng khai thác.
+### 3.10. Long-term memory
 
-#### 3.2.4. Giai đoạn 4: Execution
+LongTermMemory dùng SQLite ở \verb|~/.local/share/marl3/memory.db| theo config. Nó lưu Episode sau verify. Có hai nhóm retrieval:
 
-ExecAgent nhận chiến lược đã được approve và tạo script khai thác. Script có nhiệm vụ:
+- Lessons cho Hunt: same-target lessons và distilled rules.
+- Skills cho Exec: same-target concrete payload và cross-target abstract technique.
 
-- Chuẩn bị session nếu cần.
-- Gửi baseline/probe/verify request.
-- Lưu request/response vào `exploit_state/<BUG_ID>/`.
-- In kết quả `FINAL: EXPLOITED`, `FINAL: PARTIAL` hoặc `FINAL: FAILED`.
-- Ghi `result.json`.
+Distillation promote repeated exploited episodes thành rule nếu đạt ngưỡng số lần thành công và số target khác nhau.
 
-Manager đọc kết quả để quyết định chuyển bug tiếp theo, retry hoặc dừng bug.
+### 3.11. Quan hệ với lớp legacy
 
-#### 3.2.5. Giai đoạn 5: Report
+Repo vẫn còn lớp legacy từ phiên bản MARL trước:
 
-Sau khi xử lý hàng đợi bug, ManageAgent tổng hợp báo cáo cuối. Báo cáo gồm trạng thái từng bug, strategy, evidence, PoC artifact, verdict và khuyến nghị.
+- \verb|main.py|
+- \verb|agents/|
+- \verb|tools/crawler.py|
+- \verb|shared/|
+- \verb|test/|
+
+Lớp này có guided Playwright crawler, request chain, graph coverage và ManageAgent LLM. Tuy nhiên README hiện tại và package metadata chỉ rõ \verb|marl3| là package chính, mô tả “LangGraph-powered multi-agent BAC/BLF web pentest tool”. Vì vậy báo cáo nên tập trung vào \verb|src/marl3|; lớp legacy nên được ghi nhận là nền tảng trước đó hoặc module tham khảo.
+
+## Chương 4. Thực nghiệm và triển khai
+
+### 4.1. Môi trường và công cụ
 
-### 3.3. Thành phần chính trong mã nguồn
+#### Bảng: Môi trường triển khai
 
-#### 3.3.1. `main.py`
+| Thành phần | Công nghệ |
+|---|---|
+| Ngôn ngữ | Python >= 3.11 |
+| Orchestration | LangGraph |
+| CLI | Typer |
+| Data contracts | Pydantic |
+| HTTP client | httpx |
+| HTML parsing | BeautifulSoup |
+| LLM client | OpenAI-compatible client |
+| Config | YAML + pydantic settings |
+| Memory DB | SQLite |
+| Report | Markdown + JSON |
 
-`main.py` là điểm vào của hệ thống. File này nhận prompt từ dòng lệnh, tạo workspace, thiết lập logging và điều phối các phase. Workspace thường có dạng:
+Cài đặt:
 
-```text
-workspace/<domain>_<timestamp>/
-```
+\begin{verbatim}
+pip install -e .
+\end{verbatim}
 
-#### 3.3.2. `agents/crawl_agent.py`
+Cài thêm dev/proxy:
 
-CrawlAgent chịu trách nhiệm thu thập và chuẩn hóa thông tin target. Agent này gọi `tools/crawler.py`, xử lý auth context, chạy discovery probes, ghi artifact và render recon.
+\begin{verbatim}
+pip install -e '.[dev,proxy]'
+\end{verbatim}
+
+Chạy pipeline:
+
+\begin{verbatim}
+marl3 run "http://localhost:5000 user:alice pass:alice123 user:bob pass:bob123"
+\end{verbatim}
 
-Các output quan trọng:
+Chạy crawl-only:
 
-- `crawl_raw.json`
-- `crawl_data.txt`
-- `recon.md`
-- `auth_context.json`
-
-#### 3.3.3. `tools/crawler.py`
-
-Guided crawler là một trong các thành phần quan trọng nhất. Các chức năng chính:
-
-- Capture same-origin document/xhr/fetch/form traffic.
-- Extract links, forms, buttons.
-- Safe deterministic exploration.
-- AI-guided action planner.
-- Request chain projection.
-- Workflow graph builder.
-- Static API hints extraction.
-- Auth bootstrap.
-- Crawl memory.
-- Graph coverage evaluator.
-
-Crawler output hiện có các trường:
-
-```text
-pages
-http_traffic
-observed_actions
-action_candidates
-ai_decisions
-request_chains
-workflow_graph
-business_chain
-api_hints
-auth_bootstrap
-crawl_memory
-graph_coverage
-```
-
-#### 3.3.4. `shared/business_flow_mapper.py`
-
-BusinessFlowMapper đọc `crawl_raw.json` và ánh xạ dữ liệu thành các luồng nghiệp vụ. Mapper ưu tiên state-changing requests, request chains, workflow graph, forms và graph coverage. Output là `business_flows.json`.
-
-#### 3.3.5. `agents/vuln_hunter_agent.py`
-
-VulnHunterAgent đọc recon, raw endpoints, business flows và playbook để sinh bug candidate. Agent này ưu tiên recall cao, chấp nhận false positive ở giai đoạn đầu vì các bước Red/Blue/Exec sẽ kiểm chứng sau.
-
-#### 3.3.6. `agents/manage_agent.py`
-
-ManageAgent là bộ điều phối trung tâm. Agent này quản lý queue bug, trạng thái từng bug, retry budget, routing tới Red/Blue/Exec và tổng hợp báo cáo.
-
-#### 3.3.7. `agents/red_team.py`
-
-RedTeamAgent là chiến lược gia tấn công. Agent không dùng tool trực tiếp mà đọc bug dossier và viết chiến lược khai thác rõ ràng, có shot plan và verify condition.
-
-#### 3.3.8. `agents/blue_team.py`
-
-BlueTeamAgent review chiến lược của Red. Agent kiểm tra chiến lược có đủ endpoint, payload, auth/session, baseline/probe/verify và điều kiện thành công hay không.
-
-#### 3.3.9. `agents/exec_agent.py`
-
-ExecAgent thực thi strategy đã approve. Agent dùng tools như shell, fetch, filesystem, playwright để tạo và chạy PoC. Exec tự xác minh kết quả trong script thay vì phụ thuộc hoàn toàn vào LLM.
-
-#### 3.3.10. `shared/memory_store.py` và `shared/context_manager.py`
-
-Hai thành phần này lưu scratchpad, finding, task registry, conversation summary và context liên quan. Mục tiêu là giảm token gửi lên LLM và tránh lặp toàn bộ lịch sử hội thoại.
-
-### 3.4. Playbook BAC/BLF
-
-Hệ thống có playbook trong `knowledge/bac_blf_playbook.py`, gồm nhiều pattern cho BAC và BLF. Ví dụ:
-
-- BAC-01: IDOR.
-- BAC-02: Privilege escalation.
-- BAC-03: Horizontal access.
-- BAC-04: Forced browsing.
-- BLF-01: Price manipulation.
-- BLF-02: Coupon abuse.
-- BLF-03: Workflow skip.
-- BLF-04: Quantity manipulation.
-- BLF-05: State manipulation.
-
-Playbook được dùng để định hướng VulnHunter, RedTeam và BlueTeam.
-
-### 3.5. Dữ liệu và artifact
-
-Mỗi lần chạy sinh ra nhiều artifact:
-
-```text
-workspace/<domain>_<timestamp>/
-├── marl.log
-├── crawl_data.txt
-├── crawl_raw.json
-├── recon.md
-├── business_flows.json
-├── risk-bug.json
-├── auth_context.json
-├── exploits/
-├── exploit_state/
-├── report_raw.md
-├── report_final_vi.md
-└── report.md
-```
-
-Ý nghĩa:
-
-- `marl.log`: log toàn bộ pipeline.
-- `crawl_raw.json`: nguồn dữ liệu giàu nhất.
-- `recon.md`: mô tả target đã cấu trúc hóa.
-- `business_flows.json`: các flow nghiệp vụ.
-- `risk-bug.json`: queue bug.
-- `auth_context.json`: thông tin session/token/cookie.
-- `exploits/`: script PoC.
-- `exploit_state/`: raw request/response evidence.
-- `report.md`: báo cáo cuối.
-
-### 3.6. Máy trạng thái xử lý bug
-
-Mỗi bug đi qua các trạng thái:
-
-```text
-PENDING
-  -> DEBATE_RED
-  -> DEBATE_BLUE
-  -> EXECUTING
-  -> EXPLOITED | PARTIAL | FAILED | STOPPED
-```
-
-Nếu Blue reject, bug quay lại Red trong giới hạn retry. Nếu Exec trả `PARTIAL` hoặc `SCRIPT_ERROR`, Manager có thể retry Exec theo budget. Nếu `EXPLOITED`, hệ thống lưu bằng chứng và chuyển bug tiếp theo.
-
-## 4. Cài đặt và thực nghiệm
-
-### 4.1. Cấu trúc thư mục dự án
-
-Cấu trúc chính:
-
-```text
-MARL/
-├── main.py
-├── agents/
-│   ├── manage_agent.py
-│   ├── crawl_agent.py
-│   ├── vuln_hunter_agent.py
-│   ├── red_team.py
-│   ├── blue_team.py
-│   ├── exec_agent.py
-│   └── policy_agent.py
-├── shared/
-│   ├── context_manager.py
-│   ├── memory_store.py
-│   ├── business_flow_mapper.py
-│   ├── bug_dossier.py
-│   └── utils.py
-├── tools/
-│   └── crawler.py
-├── knowledge/
-│   ├── bac_blf_playbook.py
-│   ├── bac_knowledge.json
-│   └── blf_knowledge.json
-├── server/
-│   └── server.py
-├── test/
-├── vuln-target/
-└── workspace/
-```
-
-### 4.2. Môi trường và cách chạy
-
-Cài dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-Chạy server API:
-
-```bash
-uvicorn server.server:app --reload
-```
-
-Chạy full pipeline:
-
-```bash
-python main.py "Test http://localhost:3000"
-```
-
-Chạy với credentials:
-
-```bash
-python main.py "Test http://localhost:3000 user:admin pass:secret"
-```
-
-Chạy crawler trực tiếp:
-
-```bash
-python tools/crawler.py --url http://localhost:3000 --max-pages 8 --max-rounds 1 --timeout 45 --headless --ai-steps 4
-```
-
-Tắt AI-guided crawl để so sánh baseline:
-
-```bash
-python tools/crawler.py --url http://localhost:3000 --max-pages 8 --max-rounds 1 --timeout 45 --headless --no-ai-guided
-```
-
-### 4.3. Biến môi trường
-
-Một số biến quan trọng:
-
-```env
-MARL_SERVER_URL=http://127.0.0.1:5000/v1
-MARL_CRAWL_MODEL=...
-MARL_EXECUTOR_MODEL=...
-MARL_MANAGER_MODEL=...
-MARL_CRAWL_AI_GUIDED=true
-MARL_CRAWL_AI_STEPS=4
-GITHUB_TOKEN=...
-OPENAI_API_KEY=...
-```
-
-`MARL_CRAWL_MODEL` được dùng riêng cho AI-guided crawler. Nếu không có, crawler fallback sang `MARL_EXECUTOR_MODEL` hoặc `MARL_MANAGER_MODEL`.
-
-### 4.4. Cài đặt Guided Crawler
-
-Guided crawler được nâng cấp từ crawler BFS/traffic capture đơn thuần thành hybrid crawler:
-
-- Vẫn giữ crawl deterministic bằng Playwright.
-- Bổ sung action inventory.
-- Bổ sung AI planner chọn action.
-- Bổ sung request chains.
-- Bổ sung workflow graph.
-- Bổ sung business_chain.
-- Bổ sung crawl state memory.
-- Bổ sung graph coverage evaluator.
-
-AI planner không được click tùy ý. Planner chỉ được chọn trong candidate đã được trích xuất và kiểm soát:
-
-- navigation an toàn;
-- form GET hoặc POST được policy cho phép;
-- click bounded state-changing như add-to-cart;
-- loại bỏ delete, logout, payment, confirm, purchase và các hành động nguy hiểm.
-
-### 4.5. Crawl memory và graph coverage
-
-Crawl memory giải quyết hạn chế crawler bị lặp route/action. Memory lưu:
-
-- endpoint đã ghé;
-- action đã thử;
-- action không có hiệu quả;
-- surface đã cover;
-- endpoint state-changing;
-- endpoint bị lặp nhiều.
-
-Fallback scoring dùng memory để:
-
-- trừ điểm action đã thử;
-- trừ điểm action no-effect;
-- cộng điểm endpoint mới;
-- cộng điểm action cover surface còn thiếu;
-- giảm ưu tiên endpoint bị lặp.
-
-Graph coverage evaluator chấm điểm sau crawl. Output có:
-
-- score 0-100;
-- node_count, edge_count;
-- surfaces covered/gaps;
-- state_changing_edge_count;
-- request_chain_edge_count;
-- form_edge_count;
-- recommendations.
-
-Thông tin này được đưa vào `crawl_raw.json`, `crawl_data.txt`, `recon.md` và BusinessFlowMapper.
-
-### 4.6. Cơ chế sinh bug candidate
-
-VulnHunterAgent tạo bug candidate từ:
-
-- observed endpoint inventory;
-- guided workflow graph;
-- guided auth/API hints;
-- active discovery probes;
-- endpoint dossiers;
-- business flows;
-- BAC/BLF playbook.
-
-Sau khi LLM sinh candidate, hệ thống post-process:
-
-- normalize endpoint/method;
-- gắn http_examples;
-- lọc endpoint invalid như NaN/undefined/null;
-- dedupe theo route family;
-- phân biệt CRAWL_OBSERVED, ACTIVE_DISCOVERY và ACTION_DISCOVERY;
-- ưu tiên state-changing endpoint đã observe.
-
-### 4.7. Cơ chế thực thi PoC
-
-ExecAgent tạo script PoC cho từng bug. Script nên có ba pha:
-
-```text
-baseline -> probe -> verify
-```
-
-Ví dụ:
-
-- Baseline: request hợp lệ với session/user ban đầu.
-- Probe: thay ID, role, quantity, coupon hoặc workflow state.
-- Verify: so sánh response, state change hoặc dữ liệu trả về.
-
-Kết quả được lưu trong `exploit_state/<BUG_ID>/` gồm request, response, result.json và summary.
-
-### 4.8. Kiểm thử
-
-Các test hiện có kiểm tra nhiều contract quan trọng:
-
-- Cookie header chuyển thành Playwright cookies.
-- Header CLI parse đúng Authorization.
-- Storage state replay token/localStorage/sessionStorage.
-- Workflow graph có request và action edges.
-- Planner JSON parse được object từ model text.
-- Fallback ưu tiên business action hơn login generic.
-- Fallback tránh no-effect click.
-- Request chain project thành business chain và graph.
-- Graph coverage evaluator báo gap surface.
-- Recon render workflow graph, API hints và graph coverage.
-- VulnHunter lọc endpoint invalid và dedupe candidate.
-- BusinessFlowMapper parse và ghi business_flows.
-
-Kết quả kiểm thử gần nhất:
-
-```bash
-python -m unittest test.test_guided_crawl_contract
-```
-
-```text
-Ran 23 tests
-OK (skipped=1)
-```
-
-Kiểm thử toàn bộ thư mục test:
-
-```bash
+\begin{verbatim}
+marl3 crawl "http://localhost:5000 user:alice pass:alice123"
+\end{verbatim}
+
+### 4.2. Các phương pháp đánh giá
+
+#### 4.2.1. Đánh giá khả năng recon
+
+Các chỉ số đề xuất:
+
+- Số endpoint phát hiện.
+- Số HttpExchange ghi lại.
+- Số auth profiles đăng nhập thành công.
+- Số AuthDiff.
+- Số workflow nodes/edges.
+- Số business flows.
+- Tỉ lệ endpoint expected được phát hiện nếu có ground truth.
+
+#### 4.2.2. Đánh giá khả năng sinh candidate
+
+Các chỉ số:
+
+- Số BugDossier sinh ra.
+- Tỉ lệ candidate có HttpExample.
+- Tỉ lệ candidate có evidence_rules.
+- Candidate recall so với ground truth.
+- False positive rate sau verify.
+
+#### 4.2.3. Đánh giá thực thi và xác minh
+
+Các chỉ số:
+
+- Số candidate được debate approve.
+- Số candidate thực thi thành công về mặt request.
+- Số Evidence có đủ exchanges.
+- Số bug \verb|EXPLOITED| theo ProofGate.
+- Số \verb|INFO_EXPOSURE_ONLY|.
+- Số \verb|PROOF_QUALITY_FAIL| quay lại debate.
+- Số PoC sinh ra.
+
+### 4.3. Kết quả
+
+Dựa trên scan project hiện tại, hệ thống đã có các thành phần cốt lõi:
+
+- CLI \verb|marl3|.
+- Config mặc định.
+- LangGraph main pipeline.
+- Per-bug graph.
+- Recon crawler HTTP-native.
+- BodyStore lossless.
+- Candidate generator.
+- Coordinator.
+- Debate Red/Blue.
+- ExecutionRunner.
+- ProofGate BAC/BLF.
+- VerifierPanel.
+- Long-term memory.
+- ReportBuilder.
+- Workspace artifact management.
+
+Repo cũng có \verb|vuln-target/| làm target demo với các route login, register, profile, products, cart, checkout, orders, transfer và admin. Đây là nền tảng tốt để xây benchmark chính thức.
+
+### 4.4. Đánh giá
+
+Hệ thống đã đạt mức prototype kiến trúc rõ. Điểm mạnh nhất là thiết kế tách rời decision by code và reasoning by LLM. Những object như ReconArtifact, BugDossier, Evidence và Finding giúp pipeline dễ kiểm tra hơn so với transcript-only agent. BodyStore và ProofGate làm cho bằng chứng có tính audit cao.
+
+Tuy nhiên, phần test hiện có trong repo chủ yếu kiểm tra lớp legacy ở thư mục \verb|test/|. Trong khi đó \verb|pyproject.toml| cấu hình pytest cho thư mục \verb|tests|, nhưng repo hiện không thấy thư mục \verb|tests/|. Vì vậy cần bổ sung test cho package \verb|src/marl3| để đánh giá đúng kiến trúc hiện tại.
+
+## Chương 5. Đánh giá và thảo luận
+
+### 5.1. Ưu điểm của hệ thống
+
+- Kiến trúc LangGraph rõ ràng, có node và routing deterministic.
+- LLM không tự quyết định chuyển phase.
+- Dữ liệu truyền giữa phase được chuẩn hóa bằng Pydantic contracts.
+- HTTP body được lưu lossless.
+- ProofGate là authority, giảm rủi ro LLM phán sai.
+- VerifierPanel vẫn cung cấp nhận xét định tính cho report.
+- ExecutionRunner ghi evidence và sinh PoC.
+- Long-term memory chỉ học từ episode đã xác minh.
+- Workspace quản lý artifact tập trung.
+- Có target demo \verb|vuln-target/| để phát triển benchmark.
+
+### 5.2. Hạn chế
+
+- Crawler chính hiện là HTTP-native, có thể chưa đủ với SPA/JS-heavy app.
+- Test cho \verb|src/marl3| chưa đầy đủ; test hiện có thiên về legacy.
+- Ground truth benchmark cho \verb|vuln-target| chưa hoàn thiện.
+- ProofGate cần nhiều rule hơn cho các biến thể BAC/BLF.
+- Hunt và Debate vẫn phụ thuộc LLM, cần structured output chặt hơn.
+- Long-term memory cần đánh giá thực nghiệm để chứng minh chống overfit.
+- Tài liệu trong repo còn nhiều bản cũ như \verb|OVERVIEW.md|, \verb|ARCHITECTURE.md|, \verb|CHANGED.md|, \verb|CHANGED2.md|, dễ gây nhầm với README mới.
+- Lớp legacy và lớp \verb|marl3| cùng tồn tại nên báo cáo/demo cần xác định rõ kiến trúc nào là chính.
+
+### 5.3. Hướng phát triển tương lai
+
+Các hướng phát triển nên ưu tiên:
+
+1. Bổ sung test cho \verb|src/marl3|:
+   - pipeline graph;
+   - bug graph routing;
+   - ReconArtifact serialization;
+   - BodyStore;
+   - CandidateGenerator;
+   - ExecutionRunner;
+   - ProofGate BAC/BLF;
+   - ReportBuilder;
+   - LongTermMemory.
+
+2. Xây ground truth benchmark cho \verb|vuln-target|:
+   - expected routes;
+   - expected endpoints;
+   - business objects;
+   - workflows;
+   - vulnerabilities;
+   - negative cases.
+
+3. Thêm browser recon mode bằng Playwright cho SPA/JS-heavy app, song song với HTTP-native crawler.
+
+4. Thiết kế \verb|TargetState| machine-readable:
+   - route_state;
+   - endpoint_state;
+   - action_state;
+   - business_object_state;
+   - coverage_state.
+
+5. Thêm coverage-guided recrawl dựa trên gap của target state.
+
+6. Chuẩn hóa structured output cho LLM roles.
+
+7. Mở rộng ProofGate:
+   - approval bypass;
+   - refund abuse;
+   - order state transition;
+   - transfer amount/balance;
+   - coupon stacking;
+   - cross-user write access.
+
+8. Tách tài liệu legacy khỏi tài liệu \verb|marl3| để người đọc không nhầm kiến trúc.
+
+9. Tích hợp CI:
+
+\begin{verbatim}
+pytest
 python -m unittest discover -s test
-```
+python -m py_compile src/marl3/**/*.py
+\end{verbatim}
 
-```text
-Ran 51 tests
-OK (skipped=1)
-```
+10. Chuẩn hóa final report template theo tiêu chuẩn pentest: confirmed findings, partial findings, not exploited, coverage gaps, limitations.
 
-### 4.9. Kết quả đạt được
+## Tài liệu tham khảo
 
-Hệ thống hiện đạt mức prototype chạy được theo kiến trúc chính:
+Danh sách tài liệu tham khảo nên hoàn thiện trong bản chính thức:
 
-- Có pipeline từ recon đến report.
-- Có crawler Playwright có network capture.
-- Có AI-guided action planner.
-- Có workflow graph và request chains.
-- Có business flow mapper.
-- Có VulnHunter sinh bug candidate.
-- Có Red/Blue debate trước khi thực thi.
-- Có ExecAgent sinh và chạy PoC.
-- Có artifact request/response để audit.
-- Có memory/context compression.
-- Có graph coverage evaluator.
-- Có test contract cho các phần quan trọng.
-
-## 5. Đánh giá, hạn chế và hướng phát triển
-
-### 5.1. Đánh giá hệ thống
-
-MARL cho thấy hướng tiếp cận multi-agent phù hợp với bài toán BAC/BLF vì nhóm lỗi này cần nhiều bước: hiểu target, lập giả thuyết, phản biện, thử nghiệm và xác minh. Thay vì để một LLM làm tất cả, hệ thống chia trách nhiệm cho nhiều agent và dùng Manager làm bộ điều phối.
-
-Điểm mạnh chính:
-
-- Artifact-based: mọi quyết định quan trọng dựa trên file và evidence.
-- Role separation: Red lập kế hoạch, Blue phản biện, Exec thực thi.
-- Recon giàu ngữ cảnh: có endpoint, forms, auth, graph, request chains, business chain.
-- Có kiểm soát an toàn ở crawler.
-- Có cơ chế giảm token bằng memory/context.
-- Có test contract cho schema quan trọng.
-
-### 5.2. Hạn chế hiện tại
-
-Một số hạn chế còn tồn tại:
-
-- Model planner đôi khi trả JSON rỗng hoặc malformed, nên crawler vẫn cần fallback/controller.
-- Tốc độ crawl phụ thuộc vào model planner nếu bật AI-guided.
-- Planner hiện mới chọn trong candidate click/navigation/form đã trích xuất; chưa có semantic form filling sâu.
-- Business logic nhiều bước như checkout, transfer, approval, coupon, refund vẫn cần baseline và state verification tốt hơn.
-- Active discovery có thể tạo signal rộng, cần phân biệt rõ hơn giữa route-like response và proof.
-- BLF cần before/after state mạnh hơn để tránh suy luận quá mức.
-- Hệ thống phụ thuộc vào LLM proxy, token và target đang chạy.
-- Chưa có benchmark lớn trên nhiều loại web app khác nhau.
-
-### 5.3. Hướng phát triển
-
-Các hướng phát triển tiếp theo:
-
-- Ép model output bằng structured output nếu backend hỗ trợ.
-- Thêm planner timeout/rate telemetry.
-- Mở rộng semantic form filling bằng dữ liệu an toàn theo loại field.
-- Mở rộng graph coverage theo từng loại nghiệp vụ cụ thể.
-- Thêm workflow memory dài hạn giữa nhiều lần crawl.
-- Thêm evaluator riêng cho proof quality sau Exec.
-- Benchmark trên nhiều lab BAC/BLF như PortSwigger, OWASP Juice Shop và target tự dựng.
-- Tách dashboard quan sát pipeline, graph và bug queue.
-- Tăng khả năng replay session/auth context cho Exec.
-- Chuẩn hóa báo cáo cuối theo template học thuật và pentest report.
-
-### 5.4. Kết luận
-
-Đề tài đã xây dựng được một hệ thống prototype đa tác tử cho kiểm thử ứng dụng web, tập trung vào Broken Access Control và Business Logic Flaw. Hệ thống có pipeline tương đối đầy đủ từ thu thập thông tin, phân tích, sinh giả thuyết, tranh luận chiến lược, thực thi PoC đến báo cáo.
-
-Kết quả quan trọng nhất của đề tài là chuyển hướng recon từ danh sách endpoint đơn thuần sang bản đồ workflow có ngữ cảnh:
-
-```text
-Page/Route -> User Action -> HTTP Requests -> State Change -> Business Flow
-```
-
-Nhờ đó, các agent sau có thể làm việc trên evidence cụ thể hơn. Dù vẫn còn hạn chế về semantic form filling, độ sâu của BLF nhiều bước và phụ thuộc vào LLM backend, hệ thống đã tạo nền tảng rõ ràng để tiếp tục phát triển thành công cụ hỗ trợ kiểm thử bảo mật tự động có kiểm soát.
+1. OWASP Top 10: Broken Access Control.
+2. OWASP Web Security Testing Guide.
+3. PortSwigger Web Security Academy: Access Control vulnerabilities.
+4. PortSwigger Web Security Academy: Business logic vulnerabilities.
+5. OWASP Juice Shop documentation.
+6. LangGraph documentation.
+7. OpenAI API / OpenAI-compatible Chat Completions documentation.
+8. Pydantic documentation.
+9. httpx documentation.
+10. Typer documentation.
+11. Các tài liệu về Red Team/Blue Team methodology.
+12. Các nghiên cứu liên quan đến LLM agents trong kiểm thử bảo mật.
