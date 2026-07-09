@@ -1,4 +1,4 @@
-# marl3 — Kiến trúc & Mindset
+# marl3 — A multi-agent system for detecting and exploiting business logic flaws and broken access control vulnerabilities.
 
 > Công cụ pentest tự động phát hiện và **chứng minh** lỗ hổng phân quyền (BAC) và logic nghiệp vụ (BLF) trên ứng dụng web, sử dụng kiến trúc đa agent điều phối bằng LangGraph.
 

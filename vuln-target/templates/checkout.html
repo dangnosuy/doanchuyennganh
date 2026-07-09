@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}Thanh toán — TechShop{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div class="container">
+        <h1 class="fw-bold mb-0"><i class="bi bi-credit-card me-2"></i>Thanh toán</h1>
+    </div>
+</div>
+
+<div class="container pb-5">
+    <div class="row g-4">
+        <div class="col-lg-7">
+            <form action="{{ url_for('checkout_confirm') }}" method="post" id="checkoutForm">
+                <!-- Hidden price fields for each item -->
+                {% for item in items %}
+                <input type="hidden" name="price_{{ item.product.id }}" value="{{ item.product.price }}">
+                {% endfor %}
+                <input type="hidden" name="total" value="{{ final_total }}">
+
+                <!-- Shipping info -->
+                <div class="card border-0 shadow-sm mb-3">
+                    <div class="card-header bg-white fw-bold border-0 pt-3">
+                        <i class="bi bi-truck me-2 text-primary"></i>Thông tin giao hàng
+                    </div>
+                    <div class="card-body">
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">Họ tên</label>
+                                <input type="text" class="form-control" value="{{ user.full_name or user.username }}" readonly>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-semibold">Số điện thoại</label>
+                                <input type="text" class="form-control" value="{{ user.phone or '' }}" readonly>
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label fw-semibold">Địa chỉ giao hàng <span class="text-danger">*</span></label>
+                                <textarea name="address" class="form-control" rows="2" required placeholder="Số nhà, đường, phường/xã, quận/huyện, tỉnh/thành">{{ user.address or '' }}</textarea>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Payment method -->
+                <div class="card border-0 shadow-sm mb-3">
+                    <div class="card-header bg-white fw-bold border-0 pt-3">
+                        <i class="bi bi-wallet2 me-2 text-primary"></i>Phương thức thanh toán
+                    </div>
+                    <div class="card-body">
+                        <div class="d-flex flex-column gap-2">
+                            <div class="form-check border rounded p-3">
+                                <input class="form-check-input" type="radio" name="payment" value="cod" id="cod" checked>
+                                <label class="form-check-label fw-semibold ms-1" for="cod">
+                                    <i class="bi bi-cash-coin me-2 text-success"></i>Thanh toán khi nhận hàng (COD)
+                                </label>
+                            </div>
+                            <div class="form-check border rounded p-3">
+                                <input class="form-check-input" type="radio" name="payment" value="banking" id="banking">
+                                <label class="form-check-label fw-semibold ms-1" for="banking">
+                                    <i class="bi bi-bank me-2 text-primary"></i>Chuyển khoản ngân hàng
+                                </label>
+                            </div>
+                            <div class="form-check border rounded p-3">
+                                <input class="form-check-input" type="radio" name="payment" value="balance" id="balance">
+                                <label class="form-check-label fw-semibold ms-1" for="balance">
+                                    <i class="bi bi-wallet me-2 text-warning"></i>Số dư tài khoản
+                                    <span class="text-muted small">({{ "{:,.0f}".format(user.balance) }}đ)</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn btn-primary w-100 btn-lg">
+                    <i class="bi bi-check-circle me-2"></i>Xác nhận đặt hàng
+                </button>
+            </form>
+        </div>
+
+        <div class="col-lg-5">
+            <div class="card border-0 shadow-sm sticky-top" style="top:80px">
+                <div class="card-header bg-white fw-bold border-0 pt-3">Đơn hàng của bạn</div>
+                <div class="card-body p-0">
+                    <ul class="list-group list-group-flush">
+                        {% for item in items %}
+                        <li class="list-group-item d-flex align-items-center gap-3 py-3">
+                            <img src="{{ item.product.image_url }}" class="rounded" style="width:52px; height:40px; object-fit:cover;" alt="{{ item.product.name }}">
+                            <div class="flex-grow-1">
+                                <div class="fw-semibold small">{{ item.product.name }}</div>
+                                <div class="text-muted small">x{{ item.qty }}</div>
+                            </div>
+                            <span class="fw-bold small">{{ "{:,.0f}".format(item.subtotal) }}đ</span>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                    <div class="p-3">
+                        <div class="d-flex justify-content-between mb-1">
+                            <span class="text-muted">Tạm tính</span>
+                            <span>{{ "{:,.0f}".format(total) }}đ</span>
+                        </div>
+                        {% if discount > 0 %}
+                        <div class="d-flex justify-content-between mb-1 text-success">
+                            <span>Giảm giá</span>
+                            <span>-{{ "{:,.0f}".format(discount) }}đ</span>
+                        </div>
+                        {% endif %}
+                        <div class="d-flex justify-content-between mb-1 text-muted">
+                            <span>Vận chuyển</span>
+                            <span class="text-success">Miễn phí</span>
+                        </div>
+                        <hr>
+                        <div class="d-flex justify-content-between fw-bold fs-5">
+                            <span>Tổng thanh toán</span>
+                            <span class="text-danger" id="displayTotal">{{ "{:,.0f}".format(final_total) }}đ</span>
+                        </div>
+                        <div class="text-muted small mt-1">
+                            <i class="bi bi-gift me-1"></i>Bạn sẽ nhận được <strong>{{ (final_total // 10000)|int }}</strong> điểm tích lũy
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}

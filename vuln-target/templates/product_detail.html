@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}{{ product.name }} — TechShop{% endblock %}
+{% block content %}
+
+<div class="container py-5">
+    <nav aria-label="breadcrumb" class="mb-4">
+        <ol class="breadcrumb">
+            <li class="breadcrumb-item"><a href="{{ url_for('index') }}">Trang chủ</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('products') }}">Sản phẩm</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('products', category=product.category) }}">{{ product.category }}</a></li>
+            <li class="breadcrumb-item active">{{ product.name }}</li>
+        </ol>
+    </nav>
+
+    <div class="row g-5">
+        <div class="col-md-5">
+            <img src="{{ product.image_url }}" class="img-fluid rounded-3 shadow w-100" alt="{{ product.name }}" style="max-height:380px; object-fit:cover;">
+        </div>
+        <div class="col-md-7">
+            <span class="badge bg-primary mb-2">{{ product.category }}</span>
+            <h1 class="fw-bold fs-3 mb-2">{{ product.name }}</h1>
+            <div class="d-flex align-items-center gap-3 mb-3">
+                <span class="fs-2 fw-bold text-danger">{{ "{:,.0f}".format(product.price) }}đ</span>
+                {% if product.stock > 0 %}
+                <span class="badge bg-success-subtle text-success border border-success-subtle">
+                    <i class="bi bi-check-circle me-1"></i>Còn {{ product.stock }} sản phẩm
+                </span>
+                {% else %}
+                <span class="badge bg-danger-subtle text-danger border border-danger-subtle">Hết hàng</span>
+                {% endif %}
+            </div>
+            <p class="text-muted mb-4">{{ product.description }}</p>
+
+            <div class="d-flex gap-3 flex-wrap mb-4">
+                <div class="d-flex align-items-center gap-2 text-muted small">
+                    <i class="bi bi-shield-check text-success fs-5"></i>Bảo hành 12 tháng
+                </div>
+                <div class="d-flex align-items-center gap-2 text-muted small">
+                    <i class="bi bi-truck text-primary fs-5"></i>Giao hàng 2-3 ngày
+                </div>
+                <div class="d-flex align-items-center gap-2 text-muted small">
+                    <i class="bi bi-arrow-repeat text-warning fs-5"></i>Đổi trả 30 ngày
+                </div>
+            </div>
+
+            {% if session.user_id and product.stock > 0 %}
+            <form action="{{ url_for('cart_add') }}" method="post" class="d-flex gap-3 align-items-center">
+                <input type="hidden" name="product_id" value="{{ product.id }}">
+                <div class="input-group" style="width:130px">
+                    <span class="input-group-text">Số lượng</span>
+                    <input type="number" name="qty" value="1" class="form-control" min="1" max="{{ product.stock }}">
+                </div>
+                <button class="btn btn-primary btn-lg px-4"><i class="bi bi-cart-plus me-2"></i>Thêm vào giỏ</button>
+            </form>
+            {% elif not session.user_id %}
+            <a href="{{ url_for('login') }}" class="btn btn-primary btn-lg px-4">
+                <i class="bi bi-box-arrow-in-right me-2"></i>Đăng nhập để mua hàng
+            </a>
+            {% endif %}
+        </div>
+    </div>
+
+    {% if related %}
+    <div class="mt-5">
+        <h4 class="fw-bold mb-4">Sản phẩm tương tự</h4>
+        <div class="row g-4">
+            {% for p in related %}
+            <div class="col-sm-6 col-lg-3">
+                <div class="card product-card h-100 shadow-sm">
+                    <a href="{{ url_for('product_detail', pid=p.id) }}">
+                        <img src="{{ p.image_url }}" class="card-img-top" alt="{{ p.name }}">
+                    </a>
+                    <div class="card-body">
+                        <h6 class="fw-bold"><a href="{{ url_for('product_detail', pid=p.id) }}" class="text-dark text-decoration-none">{{ p.name }}</a></h6>
+                        <div class="price-tag">{{ "{:,.0f}".format(p.price) }}đ</div>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+{% endblock %}

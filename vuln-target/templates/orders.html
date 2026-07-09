@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Đơn hàng của tôi — TechShop{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div class="container">
+        <h1 class="fw-bold mb-0"><i class="bi bi-bag-check me-2"></i>Đơn hàng của tôi</h1>
+    </div>
+</div>
+
+<div class="container pb-5">
+    {% if orders %}
+    <div class="card border-0 shadow-sm">
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th class="ps-4">Mã đơn</th>
+                            <th>Ngày đặt</th>
+                            <th>Địa chỉ</th>
+                            <th class="text-end">Tổng tiền</th>
+                            <th class="text-center">Trạng thái</th>
+                            <th class="pe-4"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for o in orders %}
+                        <tr>
+                            <td class="ps-4"><span class="fw-bold">#{{ o.id }}</span></td>
+                            <td class="text-muted small">{{ o.created_at[:16] }}</td>
+                            <td class="text-muted small">{{ (o.address or '')[:40] }}{% if o.address and o.address|length > 40 %}...{% endif %}</td>
+                            <td class="text-end fw-bold text-danger">{{ "{:,.0f}".format(o.total) }}đ</td>
+                            <td class="text-center">
+                                {% if o.status == 'delivered' %}
+                                <span class="badge bg-success">Đã giao</span>
+                                {% elif o.status == 'shipped' %}
+                                <span class="badge bg-info text-dark">Đang giao</span>
+                                {% elif o.status == 'pending' %}
+                                <span class="badge bg-warning text-dark">Chờ xử lý</span>
+                                {% else %}
+                                <span class="badge bg-secondary">{{ o.status }}</span>
+                                {% endif %}
+                            </td>
+                            <td class="pe-4">
+                                <a href="{{ url_for('order_detail', order_id=o.id) }}" class="btn btn-sm btn-outline-primary">Chi tiết</a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% else %}
+    <div class="text-center py-5">
+        <i class="bi bi-bag-x fs-1 text-muted d-block mb-3"></i>
+        <h4 class="text-muted">Chưa có đơn hàng nào</h4>
+        <a href="{{ url_for('products') }}" class="btn btn-primary mt-3">Mua sắm ngay</a>
+    </div>
+    {% endif %}
+</div>
+
+{% endblock %}

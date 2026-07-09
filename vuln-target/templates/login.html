@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Đăng nhập — TechShop{% endblock %}
+{% block content %}
+
+<div class="min-vh-100 d-flex align-items-center bg-light py-5">
+    <div class="container">
+        <div class="row justify-content-center">
+            <div class="col-md-5 col-lg-4">
+                <div class="text-center mb-4">
+                    <a href="{{ url_for('index') }}" class="text-decoration-none">
+                        <h2 class="fw-bold"><i class="bi bi-cpu-fill text-primary me-1"></i>Tech<span class="text-info">Shop</span></h2>
+                    </a>
+                    <p class="text-muted">Đăng nhập vào tài khoản của bạn</p>
+                </div>
+                <div class="card border-0 shadow">
+                    <div class="card-body p-4">
+                        {% if error %}
+                        <div class="alert alert-danger py-2 small"><i class="bi bi-exclamation-circle me-2"></i>{{ error }}</div>
+                        {% endif %}
+                        <form action="{{ url_for('login') }}" method="post">
+                            <div class="mb-3">
+                                <label class="form-label fw-semibold">Tên đăng nhập</label>
+                                <div class="input-group">
+                                    <span class="input-group-text"><i class="bi bi-person"></i></span>
+                                    <input type="text" name="username" class="form-control" placeholder="Nhập tên đăng nhập" required autofocus>
+                                </div>
+                            </div>
+                            <div class="mb-4">
+                                <label class="form-label fw-semibold">Mật khẩu</label>
+                                <div class="input-group">
+                                    <span class="input-group-text"><i class="bi bi-lock"></i></span>
+                                    <input type="password" name="password" class="form-control" placeholder="Nhập mật khẩu" required>
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-primary w-100 py-2 fw-semibold">
+                                <i class="bi bi-box-arrow-in-right me-2"></i>Đăng nhập
+                            </button>
+                        </form>
+                        <hr class="my-3">
+                        <div class="text-center text-muted small">
+                            Chưa có tài khoản?
+                            <a href="{{ url_for('register') }}" class="text-primary text-decoration-none fw-semibold">Đăng ký ngay</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}

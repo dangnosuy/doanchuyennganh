@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}Quản lý người dùng — Admin{% endblock %}
+{% block extra_css %}
+<style>
+.admin-nav .nav-link { color: #495057; border-radius: 8px; padding: 0.6rem 1rem; }
+.admin-nav .nav-link:hover { background: #f0f4ff; color: #0d6efd; }
+.admin-nav .nav-link.active { background: #0d6efd; color: #fff !important; }
+.admin-nav .nav-link i { width: 20px; }
+</style>
+{% endblock %}
+{% block content %}
+
+<div class="container-fluid py-4">
+    <div class="row g-4">
+        <div class="col-md-3 col-xl-2">
+            <div class="card border-0 shadow-sm">
+                <div class="card-body">
+                    <div class="text-center mb-3">
+                        <div class="bg-danger rounded-circle d-inline-flex align-items-center justify-content-center mb-2" style="width:52px;height:52px;">
+                            <i class="bi bi-shield-fill-check text-white fs-4"></i>
+                        </div>
+                        <div class="fw-bold small">Admin Panel</div>
+                        <div class="text-muted" style="font-size:.75rem;">{{ session.username }}</div>
+                    </div>
+                    <nav class="admin-nav d-flex flex-column gap-1">
+                        <a href="{{ url_for('admin_dashboard') }}" class="nav-link">
+                            <i class="bi bi-speedometer2 me-2"></i>Dashboard
+                        </a>
+                        <a href="{{ url_for('admin_users') }}" class="nav-link active">
+                            <i class="bi bi-people me-2"></i>Người dùng
+                        </a>
+                        <a href="{{ url_for('admin_orders') }}" class="nav-link">
+                            <i class="bi bi-bag me-2"></i>Đơn hàng
+                        </a>
+                        <hr class="my-2">
+                        <a href="{{ url_for('index') }}" class="nav-link">
+                            <i class="bi bi-shop me-2"></i>Về trang chủ
+                        </a>
+                    </nav>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-9 col-xl-10">
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <h4 class="fw-bold mb-0"><i class="bi bi-people me-2"></i>Quản lý người dùng</h4>
+                <span class="badge bg-primary">{{ users|length }} người dùng</span>
+            </div>
+
+            <div class="card border-0 shadow-sm">
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th class="ps-4">ID</th>
+                                <th>Người dùng</th>
+                                <th>Email</th>
+                                <th>Vai trò</th>
+                                <th class="text-end">Số dư</th>
+                                <th class="text-end">Điểm</th>
+                                <th>Ngày tạo</th>
+                                <th class="text-center pe-4">Hành động</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for u in users %}
+                            <tr>
+                                <td class="ps-4 text-muted">#{{ u.id }}</td>
+                                <td>
+                                    <div class="d-flex align-items-center gap-2">
+                                        <div class="rounded-circle bg-secondary d-flex align-items-center justify-content-center text-white fw-bold"
+                                             style="width:34px;height:34px;font-size:.85rem;">
+                                            {{ u.username[0].upper() }}
+                                        </div>
+                                        <div>
+                                            <div class="fw-semibold">{{ u.username }}</div>
+                                            <div class="text-muted small">{{ u.full_name or '' }}</div>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td class="small text-muted">{{ u.email }}</td>
+                                <td>
+                                    <span class="badge {% if u.role == 'admin' %}bg-danger{% else %}bg-primary{% endif %}">
+                                        {{ u.role }}
+                                    </span>
+                                </td>
+                                <td class="text-end small">{{ "{:,.0f}".format(u.balance) }}đ</td>
+                                <td class="text-end small">{{ u.points }}</td>
+                                <td class="text-muted small">{{ u.created_at[:10] }}</td>
+                                <td class="text-center pe-4">
+                                    <div class="d-flex gap-1 justify-content-center flex-wrap">
+                                        <a href="{{ url_for('profile', user_id=u.id) }}" class="btn btn-sm btn-outline-secondary" title="Xem hồ sơ">
+                                            <i class="bi bi-eye"></i>
+                                        </a>
+
+                                        <!-- Promote form -->
+                                        <form action="{{ url_for('admin_users_promote') }}" method="post" class="d-inline">
+                                            <input type="hidden" name="user_id" value="{{ u.id }}">
+                                            <input type="hidden" name="role" value="{{ 'user' if u.role == 'admin' else 'admin' }}">
+                                            <button class="btn btn-sm btn-outline-warning" title="{{ 'Hạ cấp' if u.role == 'admin' else 'Thăng cấp' }}">
+                                                <i class="bi bi-arrow-up-circle"></i>
+                                            </button>
+                                        </form>
+
+                                        <!-- Delete form (POST) -->
+                                        {% if u.id != session.user_id %}
+                                        <form action="{{ url_for('admin_users_delete_post') }}" method="post" class="d-inline"
+                                              onsubmit="return confirm('Xóa người dùng {{ u.username }}?')">
+                                            <input type="hidden" name="user_id" value="{{ u.id }}">
+                                            <button class="btn btn-sm btn-outline-danger" title="Xóa">
+                                                <i class="bi bi-trash3"></i>
+                                            </button>
+                                        </form>
+                                        {% endif %}
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}

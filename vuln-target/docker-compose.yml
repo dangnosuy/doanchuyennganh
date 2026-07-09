@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  techshop:
+    build: .
+    ports:
+      - "5001:5001"
+    volumes:
+      - techshop_data:/data
+volumes:
+  techshop_data:

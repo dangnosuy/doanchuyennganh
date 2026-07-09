@@ -1,0 +1,202 @@
+[
+    {
+        "id": "BAC-01",
+        "name": "Unprotected Admin/Sensitive Functionality",
+        "severity": "Critical",
+        "indicators": [
+            "robots.txt chứa đường dẫn admin/management",
+            "JavaScript source tiết lộ URL ẩn (VD: adminPanelTag, isAdmin check)",
+            "Sitemap.xml liệt kê endpoint không public",
+            "Có endpoint /admin, /administrator, /management, /console, /dashboard nhưng không yêu cầu auth",
+            "Response header tiết lộ framework có admin panel mặc định"
+        ],
+        "technique": [
+            "1. Recon: kiểm tra robots.txt, sitemap.xml, JS bundles tìm hidden paths",
+            "2. Thử truy cập trực tiếp các admin paths bằng tài khoản thường (hoặc không login)",
+            "3. Nếu bị redirect → kiểm tra response body trước redirect (có thể leak nội dung)",
+            "4. Thử path variations: /Admin, /ADMIN, /admin/, /admin/dashboard",
+            "5. Kiểm tra JS source cho biến/hàm liên quan: isAdmin, adminPanel, role, privilege"
+        ],
+        "variations": [
+            "Path case-sensitivity bypass: /Admin vs /admin (một số server phân biệt hoa thường)",
+            "Trailing slash / double slash: /admin// hoặc /admin/./",
+            "URL encoding: /%61dmin",
+            "Thử thêm path prefix: /static/../admin, /api/../admin"
+        ],
+        "success": "Truy cập được giao diện/chức năng admin mà không cần role admin"
+    },
+    {
+        "id": "BAC-02",
+        "name": "Parameter-Based Access Control",
+        "severity": "Critical",
+        "indicators": [
+            "URL có tham số role/admin/access: ?role=user, ?admin=false, ?access=1",
+            "Cookie chứa role indicator: isAdmin=false, role=user, access_level=1",
+            "Hidden form field liên quan đến role/permission",
+            "Request body JSON có trường role/privilege/admin",
+            "Response trả về thông tin role trong body/cookie"
+        ],
+        "technique": [
+            "1. Đăng nhập tài khoản thường, capture request/response đầy đủ",
+            "2. Tìm tham số role trong: URL params, cookies, request body, hidden fields",
+            "3. Thay đổi giá trị: role=admin, isAdmin=true, access_level=99, admin=1",
+            "4. Gửi lại request với tham số đã sửa",
+            "5. Kiểm tra response có thay đổi quyền / hiện thêm chức năng không"
+        ],
+        "variations": [
+            "Thay đổi cookie: isAdmin=false → isAdmin=true",
+            "Thêm tham số mới vào request: &admin=true, &role=administrator",
+            "Đổi content-type và gửi JSON body thay vì form data",
+            "Sửa JWT payload nếu không verify signature (alg:none attack)"
+        ],
+        "success": "Có quyền admin/elevated sau khi sửa tham số, có thể thực hiện hành động chỉ admin mới có"
+    },
+    {
+        "id": "BAC-03",
+        "name": "IDOR — Insecure Direct Object Reference",
+        "severity": "High",
+        "indicators": [
+            "URL chứa ID/username dùng để lấy data: /user?id=123, /profile/john, /account/456",
+            "API endpoint dùng user ID trong path: /api/users/123/orders",
+            "Request body chứa userId, accountId, customerId",
+            "Response chứa data cá nhân của user hiện tại (gợi ý thử user khác)",
+            "Predictable ID format: số nguyên tăng dần, username rõ ràng"
+        ],
+        "technique": [
+            "1. Đăng nhập tài khoản A, capture request lấy data cá nhân",
+            "2. Xác định tham số identify user: id, username, email, accountId",
+            "3. Thay giá trị sang user B (VD: id=123 → id=124, username=wiener → username=carlos)",
+            "4. So sánh response: có trả về data của user B không?",
+            "5. Thử cả đọc (GET) và ghi (POST/PUT/DELETE)"
+        ],
+        "variations": [
+            "Nếu ID là GUID → tìm cách leak GUID (qua comment, review, social feature)",
+            "Horizontal → Vertical: xem data của admin user có thể leak password/token",
+            "Mass assignment: gửi thêm field userId trong update profile request",
+            "Thử ID = 0, 1, admin, root cho edge cases"
+        ],
+        "success": "Đọc/sửa/xóa được data của user khác mà không có quyền"
+    },
+    {
+        "id": "BAC-04",
+        "name": "HTTP Method-Based Access Control Bypass",
+        "severity": "High",
+        "indicators": [
+            "Endpoint bị 403 với POST nhưng chưa test GET/PUT/PATCH/DELETE",
+            "API framework dùng annotation-based routing (Spring, Django REST)",
+            "Admin action chỉ chặn trên 1 method cụ thể",
+            "Server hỗ trợ nhiều HTTP methods (kiểm tra OPTIONS response)"
+        ],
+        "technique": [
+            "1. Gửi request admin action bằng POST → bị 403",
+            "2. Thử lại bằng GET với params tương đương: GET /admin/delete?username=target",
+            "3. Thử PUT, PATCH, DELETE",
+            "4. Thử method override: X-HTTP-Method-Override: DELETE, X-HTTP-Method: PUT, _method=PUT trong body",
+            "5. Thử POSTX, GETS (invalid method — một số WAF/framework bypass)"
+        ],
+        "variations": [
+            "Header override: X-HTTP-Method-Override, X-Method-Override",
+            "Query param override: ?_method=PUT",
+            "Content-Type thay đổi: application/json vs application/x-www-form-urlencoded",
+            "TRACE method có thể reflect sensitive headers"
+        ],
+        "success": "Thực hiện được admin action bằng HTTP method khác (không phải method bị chặn)"
+    },
+    {
+        "id": "BAC-05",
+        "name": "URL Rewrite / Path Traversal Bypass",
+        "severity": "High",
+        "indicators": [
+            "Server dùng reverse proxy (Nginx/Apache trước backend)",
+            "Response header có X-Original-URL, X-Rewrite-URL",
+            "Front-end access control dựa trên URL path",
+            "Có sự khác biệt giữa proxy routing và backend routing"
+        ],
+        "technique": [
+            "1. Truy cập /admin → bị 403",
+            "2. Thử header bypass: X-Original-URL: /admin, X-Rewrite-URL: /admin/delete",
+            "3. Request path /? với header X-Original-URL: /admin",
+            "4. Thử path confusion: /admin%00, /admin%0d%0a, /./admin, //admin, /admin;",
+            "5. Nếu API gateway: thử /api/v1/../admin, path traversal qua proxy"
+        ],
+        "variations": [
+            "Header: X-Forwarded-For, X-Custom-IP-Authorization: 127.0.0.1",
+            "Path normalization: /admin/. , /admin..;/ (Tomcat), /admin%252f (double encoding)",
+            "Host header manipulation: Host: localhost",
+            "Thêm port: Host: target.com:8443"
+        ],
+        "success": "Bypass access control trên proxy/front-end, truy cập endpoint admin qua backend"
+    },
+    {
+        "id": "BAC-06",
+        "name": "Multi-Step Process — Missing Access Control on Later Steps",
+        "severity": "High",
+        "indicators": [
+            "Workflow nhiều bước: step1 (chọn action) → step2 (xác nhận) → step3 (thực thi)",
+            "Step đầu check quyền nhưng step sau không re-check",
+            "URL pattern có step/phase: ?step=2, /confirm, /execute",
+            "Hidden form field chứa action đã chọn ở step trước"
+        ],
+        "technique": [
+            "1. Dùng tài khoản admin thực hiện full workflow, capture tất cả requests",
+            "2. Xác định request ở mỗi step (đặc biệt step cuối — thực thi action)",
+            "3. Dùng tài khoản thường, skip các step đầu, gửi thẳng request step cuối",
+            "4. Hoặc: làm step 1-2 bình thường, ở step cuối đổi target user/action",
+            "5. Kiểm tra action có được thực thi với quyền thường không"
+        ],
+        "variations": [
+            "Thay đổi Referer header (một số app check Referer thay vì session)",
+            "Bỏ CSRF token ở step cuối (nếu app skip check khi không có token)",
+            "Đổi thứ tự params / thêm params từ step khác"
+        ],
+        "success": "Thực hiện được privileged action bằng cách skip hoặc thao túng multi-step workflow"
+    },
+    {
+        "id": "BAC-07",
+        "name": "Referer-Based Access Control",
+        "severity": "Medium",
+        "indicators": [
+            "Endpoint admin trả 403 khi truy cập trực tiếp nhưng cho phép nếu có Referer từ trang admin khác",
+            "Server check Referer header để xác thực source of navigation",
+            "Admin sub-page accessible nếu Referer = admin main page"
+        ],
+        "technique": [
+            "1. Truy cập /admin/delete-user → 403",
+            "2. Thêm header Referer: https://target.com/admin và gửi lại",
+            "3. Thử variations: Referer: /admin, Referer: https://target.com/admin/dashboard",
+            "4. Kết hợp với method bypass nếu cần"
+        ],
+        "variations": [
+            "Referer chứa keyword admin ở bất kỳ vị trí nào: ?ref=admin, /page?from=admin",
+            "Bỏ hoàn toàn Referer header (Referer: )",
+            "Sửa Origin header thay vì Referer"
+        ],
+        "success": "Bypass access control bằng cách giả mạo Referer header"
+    },
+    {
+        "id": "BAC-08",
+        "name": "API Endpoint Discoverability & Version Mismatch",
+        "severity": "High",
+        "indicators": [
+            "API có versioning: /api/v1/, /api/v2/ — version cũ có thể thiếu auth",
+            "JS source tiết lộ API endpoint không document",
+            "Có endpoint PATCH/PUT ngoài GET đã biết",
+            "Mobile app dùng API khác web app (kiểm tra traffic mobile)",
+            "Swagger/OpenAPI spec public"
+        ],
+        "technique": [
+            "1. Enumerate API versions: /api/v1/users, /api/v2/users, /api/v3/users",
+            "2. Tìm undocumented endpoints trong JS bundles / Swagger",
+            "3. Thử PATCH /api/users/me với body thêm field: {\"role\":\"admin\", \"isAdmin\":true}",
+            "4. Kiểm tra API endpoint không có auth header vẫn trả data",
+            "5. So sánh auth requirements giữa các API versions"
+        ],
+        "variations": [
+            "Mass assignment: gửi thêm fields không document trong update request",
+            "Thay đổi response format: .json, .xml, .csv",
+            "GraphQL introspection nếu có GraphQL endpoint",
+            "Kiểm tra /internal/, /debug/, /test/ paths"
+        ],
+        "success": "Truy cập API endpoint không có auth / bypass auth qua version cũ hoặc undocumented path"
+    }
+]

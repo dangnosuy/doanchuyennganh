@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Chuyển điểm — TechShop{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div class="container">
+        <h1 class="fw-bold mb-0"><i class="bi bi-arrow-left-right me-2"></i>Chuyển điểm thưởng</h1>
+    </div>
+</div>
+
+<div class="container pb-5">
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            {% if message %}
+            <div class="alert alert-success"><i class="bi bi-check-circle me-2"></i>{{ message }}</div>
+            {% endif %}
+            {% if error %}
+            <div class="alert alert-danger"><i class="bi bi-exclamation-circle me-2"></i>{{ error }}</div>
+            {% endif %}
+
+            <div class="card border-0 shadow-sm mb-4">
+                <div class="card-body text-center">
+                    <div class="text-muted small mb-1">Điểm hiện tại của bạn</div>
+                    <div class="fw-bold text-warning" style="font-size:2.5rem;">{{ user.points }}</div>
+                    <div class="text-muted small">điểm thưởng</div>
+                </div>
+            </div>
+
+            <div class="card border-0 shadow-sm">
+                <div class="card-header bg-white fw-bold border-0 pt-3">
+                    <i class="bi bi-send me-2 text-primary"></i>Thực hiện chuyển điểm
+                </div>
+                <div class="card-body">
+                    <form action="{{ url_for('transfer') }}" method="post">
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold">Người nhận <span class="text-danger">*</span></label>
+                            <input type="text" name="to_username" class="form-control" placeholder="Tên đăng nhập người nhận" required>
+                        </div>
+                        <div class="mb-4">
+                            <label class="form-label fw-semibold">Số điểm muốn chuyển <span class="text-danger">*</span></label>
+                            <input type="number" name="amount" class="form-control" placeholder="Nhập số điểm" required>
+                            <div class="form-text">Tối thiểu 1 điểm. Bạn có {{ user.points }} điểm.</div>
+                        </div>
+                        <button type="submit" class="btn btn-primary w-100">
+                            <i class="bi bi-send me-2"></i>Chuyển điểm
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <div class="card border-0 shadow-sm mt-3">
+                <div class="card-body">
+                    <h6 class="fw-bold mb-2"><i class="bi bi-info-circle me-2 text-info"></i>Lưu ý</h6>
+                    <ul class="text-muted small mb-0">
+                        <li>Điểm thưởng không có giá trị quy đổi tiền mặt trực tiếp.</li>
+                        <li>Giao dịch chuyển điểm không thể hoàn tác.</li>
+                        <li>10.000đ chi tiêu = 1 điểm thưởng.</li>
+                        <li>Dùng điểm để đổi voucher giảm giá hấp dẫn.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
