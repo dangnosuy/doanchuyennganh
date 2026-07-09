@@ -1,0 +1,116 @@
+<mxGraphModel adaptiveColors="0" background="#ffffff">
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+
+    <!-- Tier 1 background -->
+    <mxCell id="tier1_bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;opacity=30;" vertex="1" parent="1">
+      <mxGeometry x="30" y="30" width="680" height="120" as="geometry"/>
+    </mxCell>
+    <mxCell id="tier1_title" value="Tier 1 — HTTP Recording Layer" style="text;html=1;strokeColor=none;fillColor=none;fontStyle=1;fontSize=12;fontColor=#6c8ebf;" vertex="1" parent="1">
+      <mxGeometry x="42" y="35" width="280" height="25" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="t1_exec" value="Exec Agent&#xa;(tool calls)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontStyle=1;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="60" y="75" width="140" height="55" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="t1_rec" value="RecordingHttpClient&#xa;(wraps httpx)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontStyle=1;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="270" y="75" width="170" height="55" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="t1_store" value="HttpExchange Store&#xa;(req + resp pairs)" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontStyle=1;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="510" y="68" width="165" height="68" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="et1a" value="HTTP calls" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;" edge="1" source="t1_exec" target="t1_rec" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="et1b" value="intercepts + records" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;" edge="1" source="t1_rec" target="t1_store" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- Tier 2 background -->
+    <mxCell id="tier2_bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;opacity=30;" vertex="1" parent="1">
+      <mxGeometry x="30" y="200" width="680" height="140" as="geometry"/>
+    </mxCell>
+    <mxCell id="tier2_title" value="Tier 2 — LLM Advisory Layer (majority vote)" style="text;html=1;strokeColor=none;fillColor=none;fontStyle=1;fontSize=12;fontColor=#d6b656;" vertex="1" parent="1">
+      <mxGeometry x="42" y="206" width="360" height="25" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="t2_v1" value="Verifier 1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="65" y="248" width="110" height="55" as="geometry"/>
+    </mxCell>
+    <mxCell id="t2_v2" value="Verifier 2" style="ellipse;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="205" y="248" width="110" height="55" as="geometry"/>
+    </mxCell>
+    <mxCell id="t2_v3" value="Verifier 3" style="ellipse;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="345" y="248" width="110" height="55" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="t2_vote" value="Majority Vote (≥2/3)&#xa;Fast-fail: 0/3 + no 2xx&#xa;→ skip ProofGate" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;fontStyle=1;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="505" y="243" width="180" height="65" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="et2a" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#555555;" edge="1" source="t2_v1" target="t2_vote" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="et2b" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#555555;" edge="1" source="t2_v2" target="t2_vote" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="et2c" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#555555;" edge="1" source="t2_v3" target="t2_vote" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- Tier 3 background -->
+    <mxCell id="tier3_bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;opacity=30;" vertex="1" parent="1">
+      <mxGeometry x="30" y="400" width="680" height="140" as="geometry"/>
+    </mxCell>
+    <mxCell id="tier3_title" value="Tier 3 — Deterministic Code Layer (sole authority)" style="text;html=1;strokeColor=none;fillColor=none;fontStyle=1;fontSize=12;fontColor=#2d7600;" vertex="1" parent="1">
+      <mxGeometry x="42" y="406" width="400" height="25" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="t3_cls" value="LLMClassifier&#xa;(extracts structured&#xa;facts from exchanges)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="55" y="445" width="175" height="65" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="t3_pg" value="ProofGate&#xa;(pattern-specific rules)&#xa;AI cannot override" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontStyle=1;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="295" y="440" width="190" height="70" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="t3_out" value="VerdictStatus&#xa;EXPLOITED&#xa;PROOF_QUALITY_FAIL&#xa;NOT_EXPLOITED" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontStyle=1;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="548" y="440" width="145" height="75" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="et3a" value="structured facts" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;" edge="1" source="t3_cls" target="t3_pg" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="et3b" value="sets verdict" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#2d7600;fontColor=#2d7600;fontStyle=1;" edge="1" source="t3_pg" target="t3_out" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- Cross-tier arrows -->
+    <mxCell id="ev_down1" value="list[HttpExchange]" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;" edge="1" source="t1_store" target="t2_v1" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="593" y="185"/>
+          <mxPoint x="120" y="185"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+    <mxCell id="ev_down2" value="raw exchanges" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;" edge="1" source="t1_store" target="t3_cls" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="593" y="380"/>
+          <mxPoint x="143" y="380"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+    <mxCell id="ev_vote_pg" value="panel_verdicts" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;" edge="1" source="t2_vote" target="t3_pg" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+  </root>
+</mxGraphModel>

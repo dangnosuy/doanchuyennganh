@@ -53,9 +53,27 @@ def _after_verify(state: BugRunState) -> str:
     # budget since the data ceiling won't change.
     if status in ("EXPLOITED", "INFO_EXPOSURE_ONLY"):
         return "end"
-    # PROOF_QUALITY_FAIL — retry debate if budget allows
+    # PROOF_QUALITY_FAIL — retry when there's a meaningful signal worth re-strategizing on.
+    # Two independent signals, either is sufficient:
+    #   1. panel_verdicts confirmed_count >= 1: Panel saw something promising in raw exchanges.
+    #   2. has_partial_proof: ProofGate ran and at least one proof_marker was SATISFIED
+    #      (e.g., endpoint accessible but data not confirmed sensitive yet). This is the
+    #      strongest retry signal — execution was structurally close, strategy needs refinement.
+    # Panel runs pre-gate (raw HTTP), so its signal is weaker than ProofGate's markers.
+    # Checking both prevents missing retries when ProofGate found partial evidence
+    # but Panel voted 0/3 (e.g., Panel couldn't parse non-English response body).
+    # Off-by-one note: verify.py increments verify_retries BEFORE this check runs,
+    # so the guard must use <= (not <) to allow max_verify_retries=1 to mean 1 retry.
+    panel_verdicts = state.get("panel_verdicts", []) or []
+    confirmed_count = sum(1 for v in panel_verdicts if getattr(v, "confirmed", False))
+    evidence = state.get("evidence")
+    has_partial_proof = any(
+        getattr(m, "satisfied", False)
+        for m in (getattr(evidence, "proof_markers", None) or [])
+    ) if evidence else False
     can_retry = (
-        state.get("verify_retries", 0) < state.get("max_verify_retries", 1)
+        (confirmed_count >= 1 or has_partial_proof)
+        and state.get("verify_retries", 0) <= state.get("max_verify_retries", 1)
         and state.get("debate_rounds", 0) < state.get("max_debate_rounds", 3) * 2
     )
     if can_retry:

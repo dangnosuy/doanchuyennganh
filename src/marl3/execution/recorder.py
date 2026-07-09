@@ -196,6 +196,13 @@ class RecordingHttpClient:
         for seg in urlparse(url).path.split("/"):
             if re.fullmatch(r"\d+", seg):
                 id_fields["path_id"] = int(seg)
+        # Extract ID-like query parameters (e.g. ?id=carlos, ?userId=5, ?user=wiener)
+        from urllib.parse import parse_qs
+        _ID_PARAM_NAMES = {"id", "user", "userid", "user_id", "username", "account", "account_id", "uid", "member", "member_id"}
+        qs = parse_qs(urlparse(url).query)
+        for qk, qv in qs.items():
+            if qk.lower() in _ID_PARAM_NAMES and qv:
+                id_fields[f"query_{qk}"] = qv[0]
         # Record response size for content-diff based IDOR proof
         numeric_fields["_resp_len"] = float(len(resp_body))
 

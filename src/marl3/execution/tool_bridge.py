@@ -379,14 +379,26 @@ class ToolBridge:
             "method": method,
             "actor": actor,
         }
+        # Expose Location header for 3xx so exec can follow the redirect explicitly
+        # rather than guessing the URL (e.g. POST /cart/checkout → 303 → /order-confirmation?...).
+        if 300 <= resp.status_code < 400:
+            location = resp.headers.get("location") or resp.headers.get("Location")
+            if location:
+                result["redirect_location"] = location
         if exchange:
             result["exchange_id"] = exchange.exchange_id
             result["json_keys"] = exchange.json_keys[:20]
             result["id_fields"] = exchange.id_fields
             result["numeric_fields"] = exchange.numeric_fields
-            # Small preview (not truncated mid-string — this is just metadata)
+            # Immediate preview for the Exec agent — read first 2000 chars from disk so
+            # it can decide whether to call http_body_get for the full body.
             if exchange.response_body_ref:
-                result["body_preview"] = exchange.response_body_ref.head_preview[:300]
+                _PREVIEW_CAP = 2000
+                try:
+                    _body_bytes = self._body_store.get(exchange.response_body_ref.blob_id)
+                    result["body_preview"] = _body_bytes.decode("utf-8", "replace")[:_PREVIEW_CAP]
+                except Exception:
+                    result["body_preview"] = exchange.response_body_ref.head_preview
 
         return json.dumps(result)
 
@@ -419,7 +431,7 @@ class ToolBridge:
 
         # Cap what is injected into the agent's context. The full body is always on disk
         # (lossless); the agent only needs a bounded view — use json_path to drill in.
-        MAX = 4000
+        MAX = 20_000
         try:
             body_bytes = self._body_store.get(exchange.response_body_ref.blob_id)
             try:
@@ -430,7 +442,7 @@ class ToolBridge:
                 if len(text) > MAX:
                     return json.dumps({
                         "body_truncated": text[:MAX],
-                        "note": f"Body is {len(text)} chars; showing first {MAX}. Use json_path to extract a specific field.",
+                        "note": f"Body is {len(text)} chars; showing first {MAX}. Use json_path to drill into a specific field.",
                         "exchange_id": exchange_id,
                     })
                 return json.dumps({"body": obj, "exchange_id": exchange_id})

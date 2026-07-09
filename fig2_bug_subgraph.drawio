@@ -1,0 +1,140 @@
+<mxGraphModel adaptiveColors="0" background="#ffffff">
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+
+    <!-- ===== MAIN CENTER COLUMN ===== -->
+    <mxCell id="s0" value="QUEUED" style="ellipse;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#555555;strokeWidth=2;fontStyle=1;fontSize=12;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="290" y="20" width="170" height="52" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s1" value="DEBATING" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontStyle=1;fontSize=12;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="290" y="135" width="170" height="55" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s2" value="DEBATE_APPROVED" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontStyle=1;fontSize=12;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="270" y="260" width="210" height="55" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s3" value="EXECUTING" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontStyle=1;fontSize=12;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="290" y="385" width="170" height="55" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s4" value="VERIFYING" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontStyle=1;fontSize=12;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="290" y="515" width="170" height="55" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== RIGHT COLUMN: side exits ===== -->
+    <mxCell id="s8" value="SKIPPED_NO&#xa;_EVIDENCE" style="ellipse;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#555555;strokeWidth=2;fontStyle=1;fontSize=11;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="590" y="135" width="170" height="55" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s9" value="ERROR" style="ellipse;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;fontStyle=1;fontSize=12;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="600" y="385" width="140" height="55" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s5" value="PROOF_QUALITY&#xa;_FAIL" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;fontStyle=1;fontSize=12;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="590" y="515" width="170" height="55" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== BOTTOM: terminal states ===== -->
+    <!-- EXPLOITED far left so its wire doesn't cross others -->
+    <mxCell id="s6" value="EXPLOITED" style="ellipse;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontStyle=1;fontSize=12;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="10" y="670" width="145" height="55" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="s7" value="NOT_EXPLOITED" style="ellipse;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;strokeWidth=2;fontStyle=1;fontSize=12;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="280" y="670" width="180" height="55" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== MAIN FLOW EDGES (center, straight) ===== -->
+    <mxCell id="e1" value="START_DEBATE" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;strokeWidth=1.5;labelBackgroundColor=#ffffff;" edge="1" source="s0" target="s1" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e2" value="APPROVED" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;strokeWidth=1.5;labelBackgroundColor=#ffffff;" edge="1" source="s1" target="s2" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e5" value="START_EXEC" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;strokeWidth=1.5;labelBackgroundColor=#ffffff;" edge="1" source="s2" target="s3" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e6" value="EXEC_DONE" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;strokeWidth=1.5;labelBackgroundColor=#ffffff;" edge="1" source="s3" target="s4" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== RIGHT EXITS (straight right) ===== -->
+    <mxCell id="e4" value="INSUFFICIENT_CONTEXT" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#555555;strokeWidth=1.5;labelBackgroundColor=#ffffff;" edge="1" source="s1" target="s8" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e8" value="ERROR" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#d79b00;fontColor=#d79b00;fontStyle=1;strokeWidth=1.5;labelBackgroundColor=#ffffff;" edge="1" source="s3" target="s9" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e11" value="PROOF_FAIL" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#d79b00;fontColor=#d79b00;fontStyle=1;strokeWidth=1.5;labelBackgroundColor=#ffffff;" edge="1" source="s4" target="s5" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== REJECTED: straight down ===== -->
+    <mxCell id="e10" value="REJECTED" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#b85450;fontColor=#b85450;fontStyle=1;strokeWidth=1.5;labelBackgroundColor=#ffffff;" edge="1" source="s4" target="s7" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== LEFT EXITS: 3 wires at x=65, x=120, x=170 (spaced 55px apart) ===== -->
+
+    <!-- CONFIRMED → EXPLOITED, wire at x=65 (leftmost) -->
+    <mxCell id="e9" value="CONFIRMED" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#82b366;fontColor=#2d7600;fontStyle=1;strokeWidth=1.5;labelBackgroundColor=#ffffff;exitX=0;exitY=0.5;exitDx=0;exitDy=0;" edge="1" source="s4" target="s6" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="65" y="542"/>
+          <mxPoint x="65" y="697"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+    <!-- EXEC_FAILED → NOT_EXPLOITED, wire at x=120 -->
+    <mxCell id="e7" value="EXEC_FAILED" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#888888;fontColor=#555555;strokeWidth=1.5;labelBackgroundColor=#ffffff;exitX=0;exitY=0.5;exitDx=0;exitDy=0;" edge="1" source="s3" target="s7" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="120" y="412"/>
+          <mxPoint x="120" y="697"/>
+          <mxPoint x="280" y="697"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+    <!-- STOP/MAX_ROUNDS from DEBATING → NOT_EXPLOITED, wire at x=170 -->
+    <mxCell id="e3" value="MAX_ROUNDS" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#888888;fontColor=#555555;strokeWidth=1.5;labelBackgroundColor=#ffffff;exitX=0;exitY=0.5;exitDx=0;exitDy=0;" edge="1" source="s1" target="s7" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="170" y="162"/>
+          <mxPoint x="170" y="697"/>
+          <mxPoint x="280" y="697"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+    <!-- GIVE_UP: exits bottom of PROOF_QUALITY_FAIL, goes down then left to NOT_EXPLOITED -->
+    <mxCell id="e13" value="GIVE_UP" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#888888;fontColor=#555555;strokeWidth=1.5;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" source="s5" target="s7" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="675" y="640"/>
+          <mxPoint x="370" y="640"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+    <!-- RETRY_DEBATE: right side loop, wire at x=830 -->
+    <mxCell id="e12" value="RETRY_DEBATE&#xa;(if budget)" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;strokeColor=#d79b00;fontColor=#d79b00;fontStyle=1;strokeWidth=1.5;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="s5" target="s1" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="830" y="542"/>
+          <mxPoint x="830" y="162"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+  </root>
+</mxGraphModel>

@@ -1,0 +1,55 @@
+\documentclass[12pt, oneside]{thesis}
+\usepackage{rotating}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,backgrounds,patterns}
+
+\begin{document}
+
+\frontmatter\pagestyle{plain}
+
+
+\input{src/covers/title_page}
+\input{src/covers/second_title_page}
+\input{src/loi_cam_on}
+
+\renewcommand{\contentsname}{NỘI DUNG}
+\tableofcontents
+
+\renewcommand{\figurename}{Hình}
+\renewcommand{\listfigurename}{DANH SÁCH HÌNH ẢNH}
+\addcontentsline{toc}{section}{\textbf{\listfigurename}}
+\listoffigures
+\newpage
+
+\renewcommand{\tablename}{Bảng}
+\renewcommand{\listtablename}{DANH SÁCH BẢNG BIỂU}
+\addcontentsline{toc}{section}{\textbf{\listtablename}}
+\listoftables
+\newpage
+
+\include{src/danh_muc_viet_tat}
+\include{src/danh_muc_dich}
+
+\mainmatter
+\include{src/chapters/0.tom_tat}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{}
+\lhead{\itshape\small\leftmark}
+\cfoot{\thepage}
+
+\input{src/chapters/1.tong_quan_de_tai}
+\input{src/chapters/2.co_so_ly_thuyet}
+\input{src/chapters/3.phuong_phap_thuc_hien}
+\input{src/chapters/4.hien_thuc_danh_gia_thao_luan}
+\input{src/chapters/5.ket_luan}
+
+\printbibliography[title={TÀI LIỆU THAM KHẢO}]
+\addcontentsline{toc}{chapter}{\textbf{TÀI LIỆU THAM KHẢO}}
+
+\end{document}

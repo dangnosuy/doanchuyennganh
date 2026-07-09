@@ -5,6 +5,7 @@ then enriches each candidate with real HTTP examples and evidence rules.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -65,13 +66,120 @@ def _reclassify_pattern(c: dict) -> str:
     is_list = any(w in blob for w in _LIST_MARKERS)
     if pid == "BAC-03" and (is_list or not has_obj):
         return "BAC-01"
+    # Reverse: BAC-01 tagged on a per-object path (e.g. /profile/{id}) is really IDOR
+    if pid == "BAC-01" and has_obj and not is_list:
+        return "BAC-03"
+    # BAC-06 (forced-browsing probe) on a per-object non-admin path is really IDOR
+    is_admin_path = any(kw in endpoint.lower() for kw in _ADMIN_PATH_KW)
+    if pid == "BAC-06" and has_obj and not is_list and not is_admin_path:
+        return "BAC-03"
     return pid
 
 
 _SEED_MONEY_KW = ("amount", "price", "total", "cost", "balance", "credit", "point", "qty", "quantity")
+
+
+def _build_page_observations(recon) -> str:
+    """Build rich page content for the hunter — body previews, form field details with type+value.
+
+    Code responsibility: collect everything and forward it. LLM responsibility: reason from it.
+    """
+    if recon is None:
+        return ""
+    lines: list[str] = []
+    seen: set[tuple] = set()
+
+    for ex in (getattr(recon, "exchanges", None) or []):
+        key = (ex.url, ex.actor)
+        if key in seen:
+            continue
+        has_content = bool(
+            ex.html_title
+            or ex.forms
+            or (getattr(ex, "response_body_ref", None) and ex.response_body_ref.head_preview)
+        )
+        if not has_content:
+            continue
+        seen.add(key)
+
+        parts: list[str] = [f"\n### {ex.method} {ex.url}  (actor={ex.actor}) → {ex.status}"]
+        if ex.html_title:
+            parts.append(f"  Title: {ex.html_title}")
+
+        for form in (ex.forms or []):
+            action = form.get("action", "") or ""
+            method = (form.get("method", "GET") or "GET").upper()
+            field_parts: list[str] = []
+            for fld in form.get("fields", []):
+                name = fld.get("name", "")
+                if not name:
+                    continue
+                ftype = fld.get("type", "text")
+                value = fld.get("value", "")
+                if ftype == "hidden":
+                    field_parts.append(f"{name}={value}[hidden]")
+                elif value:
+                    field_parts.append(f"{name}={value}[{ftype}]")
+                else:
+                    field_parts.append(f"{name}[{ftype}]")
+            if field_parts:
+                parts.append(f"  Form {method} {action}: {', '.join(field_parts)}")
+
+        body_ref = getattr(ex, "response_body_ref", None)
+        if body_ref and getattr(body_ref, "head_preview", None):
+            preview = body_ref.head_preview[:500]
+            parts.append(f"  Body: {preview}")
+
+        lines.append("\n".join(parts))
+
+    return "\n".join(lines)
+
+
+def _build_auth_sessions_detail(recon) -> str:
+    """Return auth session summary including actual cookie values for BAC reasoning.
+
+    Base64-encoded cookie values are decoded inline — the hunter sees the plaintext
+    uid:role structure without needing to decode manually (e.g. _identity=MTp1c2Vy → '1:user').
+    """
+    profiles = getattr(recon, "auth_profiles", None) or []
+    if not profiles:
+        return "(none — anonymous crawl only)"
+    parts: list[str] = []
+    for p in profiles:
+        raw_cookie = getattr(p, "cookie_header", None) or ""
+        if not raw_cookie:
+            parts.append(f"- {p.label}: (no cookies)")
+            continue
+        annotated_pairs: list[str] = []
+        for kv in raw_cookie.split(";"):
+            kv = kv.strip()
+            if "=" not in kv:
+                annotated_pairs.append(kv)
+                continue
+            name, _, val = kv.partition("=")
+            annotation = ""
+            if len(val) >= 6:
+                try:
+                    decoded = base64.b64decode(val + "==").decode("utf-8", errors="strict")
+                    if any(c.isalpha() for c in decoded) and decoded.isprintable():
+                        annotation = f" [base64→ {decoded!r}]"
+                except Exception:
+                    pass
+            annotated_pairs.append(f"{name}={val}{annotation}")
+        parts.append(f"- {p.label}: {'; '.join(annotated_pairs)}")
+    return "\n".join(parts)
 _SEED_QTY_KW = ("qty", "quantity", "count", "stock")
-_ADMIN_PATH_KW = ("/admin", "/administrator", "/manage", "/console", "/staff",
-                  "/internal", "/backend", "/superuser")
+_TAMPERABLE_COOKIE_NAMES = frozenset({
+    "role", "is_admin", "admin", "user_id", "userid", "account", "uid",
+    "access_level", "privilege", "permissions", "account_type", "tier",
+    "is_staff", "is_superuser", "user_role", "auth_level", "usertype",
+    "user_type", "group", "isadmin",
+})
+_ADMIN_PATH_KW = (
+    "/admin", "/administrator", "/manage", "/console", "/staff",
+    "/internal", "/backend", "/superuser", "/control", "/moderator",
+    "/sysadmin", "/panel", "/ops", "/debug", "/manager", "/config",
+)
 
 
 def _seed(pattern_id: str, endpoint: str, method: str, title: str, hypothesis: str,
@@ -95,13 +203,37 @@ def _seed_from_recon(recon) -> list[dict]:
     endpoints = getattr(recon, "endpoints", []) or []
     seeds: list[dict] = []
 
-    # cookie-tamper (BAC-02) signal: plaintext role/uid cookies after login
+    # Endpoints where anon is blocked (302/401/403) — BAC-01 requires anon to actually
+    # receive data, so skip seeding BAC-01 for these (they are properly auth-gated).
+    auth_gated: set[str] = set()
+    for diff in getattr(recon, "auth_diffs", []) or []:
+        if diff.anon_status in (301, 302, 303, 401, 403):
+            auth_gated.add(f"{diff.method}:{diff.endpoint}")
+
+    # cookie-tamper (BAC-02) signal: plaintext role/uid cookies OR base64-encoded identity cookies
+    # (e.g. _identity=MTp1c2Vy → base64 decode → "1:user" — clear uid:role structure)
     cookie_names: set[str] = set()
+    encoded_identity_cookies: set[str] = set()
+
     for p in getattr(recon, "auth_profiles", []) or []:
         if getattr(p, "cookie_header", None):
-            cookie_names |= {c.split("=")[0].strip().lower()
-                             for c in p.cookie_header.split(";") if "=" in c}
-    tamperable = bool(cookie_names & {"role", "is_admin", "admin", "user_id", "userid", "account", "uid"})
+            for kv in p.cookie_header.split(";"):
+                kv = kv.strip()
+                if "=" not in kv:
+                    continue
+                name, _, val = kv.partition("=")
+                cname = name.strip().lower()
+                cookie_names.add(cname)
+                if len(val) >= 6:
+                    try:
+                        decoded = base64.b64decode(val + "==").decode("utf-8", errors="strict")
+                        if re.search(r"\d+:(user|admin|staff|role|operator|member|mod)", decoded, re.I):
+                            encoded_identity_cookies.add(cname)
+                    except Exception:
+                        pass
+
+    plaintext_tamperable = bool(cookie_names & _TAMPERABLE_COOKIE_NAMES)
+    tamperable = plaintext_tamperable or bool(encoded_identity_cookies)
 
     # money/qty fields per endpoint family (from endpoint params + form fields + form actions)
     from urllib.parse import urlparse
@@ -131,23 +263,65 @@ def _seed_from_recon(recon) -> list[dict]:
         fam = _family_path(path)
         probed = getattr(ep, "discovery", "") == "probed"
         is_admin = any(k in low for k in _ADMIN_PATH_KW)
-        has_pathid = "{id}" in path or "{uuid}" in path
+        has_pathid = "{id}" in path or "{uuid}" in path or "{id}" in fam
 
         if method == "GET" and is_admin:
-            seeds.append(_seed("BAC-06", path, "GET",
-                f"Forced browsing to admin area {path}",
-                f"GET {path} is an admin/privileged area{' ([probed], not linked)' if probed else ''}; "
-                f"test access as low-priv and with a tampered role cookie."))
-            if tamperable:
+            # Seed BAC-06 for any admin path that is accessible (auth_diffs, probed, or simply crawled).
+            # A crawled path is reachable by definition — the crawler visited it successfully.
+            accessible_to_auth = f"GET:{path}" in {f"{d.method}:{d.endpoint}"
+                                                    for d in (getattr(recon, "auth_diffs", []) or [])
+                                                    if getattr(d, "auth_status", 999) < 400}
+            crawled = getattr(ep, "discovery", "") == "crawled"
+            if accessible_to_auth or probed or crawled:
+                seeds.append(_seed("BAC-06", path, "GET",
+                    f"Forced browsing to admin area {path}",
+                    f"GET {path} is an admin/privileged area{' ([probed], not linked)' if probed else ''}; "
+                    f"test access as low-priv and with a tampered role cookie."))
+            if plaintext_tamperable:
+                plain_names = sorted(cookie_names & _TAMPERABLE_COOKIE_NAMES)
                 seeds.append(_seed("BAC-02", path, "GET",
                     f"Privilege escalation via cookie on {path}",
-                    f"Plaintext cookies {sorted(cookie_names)} present. FIRST request {path} as normal "
+                    f"Plaintext cookies {plain_names} present. FIRST request {path} as normal "
                     f"user (expect 302/403 block), THEN tamper role=admin (expect 200) — capture both in order.",
                     confidence=0.5))
+            if encoded_identity_cookies:
+                cnames = sorted(encoded_identity_cookies)
+                seeds.append(_seed("BAC-02", path, "GET",
+                    f"Encoded-cookie privilege escalation on {path}",
+                    f"Cookie(s) {cnames} contain base64-encoded uid:role data (e.g. MTp1c2Vy → '1:user'). "
+                    f"FIRST request {path} as normal user, THEN forge cookie with admin/staff role: "
+                    f"base64-encode '1:admin' or '1:staff' and replace the cookie value. "
+                    f"Capture baseline (normal user → 302/403) then forged (elevated → 200) in order.",
+                    confidence=0.55))
         elif method == "GET" and probed and not is_admin:
             seeds.append(_seed("BAC-06", path, "GET",
                 f"Forced browsing to {path}",
                 f"GET {path} is auth-gated/probed; verify it exists and whether a low-priv session reaches it."))
+
+        # BAC-04: HTTP Method Override — seed when an admin/role-action endpoint exists
+        # alongside a GET admin area. Typical scenario: GET /admin renders panel, but
+        # POST /admin/roles or /admin/upgrade requires admin privilege — try method override.
+        if method in ("POST", "PUT", "PATCH", "DELETE") and is_admin:
+            seeds.append(_seed("BAC-04", path, method,
+                f"HTTP method override on {path}",
+                f"{method} {path} is an admin action endpoint. If it returns 401/403, "
+                f"try tunnelling via POST with X-HTTP-Method-Override: {method} header, "
+                f"or use _method={method} query param. Capture baseline (no override → blocked) "
+                f"then override (expects 200/302).", confidence=0.4))
+
+        # BAC-02 mass assignment: POST/PATCH to account/profile/settings endpoints.
+        # Server may accept undocumented JSON fields (roleid, role, is_admin) alongside
+        # legitimate ones and persist them without whitelist validation.
+        _PROFILE_KW = ("account", "profile", "user", "settings", "my-account", "change-email",
+                       "change-password", "update", "edit")
+        if method in ("POST", "PATCH") and any(k in low for k in _PROFILE_KW) and not is_admin:
+            seeds.append(_seed("BAC-02", path, method,
+                f"Mass assignment / JSON privilege field injection on {path}",
+                f"{method} {path} accepts JSON updates to user account fields. Try adding "
+                f"undocumented privilege fields to the JSON body: {{\"roleid\": 1}}, "
+                f"{{\"role\": \"administrator\"}}, {{\"is_admin\": true}}, {{\"admin\": true}} "
+                f"alongside the normal fields. If the server stores all submitted JSON keys "
+                f"(ORM mass assignment), your role will be elevated.", confidence=0.45))
 
         if method == "GET" and has_pathid and getattr(ep, "auth_required", False):
             seeds.append(_seed("BAC-03", path, "GET",
@@ -155,28 +329,92 @@ def _seed_from_recon(recon) -> list[dict]:
                 f"GET {path} has a per-object id. Log in as user A, then request user B's id (cross-user) "
                 f"and compare the returned identity — different owner = IDOR."))
 
-        if method == "GET" and any(k in low for k in ("user", "account", "profile", "order")):
-            seeds.append(_seed("BAC-01", path, "GET",
-                f"Sensitive data exposure on {path}",
-                f"GET {path} returns user/account data; check whether anon or a low-priv actor receives "
-                f"PII of other users.", confidence=0.5))
+        if method == "GET" and any(k in low for k in (
+            "user", "account", "profile", "order", "client", "clients",
+            "internal", "staff", "personnel", "data", "report",
+            "employee", "customer", "member",
+        )) and not has_pathid:
+            # BAC-01 = anon/low-priv actor receives PII. If anon is blocked by a 302/401/403
+            # redirect, the endpoint is properly auth-gated and is NOT a BAC-01 candidate.
+            if f"{method}:{path}" not in auth_gated:
+                seeds.append(_seed("BAC-01", path, "GET",
+                    f"Sensitive data exposure on {path}",
+                    f"GET {path} returns user/account data; check whether anon or a low-priv actor "
+                    f"receives PII of other users.", confidence=0.5))
 
         if method in ("POST", "PUT", "PATCH") and fam in money_family:
             mfields = money_family[fam]
             is_qty = any(any(k in f.lower() for k in _SEED_QTY_KW) for f in mfields)
             pid = "BLF-06" if is_qty else "BLF-01"
+            extra = ""
+            if any(k in path.lower() for k in ("cart", "checkout", "order", "purchase")):
+                extra = (" Also probe hidden price params not in the form: unit_price, price, "
+                         "total — add them to the request body and check if the server accepts them.")
             seeds.append(_seed(pid, path, method,
                 f"Value tampering on {path}",
                 f"{method} {path} accepts value field(s) {mfields}; submit negative/extreme values "
-                f"(e.g. -100 / -1), then re-read state to confirm acceptance.", confidence=0.5))
-        elif method in ("POST", "PUT", "PATCH", "DELETE") and getattr(ep, "discovery", "") in ("js", "form"):
-            # State-changing action discovered in the app surface but with no obvious
-            # money/qty field (e.g. /checkout, /coupon/apply, /orders/{id}/cancel). Seed a
-            # business-logic candidate keyed to the right BLF pattern so it is attempted —
-            # and can serve as a step the hunter stitches into a multi-request chain —
-            # instead of being silently dropped for lacking a value field.
+                f"(e.g. -100 / -1), then re-read state to confirm acceptance.{extra}", confidence=0.5))
+        elif method in ("POST", "PUT", "PATCH", "DELETE"):
+            # State-changing action with no obvious money/qty field — seed a business-logic
+            # candidate regardless of how it was discovered (crawled/js/form all count).
+            # Dedup keeps highest confidence, so money seeds (0.5) win over these (0.4).
             pid, title, hyp = _action_seed_spec(method, path)
             seeds.append(_seed(pid, path, method, title, hyp, confidence=0.4))
+
+    # BLF-09: Workflow step bypass — POST directly to checkout/confirm without prior steps.
+    # Triggered when: checkout/confirm endpoint exists AND a cart/add endpoint also exists.
+    # The server validates the final action but not that prior workflow steps were completed.
+    checkout_eps = [ep for ep in endpoints
+                    if ep.method in ("POST", "GET")
+                    and any(k in ep.endpoint.lower() for k in ("checkout", "confirm", "order/complete",
+                                                                "order/confirm", "payment/complete",
+                                                                "purchase/confirm"))]
+    cart_eps = [ep for ep in endpoints
+                if ep.method in ("POST",)
+                and any(k in ep.endpoint.lower() for k in ("cart", "basket", "add-to-cart",
+                                                            "cart/add", "cart/item"))]
+    if checkout_eps and cart_eps:
+        for chk_ep in checkout_eps[:1]:  # one candidate is enough
+            seeds.append(_seed("BLF-09", chk_ep.endpoint, chk_ep.method,
+                f"Workflow step bypass — POST directly to {chk_ep.endpoint}",
+                f"The checkout/confirm flow requires prior cart steps, but "
+                f"{chk_ep.method} {chk_ep.endpoint} may process the request without "
+                f"verifying the prior steps were completed. Try: (1) ensure cart has the "
+                f"target item, (2) POST directly to {chk_ep.endpoint} with only CSRF token, "
+                f"skipping any intermediate payment/shipping steps. A 200 or redirect to "
+                f"order confirmation proves the workflow validation is missing.",
+                confidence=0.45))
+
+    # BLF-10: Password-change endpoint with username field but no current-password check.
+    # Seed when a POST endpoint is found with 'password' in path AND form fields include
+    # 'username' but the forms don't require 'current-password' (field absent = exploitable).
+    for ep in endpoints:
+        if ep.method != "POST":
+            continue
+        if "password" not in ep.endpoint.lower() and "change-pass" not in ep.endpoint.lower():
+            continue
+        form_fields: list[str] = []
+        for ex in (getattr(recon, "exchanges", []) or []):
+            if ex.endpoint == ep.endpoint:
+                for form in (ex.forms or []):
+                    form_fields += [f.get("name", "") for f in form.get("fields", [])]
+        has_username = any("username" in f.lower() for f in form_fields)
+        has_current = any("current" in f.lower() for f in form_fields)
+        if has_username and not has_current:
+            seeds.append(_seed("BLF-10", ep.endpoint, "POST",
+                f"Password change without current-password check on {ep.endpoint}",
+                f"POST {ep.endpoint} has a 'username' field but NO 'current-password' "
+                f"field — the server may change any account's password without verifying "
+                f"the caller knows the existing one. Try: POST with username=administrator "
+                f"+ new-password=<anything>, omitting current-password entirely.",
+                confidence=0.6))
+        elif has_username:
+            seeds.append(_seed("BLF-10", ep.endpoint, "POST",
+                f"Potential dual-use password-change endpoint {ep.endpoint}",
+                f"POST {ep.endpoint} accepts 'username' in the body. Test omitting "
+                f"'current-password' — the server may gate the validation on field presence "
+                f"rather than enforcing it unconditionally. Set username=administrator.",
+                confidence=0.4))
 
     return seeds
 
@@ -184,21 +422,26 @@ def _seed_from_recon(recon) -> list[dict]:
 def _action_seed_spec(method: str, path: str) -> tuple[str, str, str]:
     """Map a discovered state-changing action endpoint to a BLF pattern + hypothesis."""
     low = path.lower()
-    if any(k in low for k in ("refund", "cancel", "return", "reverse", "chargeback")):
+    if any(k in low for k in ("refund", "cancel", "return", "reverse", "chargeback",
+                               "void", "rollback", "undo", "revoke")):
         return ("BLF-06", f"Refund/cancel abuse on {path}",
             f"{method} {path} reverses an order/payment. Check whether it credits the caller "
             f"without an ownership check, can be replayed for repeated credit, or re-enables a "
             f"consumed resource (coupon/stock) — refund/cancel abuse.")
-    if any(k in low for k in ("coupon", "discount", "promo", "voucher")):
+    if any(k in low for k in ("coupon", "discount", "promo", "voucher",
+                               "gift_card", "giftcard", "reward", "redeem", "offer")):
         return ("BLF-05", f"Coupon/discount abuse on {path}",
             f"{method} {path} applies a coupon/discount. Test re-applying the same code, and "
             f"re-applying after a related action (order cancel/refund) that may reset a 'used' "
             f"flag — stacking or reusing a one-time discount is BLF-05.")
-    if any(k in low for k in ("checkout", "cart", "order", "purchase", "pay", "confirm")):
+    if any(k in low for k in ("checkout", "cart", "order", "purchase", "pay", "confirm",
+                               "buy", "subscribe", "billing", "charge", "settle")):
         return ("BLF-01", f"Price/total trust on {path}",
             f"{method} {path} is a purchase/checkout step. Test submitting client-controlled "
-            f"price/total/unit_price fields, and skipping prior steps; the server may trust the "
-            f"client value or accept an out-of-order request.")
+            f"price fields — including hidden params the form may not advertise: unit_price, price, "
+            f"total, amount, subtotal, cost. Also try skipping prior steps (e.g. POST /checkout "
+            f"without a completed cart); the server may trust client-supplied values or accept "
+            f"out-of-order requests.")
     return ("BLF-03", f"Workflow/state manipulation on {path}",
         f"{method} {path} changes state. Probe sequence bypass: invoke it out of the expected "
         f"order or replay it, then re-read state to confirm an invariant was violated.")
@@ -226,6 +469,8 @@ class VulnCandidateGenerator:
                 "Assume auth-gated endpoints (302 redirect) are worth testing once credentials are available."
             )
 
+        hunt_signals = self._playbook.hunt_signals_digest()
+
         prompt = render(
             "hunter_system",
             target_url=recon.target_url,
@@ -234,6 +479,9 @@ class VulnCandidateGenerator:
             business_flows=recon.business_flows,
             auth_cookies=sorted(set(auth_cookies)),
             auth_warning=auth_warning,
+            hunt_signals=hunt_signals,
+            page_observations=_build_page_observations(recon),
+            auth_sessions_detail=_build_auth_sessions_detail(recon),
         )
         # Long-term memory: prepend lessons from previous runs (hints, not ground truth).
         if lessons:
@@ -261,12 +509,15 @@ class VulnCandidateGenerator:
                 break
             log.warning(f"Hunter returned 0 candidates (attempt {attempt + 1}/3) — retrying")
 
-        # Deterministic seeding: ALWAYS add candidates derived from observed routes,
-        # so high-value endpoints (money POST, auth-gated admin, IDOR path-ids, PII
-        # APIs) are covered even when the LLM hunter forgets them. Merged then deduped.
-        seeds = _seed_from_recon(recon)
+        # Deterministic seeding: add candidates derived from observed routes so high-value
+        # endpoints are covered even when the LLM hunter misses them.
+        # Ablation flag hunt.seeder_enabled=false disables this for controlled comparison.
+        seeder_on = getattr(self._cfg.hunt, "seeder_enabled", True)
+        seeds = _seed_from_recon(recon) if seeder_on else []
         if seeds:
             log.info(f"Deterministic seeding added {len(seeds)} candidate(s) from recon routes")
+        elif not seeder_on:
+            log.info("Deterministic seeding DISABLED (hunt.seeder_enabled=false) — ablation mode")
         candidates = candidates + seeds
 
         # Fix mislabeled patterns + collapse duplicate endpoints before assigning IDs.
@@ -287,6 +538,11 @@ class VulnCandidateGenerator:
         return dossiers
 
     def _parse_candidates(self, raw: str) -> list[dict]:
+        # Strip think/reasoning blocks emitted by chain-of-thought models before the JSON
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        # Strip markdown code fences (```json ... ```)
+        raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw).rstrip("`").strip()
+
         # Try a clean array parse first
         match = re.search(r"\[.*\]", raw, re.DOTALL)
         if match:
@@ -398,6 +654,30 @@ class VulnCandidateGenerator:
             elif ex.json_keys:
                 note += f" — json keys: {ex.json_keys[:12]}"
             _add_ex(ex, note)
+
+        # 3. Cross-family form-referencing exchanges: pages on a DIFFERENT endpoint that have
+        #    a <form action=TARGET> posting to our target endpoint family.
+        #    e.g. GET /product has <form action=/cart method=POST> with fields [productId, quantity, price].
+        #    The BLF dossier for POST /cart needs those fields visible to Red — without this,
+        #    Red declares INSUFFICIENT_EVIDENCE because it only sees POST /cart → 302 with no body.
+        from urllib.parse import urlparse as _urlparse
+        for ex in recon.exchanges:
+            if _family_path(ex.endpoint) == fam:
+                continue  # already covered by step 2
+            if not ex.forms:
+                continue
+            for form in ex.forms:
+                action = form.get("action") or ""
+                action_fam = _family_path(_urlparse(action).path or action)
+                if action_fam != fam:
+                    continue
+                fields_x: list[str] = [fl.get("name", "") for fl in form.get("fields", []) if fl.get("name")]
+                note = (
+                    f"Form reference: {ex.method} {ex.endpoint} → {ex.status} "
+                    f"(has form POST {action} with fields: {fields_x})"
+                )
+                _add_ex(ex, note)
+                break
 
         # Auth requirement
         auth_profiles = recon.auth_profiles

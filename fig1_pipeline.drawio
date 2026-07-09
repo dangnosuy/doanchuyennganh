@@ -1,0 +1,63 @@
+<mxGraphModel adaptiveColors="0" background="#ffffff">
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+
+    <!-- Row 1 (L→R): Input → RECON → HUNT -->
+    <mxCell id="input" value="Target URL&#xa;+ Credentials" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fixedSize=1;size=10;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontStyle=1;fontSize=13;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="30" y="40" width="150" height="70" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="recon" value="RECON&#xa;(Crawler + Playwright)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontStyle=1;fontSize=13;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="220" y="40" width="190" height="70" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="hunt" value="HUNT&#xa;(Hunter LLM)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontStyle=1;fontSize=13;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="450" y="40" width="190" height="70" as="geometry"/>
+    </mxCell>
+
+    <!-- Row 2 (R→L): COORDINATE → BUG SUB-GRAPH -->
+    <mxCell id="coord" value="COORDINATE&#xa;(Sort by severity)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontStyle=1;fontSize=13;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="450" y="220" width="190" height="70" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="bug" value="BUG SUB-GRAPH&#xa;(per-bug loop)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;strokeWidth=2;dashed=1;fontStyle=1;fontSize=13;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="220" y="213" width="190" height="84" as="geometry"/>
+    </mxCell>
+
+    <!-- Row 3 (L→R): REPORT → Output -->
+    <mxCell id="report" value="REPORT&#xa;(ReportBuilder)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontStyle=1;fontSize=13;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="220" y="420" width="190" height="70" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="output" value="report.md&#xa;findings.json&#xa;pocs/" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fixedSize=1;size=10;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontStyle=1;fontSize=13;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="450" y="410" width="160" height="84" as="geometry"/>
+    </mxCell>
+
+    <!-- Edges -->
+    <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#555555;strokeWidth=1.5;" edge="1" source="input" target="recon" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e2" value="ReconArtifact" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;fontColor=#333333;strokeColor=#555555;strokeWidth=1.5;" edge="1" source="recon" target="hunt" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e3" value="list[BugDossier]" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;fontColor=#333333;strokeColor=#555555;strokeWidth=1.5;" edge="1" source="hunt" target="coord" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e4" value="ordered dossiers" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;fontColor=#333333;strokeColor=#555555;strokeWidth=1.5;" edge="1" source="coord" target="bug" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e5" value="list[Finding]" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=11;fontColor=#333333;strokeColor=#555555;strokeWidth=1.5;" edge="1" source="bug" target="report" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e6" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;strokeColor=#555555;strokeWidth=1.5;" edge="1" source="report" target="output" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+  </root>
+</mxGraphModel>

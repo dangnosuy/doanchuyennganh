@@ -1,0 +1,141 @@
+{
+  "workspace": "benchmark_results/no-memory/run_4/workspace/localhost_20260703_142333",
+  "total_findings": 11,
+  "exploited": 3,
+  "tp": 2,
+  "fp": 1,
+  "fn": 8,
+  "precision": 0.6667,
+  "recall_tpr": 0.2,
+  "fpr": 0.1111,
+  "total_tokens": 2656656,
+  "total_llm_calls": 328,
+  "elapsed_s": 2926.35,
+  "tp_patterns": [
+    "BLF-01",
+    "BLF-06"
+  ],
+  "fp_patterns": [
+    "BLF-05"
+  ],
+  "failure_modes": {
+    "EXEC_NO_EXCHANGES": 2,
+    "PROOF_QUALITY_FAIL": 4,
+    "NOT_EXPLOITED": 1,
+    "INSUFFICIENT_CONTEXT": 1
+  },
+  "per_bug_metrics": [
+    {
+      "bug_id": "BUG-003",
+      "pattern_id": "BLF-01",
+      "status": "EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 212.87,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-007",
+      "pattern_id": "BLF-06",
+      "status": "EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 220.81,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-011",
+      "pattern_id": "BLF-05",
+      "status": "EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 198.07,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-001",
+      "pattern_id": "BAC-01",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 112.38,
+      "failure_mode": "EXEC_NO_EXCHANGES"
+    },
+    {
+      "bug_id": "BUG-002",
+      "pattern_id": "BAC-02",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 4,
+      "verify_retries": 2,
+      "exec_retries": 0,
+      "elapsed_s": 491.77,
+      "failure_mode": "PROOF_QUALITY_FAIL"
+    },
+    {
+      "bug_id": "BUG-004",
+      "pattern_id": "BAC-04",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 120.77,
+      "failure_mode": "PROOF_QUALITY_FAIL"
+    },
+    {
+      "bug_id": "BUG-005",
+      "pattern_id": "BAC-06",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 3,
+      "verify_retries": 0,
+      "exec_retries": 0,
+      "elapsed_s": 140.96,
+      "failure_mode": "EXEC_NO_EXCHANGES"
+    },
+    {
+      "bug_id": "BUG-006",
+      "pattern_id": "BAC-06",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 144.82,
+      "failure_mode": "PROOF_QUALITY_FAIL"
+    },
+    {
+      "bug_id": "BUG-008",
+      "pattern_id": "BLF-03",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 5,
+      "verify_retries": 2,
+      "exec_retries": 0,
+      "elapsed_s": 564.86,
+      "failure_mode": "PROOF_QUALITY_FAIL"
+    },
+    {
+      "bug_id": "BUG-009",
+      "pattern_id": "BLF-03",
+      "status": "INFO_EXPOSURE_ONLY",
+      "debate_rounds": 4,
+      "verify_retries": 2,
+      "exec_retries": 0,
+      "elapsed_s": 491.51,
+      "failure_mode": "NOT_EXPLOITED"
+    },
+    {
+      "bug_id": "BUG-010",
+      "pattern_id": "BLF-01",
+      "status": "SKIPPED_NO_EVIDENCE",
+      "debate_rounds": 3,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 151.65,
+      "failure_mode": "INSUFFICIENT_CONTEXT"
+    }
+  ],
+  "run_index": 4,
+  "status": "OK"
+}

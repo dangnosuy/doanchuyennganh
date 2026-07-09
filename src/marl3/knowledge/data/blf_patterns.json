@@ -1,127 +1,150 @@
 [
     {
         "id": "BLF-01",
-        "name": "Client-Side Validation Bypass (Price/Quantity Tampering)",
+        "name": "Client-Side Price / Parameter Trust (Excessive Trust in Client-Side Controls)",
         "severity": "HIGH",
-        "description": "The server accepts price, quantity, or discount values directly from the client request without server-side re-validation, allowing an attacker to purchase items for arbitrary amounts.",
+        "description": "The server trusts a price, discount, or amount value that originates directly from the client request body without re-deriving it server-side from a product catalog. An attacker intercepts the POST /cart or POST /checkout request and replaces the price with any value (e.g., 1 cent).",
+        "real_world_example": "Real-world example: POST /cart contains a `price` parameter. Modifying price=133700 to price=1 causes the server to charge 1 cent for a £1337 jacket.",
         "indicators": [
-            "Price or quantity appears in hidden form fields or request body",
-            "JavaScript validates input before sending (client-side only)",
-            "Request contains calculated parameters (total, subtotal, tax)",
-            "Dropdown restricts values but backend does not re-validate"
+            "POST /cart or POST /checkout request body contains a `price`, `unit_price`, or `amount` field",
+            "Hidden HTML form input carries the product price",
+            "JavaScript computes a total and sends it — if you can modify the request, the server trusts it",
+            "Response after cart modification reflects the price you submitted, not the catalog price"
         ],
         "technique": [
-            "1. Intercept the purchase/checkout request",
-            "2. Locate price/quantity/amount in request body",
-            "3. Modify values: price=0, price=-100, quantity=0, discount=100",
-            "4. Submit the modified request",
-            "5. Check the server response and the resulting order state"
+            "1. Add target item to cart; capture the POST /cart (or equivalent) request",
+            "2. Locate price/unit_price/amount in the request body",
+            "3. Replace with a small value: price=1, price=0, or price=-100",
+            "4. Send the modified request; reload the cart page",
+            "5. If cart total reflects the manipulated price → server trusts client-supplied price",
+            "6. Proceed to checkout at the manipulated price to complete the exploit"
         ],
         "variations": [
+            "Zero price: price=0",
             "Negative price to gain credit: price=-1000",
-            "Extreme quantity causing integer overflow: quantity=99999999",
-            "Currency switch: USD → lower-value currency",
-            "Remove CSRF token / nonce and see if check is skipped"
+            "Remove price param entirely — some servers default to 0 when param is absent",
+            "Currency switch: send amount in a lower-value currency code"
         ],
         "required_proof_markers": ["PRICE_MANIPULATION", "STATE_DELTA"],
-        "success_condition": "Server accepts the tampered value and creates an order at the manipulated price or quantity; state_delta confirms the discrepancy."
+        "success_condition": "Server accepts the tampered price and the order is created at the manipulated amount; cart total or order confirmation reflects the attacker-supplied price, not the catalog price."
     },
     {
         "id": "BLF-02",
-        "name": "Unconventional Input Handling",
+        "name": "Unconventional / Out-of-Range Input Handling (Negative Quantity)",
         "severity": "HIGH",
-        "description": "The application applies client-side validation but does not mirror it server-side, allowing submission of out-of-range, negative, zero, or type-mismatched values.",
+        "description": "The application validates input only on the client side (HTML min/max, JavaScript) and does not enforce the same constraints server-side. Submitting negative numbers, zero, or extreme values produces unexpected server behaviour — most commonly, a negative quantity reducing the cart total below zero.",
+        "real_world_example": "Real-world example: POST /cart?productId=2&quantity=-3 subtracts from the cart total. Adding quantity=-<large> of a cheap item makes the total negative, allowing checkout of an expensive item for free.",
         "indicators": [
-            "Numeric fields with client-side min/max but no server validation signal",
-            "Quantity or price accepts decimal or negative numbers",
-            "Form regex validation only on the client"
+            "Quantity, count, or amount field exists in cart/purchase request body",
+            "HTML form has min=1 or min=0 constraint — client-side only",
+            "No 4xx error when you send quantity=-1 directly",
+            "Cart total changes to reflect the submitted quantity including negatives"
         ],
         "technique": [
-            "1. Try excessively long input: email 300 chars, name 10000 chars",
-            "2. Try negative numbers: quantity=-1, amount=-500",
-            "3. Try decimals: quantity=1.5, amount=0.001",
-            "4. Try zero: quantity=0, price=0",
-            "5. Try special values: null, NaN, Infinity, empty string",
-            "6. Try type mismatch: send a string where a number is expected, an array instead of string"
+            "1. Add the expensive target item to cart at normal quantity",
+            "2. Add a cheap item with a very large NEGATIVE quantity (quantity=-<N>)",
+            "3. Confirm the cart total becomes negative or falls below available credit",
+            "4. Proceed to checkout — the server should accept the negative total",
+            "5. ALSO try: quantity=0 (free item), quantity=0.5 (rounding), quantity=99999999 (overflow)"
+        ],
+        "variations": [
+            "Negative quantity: quantity=-1, quantity=-9999",
+            "Zero quantity: quantity=0",
+            "Fractional quantity: quantity=0.5 or quantity=1.9",
+            "String injection: quantity=1;DROP TABLE",
+            "Array: quantity[]=1&quantity[]=1 (some backends sum the array)"
         ],
         "required_proof_markers": ["QUANTITY_TAMPER", "STATE_DELTA"],
-        "success_condition": "Server processes an invalid value and the resulting application state reflects the tampered input."
+        "success_condition": "Server accepts the negative or out-of-range quantity; cart total or account balance reflects the invalid state (negative total, inflated balance)."
     },
     {
         "id": "BLF-03",
-        "name": "Workflow Sequence Bypass (State-Skipping)",
+        "name": "Workflow Sequence Bypass (State-Skipping / Order Confirmation Replay)",
         "severity": "HIGH",
-        "description": "The application has a multi-step business workflow (e.g., cart → payment → confirmation). The server does not enforce that prior steps are completed, allowing an attacker to jump directly to a later step.",
+        "description": "The application has a multi-step business workflow (cart → payment → confirmation). The server does not enforce that prior steps are completed — specifically, it does not verify that the payment step succeeded before honoring the confirmation step. An attacker who has seen a confirmation URL can replay it against any cart, bypassing payment entirely.",
+        "real_world_example": "Real-world example: complete a cheap purchase to capture GET /cart/order-confirmation?order-confirmed=true. Then add the expensive jacket to cart and replay that same confirmation URL — the server processes the order without charging.",
         "indicators": [
-            "Multi-step checkout, registration, or approval workflow",
-            "Each step is a separate API endpoint",
-            "Step completion is tracked client-side or via a mutable status parameter",
-            "No server-side check for previous-step completion"
+            "Multi-step checkout: cart → POST /cart/checkout → GET /order-confirmation",
+            "Order confirmation page has a predictable URL with a boolean or token parameter",
+            "POST /cart/checkout just redirects — the actual commit happens at GET /order-confirmation",
+            "Replaying the confirmation URL from a previous order triggers a new purchase"
         ],
         "technique": [
-            "1. Map the full workflow: identify all step endpoints and their order",
-            "2. Complete step 1 legitimately; capture request for step 3",
-            "3. Submit the step 3 request without completing step 2",
-            "4. Alternatively, replay an earlier completed-step request to revert state and skip forward"
+            "1. Complete a legitimate cheap purchase; capture GET /cart/order-confirmation?order-confirmed=true",
+            "2. Add the target (expensive) item to cart",
+            "3. Replay the captured confirmation GET without going through POST /checkout",
+            "4. If the server places the order, the payment step was not server-enforced",
+            "5. ALTERNATIVE: Try direct access to /confirm, /complete, /finalize with a fresh session"
         ],
         "required_proof_markers": ["STATE_SKIP", "STATE_DELTA"],
-        "success_condition": "Attacker reaches the final workflow step (e.g., order confirmation) without completing an intermediate required step; state_delta shows the skipped step was never recorded."
+        "success_condition": "Expensive item is purchased without payment; order confirmation page renders with the item listed and account credit is NOT deducted."
     },
     {
         "id": "BLF-04",
         "name": "Time-of-Check to Time-of-Use (TOCTOU) Race Condition",
         "severity": "HIGH",
-        "description": "A resource check (balance, coupon validity, stock count) is performed at request time T1 but the deduction happens at T2. Sending concurrent requests exploits the window between T1 and T2.",
+        "description": "A resource check (balance, coupon validity, stock count) is performed at T1 but the deduction happens at T2. Sending concurrent requests exploits the window between T1 and T2 to consume the resource multiple times.",
         "indicators": [
-            "Coupon or discount code can be used once",
-            "Account balance checked before deduction in separate operations",
+            "Coupon or discount code can only be used once according to business rules",
+            "Account balance checked before deduction in a non-atomic operation",
             "API allows concurrent requests to the same transaction endpoint"
         ],
         "technique": [
             "1. Identify a one-use resource: coupon code, referral credit, gift card",
-            "2. Send multiple simultaneous requests (thread pool / async) before the deduction commits",
-            "3. Check whether the resource was consumed multiple times"
+            "2. Send 10-20 simultaneous requests (parallel threads / async) before the deduction commits",
+            "3. Check whether the resource was consumed multiple times or credited multiple times"
         ],
         "required_proof_markers": ["STATE_DELTA"],
-        "success_condition": "Multiple successful responses are received for a one-use resource; state_delta shows the balance/coupon was deducted more than once or not at all despite multiple uses."
+        "success_condition": "Multiple successful responses are received for a one-use resource; account credit or order count shows multiple successful redemptions."
     },
     {
         "id": "BLF-05",
-        "name": "Coupon / Discount Abuse",
+        "name": "Coupon / Discount Abuse (Stacking, Alternating, Infinite Money Loop)",
         "severity": "MEDIUM",
-        "description": "Coupon validation logic is insufficient: codes can be reused, stacked, applied retroactively, or brute-forced because the server performs weak uniqueness checks.",
+        "description": "Coupon validation logic is insufficient: codes can be reused, stacked, or alternated because the server only prevents using the SAME code consecutively but not the same code across multiple requests. Additionally, a gift card + discount loop can be used to generate infinite store credit.",
+        "real_world_example_1": "Real-world example: NEWCUST5 then SIGNUP30 then NEWCUST5 then SIGNUP30... The server blocks re-using the same code back-to-back, but not alternating between two codes. Repeating the cycle reduces price to zero.",
+        "real_world_example_2": "Real-world example: Apply SIGNUP30 discount to a $10 gift card → pay $7. Redeem the gift card for $10 store credit. Net gain: +$3 per cycle. Automate to accumulate enough credit for the target item.",
         "indicators": [
-            "Discount applied via a code field in the request body",
-            "No per-account or per-order usage tracking visible in error messages",
-            "Sequential or guessable coupon codes"
+            "Multiple coupon codes available (newsletter signup, new customer, etc.)",
+            "Error message says 'Coupon already applied' only when the SAME code is used twice in a row",
+            "Gift cards can be purchased with discounts and redeemed for face value",
+            "No per-account coupon usage tracking — just per-request deduplication"
         ],
-        "technique": [
-            "1. Apply a valid coupon, complete the order",
-            "2. Attempt to re-apply the same coupon on a new order",
-            "3. Try applying multiple coupons simultaneously to the same cart",
-            "4. Try brute-forcing 4-6 digit numeric coupon codes",
-            "5. Try applying a coupon retroactively to a completed order"
+        "technique_alternating": [
+            "1. Collect all available coupon codes (check newsletter signup, account page, promotions)",
+            "2. Apply code_A → apply code_B → apply code_A → apply code_B...",
+            "3. Each alternation further reduces the price",
+            "4. Stop when cart total falls below available credit and checkout"
+        ],
+        "technique_infinite_money": [
+            "1. Sign up for newsletter to get a discount coupon (e.g. SIGNUP30 = 30% off)",
+            "2. Add a gift card to cart; apply the discount coupon at checkout",
+            "3. Purchase the discounted gift card (pay 70% of face value)",
+            "4. Redeem the gift card via POST /gift-card for its full face value",
+            "5. Net gain = 30% of face value per cycle",
+            "6. Repeat by looping: POST /cart (add gift card) → POST /cart/coupon → POST /cart/checkout → GET /order-confirmation (extract gift card code) → POST /gift-card (redeem)",
+            "7. Use Burp Intruder with null payloads (412 iterations) or write a loop script to automate"
         ],
         "required_proof_markers": ["PRICE_MANIPULATION", "STATE_DELTA"],
-        "success_condition": "The same coupon is accepted more than once, or multiple coupons stack to produce a price below zero."
+        "success_condition": "Cart total reaches zero or negative after coupon cycling; OR account credit grows above initial amount through the gift card loop, enabling checkout of the target item."
     },
     {
         "id": "BLF-06",
         "name": "Negative Quantity / Refund Abuse",
         "severity": "HIGH",
-        "description": "Submitting a negative quantity in a purchase or refund request causes the server to credit the attacker's account instead of debiting it.",
+        "description": "Submitting a negative quantity in a purchase or refund request causes the server to credit the attacker's account instead of debiting it. The server does not enforce quantity >= 1.",
         "indicators": [
-            "Refund or return endpoint accepts quantity parameter",
-            "Shopping cart API accepts arbitrary item counts",
-            "No server-side minimum quantity validation"
+            "Shopping cart API accepts arbitrary item counts with no server-side minimum",
+            "Refund or return endpoint accepts a quantity parameter",
+            "No 4xx error when quantity=-1 is submitted"
         ],
         "technique": [
-            "1. Add an item to cart with quantity=-1 or submit a refund for more than was purchased",
-            "2. Proceed through checkout",
-            "3. Observe account balance or credit change"
+            "1. Add an item with quantity=-1 directly via POST /cart",
+            "2. Proceed to checkout; the negative total should result in a credit",
+            "3. ALSO try: submit a refund for MORE than the original purchased quantity"
         ],
         "required_proof_markers": ["QUANTITY_TAMPER", "STATE_DELTA"],
-        "success_condition": "Account balance increases or a credit is applied when a negative quantity order is submitted."
+        "success_condition": "Account balance increases or a credit is applied when a negative-quantity order is submitted; OR a refund larger than the original purchase is accepted."
     },
     {
         "id": "BLF-07",
@@ -140,5 +163,124 @@
         ],
         "required_proof_markers": ["QUANTITY_TAMPER", "STATE_DELTA"],
         "success_condition": "Order is accepted for a quantity exceeding available stock; state_delta shows the inventory was not correctly decremented."
+    },
+    {
+        "id": "BLF-08",
+        "name": "Integer Overflow / Signed Arithmetic Wrap (Low-Level Logic Flaw)",
+        "severity": "HIGH",
+        "description": "The server stores the running cart total as a signed 32-bit integer in cents. Continuously adding a large positive quantity (e.g., qty=99 per request) accumulates the total until it exceeds INT32_MAX (2,147,483,647), at which point it wraps to a large negative number. By precisely controlling the number of iterations, the attacker can engineer a cart total between $0 and their available credit.",
+        "real_world_example": "Real-world example: target item costs £1337.00 (133700 cents). With qty=99, each request adds 13,236,300 cents. After approximately 160+ requests the total wraps past INT32_MAX to a large negative. The attacker then adds small-quantity items to push the total into the range [$0, $100]. Checkout succeeds because the server sees a small positive total.",
+        "indicators": [
+            "Cart total or order total is an integer type (not decimal/arbitrary-precision)",
+            "No server-side maximum quantity limit — you can add qty=99 per request without 4xx",
+            "Cart total behaves unexpectedly with very large quantities (jumps or wraps)",
+            "Quantity field is limited to 2 digits per request (server enforces max 99 per request, not per order)"
+        ],
+        "technique": [
+            "1. Confirm the target item price and available store credit",
+            "2. Calculate required iterations: INT32_MAX / (price_in_cents * qty_per_request)",
+            "   Example: 2147483647 / (133700 * 99) ≈ 162 requests to reach first overflow",
+            "3. Use a loop to send POST /cart with quantity=99 for the target item repeatedly",
+            "   In exec: use shell_execute to run a Python loop rather than calling http_request 100+ times manually",
+            "4. After each batch, GET the cart page and use http_body_get to read the current total",
+            "5. Stop when total is in range [1, available_credit]",
+            "6. If total is below 0 but abs(total) > credit, add cheap items with small positive quantity to tune the total upward",
+            "7. Proceed to checkout"
+        ],
+        "exec_loop_example": "To send 200 POST /cart requests in a loop, use shell_execute with a Python script:\n  import requests, json\n  session = requests.Session()\n  session.cookies.set('session', '<SESSION_COOKIE>')\n  for i in range(200):\n      r = session.post('http://TARGET/cart', data={'productId':'1','quantity':'99','redir':'PRODUCT_PATH'})\n      if i % 20 == 0: print(i, r.status_code)\n  print('done')",
+        "key_numbers": {
+            "INT32_MAX": 2147483647,
+            "INT32_MIN": -2147483648,
+            "overflow_formula": "total_cents = (price_cents * qty) * N_requests mod 2^32 (signed)",
+            "typical_iterations": "160-325 requests with qty=99 for a £1337 item"
+        },
+        "required_proof_markers": ["QUANTITY_TAMPER", "STATE_DELTA"],
+        "success_condition": "Cart total wraps to a value between $0 and available_credit (e.g., $0.00 - $100.00). Checkout succeeds; the expensive item is obtained at near-zero cost."
+    },
+    {
+        "id": "BLF-09",
+        "name": "Multi-Step Process Bypass",
+        "severity": "HIGH",
+        "description": "A multi-step workflow (checkout, registration, KYC, approval) can be bypassed by submitting the final-step request directly because the server does not validate prior-step completion.",
+        "indicators": [
+            "Workflow with distinct endpoints per step: /checkout/step1, /checkout/step2, /confirm",
+            "Step completion tracked client-side or via a mutable session/status parameter",
+            "Final step endpoint reachable via direct request without prior step tokens"
+        ],
+        "technique": [
+            "1. Walk through the full workflow; capture all requests in order",
+            "2. Submit the final-step request (confirm/complete/execute) directly without steps 1-2",
+            "3. Check whether the server accepts it and state reflects completion"
+        ],
+        "required_proof_markers": ["STATE_SKIP", "STATE_DELTA"],
+        "success_condition": "Final workflow endpoint returns 2xx and state confirms completion without the required intermediate step being recorded."
+    },
+    {
+        "id": "BLF-10",
+        "name": "Weak Isolation on Dual-Use Endpoint (Parameter Omission Bypass)",
+        "severity": "HIGH",
+        "description": "A single endpoint serves both a privileged operation (admin password change) and an unprivileged one (user changes own password). The server branches on the presence/absence of a parameter. By omitting the `current-password` verification parameter, a low-privilege user can change any account's password.",
+        "real_world_example": "Real-world example: POST /my-account/change-password normally requires current-password, new-password, confirm-new-password. Removing current-password entirely allows the password change to succeed. By also changing username=administrator, the attacker sets the admin password.",
+        "indicators": [
+            "Password change endpoint at /my-account/change-password or similar",
+            "Request body contains both username (or user_id) and current_password",
+            "Server-side logic: if current_password is absent, skip verification step",
+            "Endpoint accessible to low-privilege authenticated users"
+        ],
+        "technique": [
+            "1. Log in with a low-privilege account; navigate to the password change function",
+            "2. Capture POST /my-account/change-password (or equivalent)",
+            "3. Remove the `current-password` parameter entirely from the request",
+            "4. Change `username` parameter to `administrator` (or target account)",
+            "5. Send the modified request — if 3xx or 200 is returned, the password was changed",
+            "6. Log out and log in as administrator with the new password"
+        ],
+        "required_proof_markers": ["AUTH_BYPASS", "PRIVILEGED_ACCESS"],
+        "success_condition": "Attacker successfully logs in as administrator (or target user) with the newly set password; admin panel is accessible."
+    },
+    {
+        "id": "BLF-11",
+        "name": "Input Truncation Bypass (Exceptional Input Handling)",
+        "severity": "HIGH",
+        "description": "The server truncates excessively long input at a specific length (e.g., 255 characters for an email address) but the access control check is performed on the untruncated or differently-truncated value. An attacker crafts input where the meaningful part (e.g., @dontwannacry.com) is positioned to land exactly at the truncation boundary, passing the validation check under the stored form.",
+        "real_world_example": "Real-world example: email truncated to 255 chars. Craft: `aaaa...aaaa@dontwannacry.com.YOURID.web-security-academy.net`. Position `@dontwannacry.com` so its last character `m` falls at position 255. After registration, stored email ends with `@dontwannacry.com` → admin access is granted.",
+        "indicators": [
+            "Registration or account update accepts email/username as free text",
+            "Domain-based access control for admin panel (only @company.com employees)",
+            "Error message or account page truncates very long input",
+            "Different truncation lengths between validation and storage"
+        ],
+        "technique": [
+            "1. Register with a normal email to identify the truncation length (try 200, 255, 300 char emails and check what is stored)",
+            "2. Once truncation point is known (e.g., 255), craft: `{'A' * (255 - len('@target-domain.com'))}@target-domain.com.YOUR-EMAIL-ID.legitimate-domain.net`",
+            "3. The stored email will be exactly `AAAA...@target-domain.com`",
+            "4. Complete email verification via the legitimate domain",
+            "5. Log in — the system sees your stored email as @target-domain.com → grants admin access"
+        ],
+        "required_proof_markers": ["AUTH_BYPASS", "PRIVILEGED_ACCESS"],
+        "success_condition": "Attacker's registered email, after truncation, matches the privileged domain. Admin panel becomes accessible with the attacker's session."
+    },
+    {
+        "id": "BLF-12",
+        "name": "Authentication Bypass via Flawed State Machine (Dropped Role-Selector Request)",
+        "severity": "HIGH",
+        "description": "The login flow has a mandatory post-login step (role selection, MFA, terms acceptance) that the server expects to complete before granting access. If this intermediate request is dropped/intercepted and never sent, the server defaults the user to a privileged role because no explicit assignment was made.",
+        "real_world_example": "Real-world example: after POST /login, the server redirects to GET /role-selector. If you intercept and DROP this request (never send it), then navigate directly to the home page, the application defaults your role to administrator. The server assumed if you skipped role selection, you must have been granted the default/most privileged role.",
+        "indicators": [
+            "Login redirects to an intermediate page: /role-selector, /choose-account, /select-role",
+            "Intermediate page is a GET request (can be dropped without the server knowing)",
+            "Direct navigation to / or /admin after login (without completing intermediate step) produces unexpected access",
+            "No server-side validation that role-selector step was completed before granting session"
+        ],
+        "technique": [
+            "1. Perform a normal login; observe the redirect chain after POST /login",
+            "2. Identify the intermediate step request (GET /role-selector or similar)",
+            "3. Log out; log in again with proxy intercept enabled",
+            "4. After POST /login is processed (forward it), INTERCEPT and DROP the GET /role-selector request",
+            "5. Navigate directly to the application home page or /admin",
+            "6. If the session now has elevated privileges, the state machine assumption is exploitable"
+        ],
+        "required_proof_markers": ["AUTH_BYPASS", "PRIVILEGED_ACCESS"],
+        "success_condition": "After dropping the intermediate role-selector request, the session has administrator role. GET /admin returns 200 with admin content."
     }
 ]

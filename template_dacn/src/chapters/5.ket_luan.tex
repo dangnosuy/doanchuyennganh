@@ -1,0 +1,19 @@
+% Chapter 5
+\chapter{Đánh giá và thảo luận} % Main chapter title
+\label{Chapter5}
+
+% \section*{Tóm tắt chương}
+% Trong chương này, chúng tôi sẽ trình bày chi tiết cách hiện thực hóa phương pháp đã trình bày trong \textbf{Chương \ref{Chapter3}}, đồng thời, chúng tôi trình bày cách xây dựng môi trường thực nghiệm, kịch bản và các kết quả đạt được khi thực nghiệm công cụ.
+% \newline
+
+\section{Ưu điểm của hệ thống}
+
+Nghiên cứu đã đạt được những bước tiến quan trọng trong việc tự động hóa quy trình sinh mã tấn công, khắc phục được nhiều nhược điểm của các phương pháp truyền thống. Ưu điểm nổi bật nhất là tính hiệu quả của chiến lược huấn luyện tinh chỉnh (fine-tuning) chuyên biệt, giúp các mô hình NMT như CodeT5+ vượt qua các mô hình ngôn ngữ lớn tổng quát như ChatGPT trong tác vụ sinh mã PowerShell tấn công, thể hiện qua các chỉ số độ tương đồng văn bản và độ chính xác cú pháp vượt trội. Đặc biệt, kết quả thực nghiệm phân tích động cho thấy mã sinh ra không chỉ đúng về mặt hình thức mà còn có khả năng thực thi các hành vi tấn công thực tế với chỉ số F1-Score đạt trên 88\%, chứng minh tính khả thi của việc sử dụng AI để mô phỏng đối thủ trong các kịch bản tấn công. Một đóng góp quan trọng mà đồ án mang lại là kiến trúc Code-RAG-Bench, giải quyết triệt để bài toán "tri thức đóng" của các mô hình học sâu. Bằng cách tích hợp cơ chế truy xuất ngữ cảnh động với độ chính xác Recall@10 đạt tuyệt đối, hệ thống cho phép cập nhật tức thời các kỹ thuật tấn công mới (TTPs) hoặc các thư viện lạ mà không cần tốn kém chi phí huấn luyện lại toàn bộ mô hình, đảm bảo tính thời sự và khả năng mở rộng bền vững cho hệ thống.
+
+\section{Hạn chế}
+
+Mặc dù kiến trúc đề xuất đã giải quyết được vấn đề cập nhật tri thức, hệ thống vẫn còn tồn tại một số hạn chế cần được xem xét. Thứ nhất, dù việc sử dụng dữ liệu tinh chỉnh chuyên biệt mang lại độ chính xác cao, nhưng quy mô tập dữ liệu hiện tại (khoảng hơn 1.000 mẫu) vẫn còn khá khiêm tốn so với không gian mẫu khổng lồ của các biến thể mã độc thực tế, điều này tiềm ẩn rủi ro quá khớp hoặc kém linh hoạt khi đối mặt với các kịch bản quá phức tạp nằm ngoài phân phối huấn luyện. Thứ hai, trọng tâm hiện tại của đồ án mới chỉ giải quyết tốt bài toán về chức năng tấn công mà chưa tối ưu hóa sâu cho khả năng lẩn tránh (evasion). Các đoạn mã sinh ra, tuy thực thi đúng logic, nhưng có thể vẫn bị các hệ thống phòng thủ hiện đại phát hiện nếu thiếu các kỹ thuật obfuscation nâng cao. Cuối cùng, dù phần truy xuất đạt hiệu năng rất cao, nhưng phần sinh mã vẫn cần được cải thiện thêm để tận dụng triệt để và khéo léo hơn các ngữ cảnh được trích xuất, đảm bảo tính tự nhiên và tối ưu của đoạn mã đầu ra.
+
+\section{Hướng phát triển tương lai}
+
+Dựa trên những kết quả khả quan và các hạn chế đã nhận diện, hướng phát triển tiếp theo của đề tài sẽ tập trung vào việc nâng cao chất lượng và tính thực chiến của mã sinh ra. Mục tiêu ưu tiên là cải tiến thành phần sinh mã để xử lý hiệu quả hơn các thông tin ngữ cảnh nhận được từ quá trình truy xuất, từ đó nâng cao độ chính xác trong các kịch bản phức tạp đòi hỏi sự kết hợp nhiều kỹ thuật. Song song đó, nghiên cứu sẽ mở rộng sang việc tích hợp các cơ chế làm mờ mã (obfuscation) tự động vào quy trình sinh, giúp các đoạn mã PowerShell không chỉ thực thi đúng chức năng mà còn có khả năng vượt qua các trình giải rối mã và hệ thống phát hiện xâm nhập. Ngoài ra, việc mở rộng phạm vi đánh giá thông qua thực thi trong các môi trường sandbox với các cơ chế bảo mật được bật đầy đủ cũng là một hướng đi cần thiết để kiểm chứng toàn diện khả năng lẩn tránh và tác động thực tế của hệ thống trong môi trường tác chiến mạng hiện đại.

@@ -3,143 +3,207 @@
         "id": "BAC-01",
         "name": "Unprotected Admin / Sensitive Functionality",
         "severity": "CRITICAL",
-        "description": "Admin or sensitive endpoints are accessible to low-privilege or unauthenticated users because the server relies on URL obscurity instead of server-side authorization checks.",
+        "description": "Admin or sensitive endpoints are accessible without proper authentication because the server relies on URL obscurity rather than server-side authorization. The path may be discovered via robots.txt, client-side JavaScript, or directory guessing.",
+        "real_world_examples": [
+            "Real-world example: robots.txt Disallow: /administrator-panel. Navigate directly → admin panel loads with no auth check.",
+            "Real-world example: JavaScript in the homepage source contains the admin panel URL. Inspecting source reveals it; direct navigation succeeds."
+        ],
         "indicators": [
-            "robots.txt or sitemap.xml reveals admin/management paths",
-            "JavaScript bundles expose hidden URLs (adminPanelTag, isAdmin checks)",
-            "Endpoints /admin, /management, /console, /dashboard respond 2xx to non-admin users",
-            "Response headers reveal framework with default admin panel"
+            "robots.txt or sitemap.xml reveals admin/management paths (Disallow: /admin-panel)",
+            "JavaScript source contains strings like adminPanelTag, isAdmin, /administrator-panel",
+            "/admin, /management, /console respond 200 to non-admin users",
+            "Response headers reveal framework with default admin panel location"
         ],
         "technique": [
-            "1. Recon: parse robots.txt, sitemap.xml, JS bundles for hidden paths",
-            "2. Access admin paths directly with a low-privilege or anonymous session",
-            "3. If redirected, capture the response body before the redirect (may leak content)",
-            "4. Try path variations: /Admin, /ADMIN, /admin/, /admin/dashboard",
-            "5. Check JS source for variables: isAdmin, adminPanel, role, privilege"
+            "1. Request /robots.txt — check Disallow entries for admin paths",
+            "2. View page source of the home page — search for 'admin', 'panel', 'secret', 'hidden' in JavaScript",
+            "3. Access discovered path directly with a low-privilege or anonymous session",
+            "4. Try standard paths: /admin, /admin/, /admin/dashboard, /administrator, /administrator-panel",
+            "5. If redirected (302), capture the response body before redirect — may contain admin HTML"
         ],
         "variations": [
-            "Path case-sensitivity bypass: /Admin vs /admin",
-            "Trailing/double slash: /admin// or /admin/./",
+            "Path case-sensitivity: /Admin, /ADMIN",
+            "Trailing slash bypass: /admin/",
             "URL encoding: /%61dmin",
-            "Path traversal prefix: /static/../admin, /api/../admin"
+            "Path traversal: /static/../admin"
         ],
         "required_proof_markers": ["PRIVILEGED_ACCESS"],
-        "success_condition": "Low-privilege or anonymous actor receives 2xx on an admin endpoint and the response body contains privileged data (user list, config, secrets)."
+        "success_condition": "Low-privilege or anonymous actor receives 200 on an admin endpoint and the response body contains privileged data (user list, config, admin controls)."
     },
     {
         "id": "BAC-02",
-        "name": "Parameter-Based Access Control (Privilege Escalation)",
+        "name": "Parameter-Based Access Control (Privilege Escalation via Cookie/Hidden Field)",
         "severity": "CRITICAL",
-        "description": "The server trusts a client-supplied role/privilege parameter rather than validating against the authenticated session, allowing an attacker to elevate their role.",
+        "description": "The server trusts a client-supplied role/privilege indicator (cookie, hidden field, URL parameter) rather than deriving the user's role from the authenticated session server-side. Modifying Admin=false to Admin=true grants full admin access.",
+        "real_world_example": "Real-world example: After login, response sets cookie Admin=false. Intercept response and change to Admin=true. Reload /admin — full admin panel accessible.",
         "indicators": [
-            "URL parameters encode role/admin: ?role=user, ?admin=false, ?access=1",
-            "Cookie contains role indicator: isAdmin=false, role=user, access_level=1",
-            "Request body JSON includes role/privilege/admin field",
-            "Response reveals current role in body or cookie"
+            "Cookie contains plaintext role: Admin=false, role=user, isAdmin=false, access_level=1",
+            "URL parameter encodes role: ?admin=false, ?role=user",
+            "Hidden form field carries privilege level",
+            "Response body reveals current role value that matches a cookie name"
         ],
         "technique": [
-            "1. Log in with a low-privilege account; capture the full request/response",
-            "2. Locate role parameters in: URL params, cookies, request body, hidden fields",
-            "3. Modify values: role=admin, isAdmin=true, access_level=99, admin=1",
-            "4. Replay the modified request",
-            "5. Confirm the response exposes admin functionality or sensitive data"
+            "1. Log in; inspect all cookies and response headers",
+            "2. Look for cookies/params with role semantics: Admin, isAdmin, role, access, privilege",
+            "3. INTERCEPT the server's login response and modify: Admin=false → Admin=true",
+            "4. Alternatively modify the cookie directly in the next request",
+            "5. Access /admin — if it returns 200 with admin content, cookie tamper succeeded",
+            "6. ALSO try: add &admin=true or &role=administrator as URL parameters"
         ],
         "variations": [
-            "Cookie tampering: isAdmin=false → isAdmin=true",
-            "Inject new parameter: &admin=true, &role=administrator",
-            "Switch content-type and send JSON body instead of form data",
-            "Tamper JWT payload when signature is not verified (alg:none)"
+            "Cookie: isAdmin=false → isAdmin=true",
+            "Cookie: role=user → role=admin or role=administrator",
+            "URL param: ?role=administrator",
+            "JWT payload: change role claim (when signature not verified)"
         ],
         "required_proof_markers": ["AUTH_BYPASS", "PRIVILEGED_ACCESS"],
-        "success_condition": "After modifying the role parameter the response grants elevated access or returns data only available to admins."
+        "success_condition": "After modifying the role parameter, /admin or equivalent returns 200 with admin content that was previously inaccessible."
     },
     {
         "id": "BAC-03",
         "name": "Insecure Direct Object Reference (IDOR)",
         "severity": "HIGH",
-        "description": "An authenticated but low-privilege actor can access or modify another user's resources by substituting a predictable identifier (user ID, order ID, document ID) in the request.",
+        "description": "An authenticated user can access or modify another user's resources by substituting a predictable identifier (numeric user_id, username, GUID, sequential filename) in a request. The server does not verify that the requesting user owns the referenced object.",
+        "real_world_examples": [
+            "Real-world example: /my-account?id=wiener → change id=carlos to get Carlos's API key.",
+            "Real-world example: Carlos has a blog post — his author profile link exposes his GUID. Use it in /my-account?id=<GUID> to access his account.",
+            "Real-world example: /my-account?id=administrator exposes admin password in a masked input field in the HTML source.",
+            "Real-world example: /download-transcript/1.txt — change to 2.txt to get other users' chat logs. Sequential filenames are the object reference.",
+            "Real-world example: change id=carlos — server issues a 302 redirect but the BODY of the redirect response still contains Carlos's API key."
+        ],
         "indicators": [
-            "URLs or request bodies contain numeric/GUID object IDs: /api/orders/1234, userId=5",
-            "Endpoint accepts IDs as path params: /api/users/{id}, /api/orders/{orderId}",
-            "ID values appear to be sequential or predictable",
-            "Authenticated endpoints return objects with owner fields (userId, ownerId, email)"
+            "User account page URL contains the username or id: ?id=wiener, /users/5",
+            "Download or transcript endpoint uses sequential numbers: /transcript/1.txt",
+            "Blog post author links contain a user GUID in the URL",
+            "API response includes owner fields: userId, email, apiKey belonging to the caller"
         ],
         "technique": [
-            "1. Establish two sessions: user_a (attacker) and user_b (victim)",
-            "2. With user_b, create or identify a resource and note its ID",
-            "3. With user_a, call the endpoint substituting user_b's resource ID",
-            "4. If the response returns user_b's data → IDOR confirmed",
-            "5. Test write operations: PUT/PATCH/DELETE on user_b's resource with user_a's session"
+            "1. Identify any endpoint that takes a user/object identifier in URL or body",
+            "2. Substitute another known username (carlos) or increment integer IDs (id=1, id=2...)",
+            "3. For GUIDs: find the target user's GUID from public content (blog posts, comments, author pages)",
+            "4. Check /my-account?id=administrator to expose admin credentials",
+            "5. For file references: enumerate /transcript/1.txt, 2.txt, 3.txt",
+            "6. IMPORTANT: always read the full response body on redirects (302) — data may leak before redirect fires"
         ],
         "variations": [
-            "Encoded IDs: base64, hash — decode to find sequential patterns",
-            "Nested object references: /api/users/1/orders/2 — substitute both IDs",
-            "POST body IDOR: submit JSON with another user's userId",
-            "Mass assignment: include id field in PUT body to reassign ownership"
+            "String ID: id=carlos (not just integer IDs)",
+            "GUID from public blog/forum author links",
+            "Sequential file names: 1.txt, 2.txt, 3.txt",
+            "Data in redirect body — server returns sensitive data before the 302 redirect executes"
         ],
         "required_proof_markers": ["OWNERSHIP_BYPASS"],
-        "success_condition": "Attacker actor receives 2xx response containing victim's private data (owner field matches victim ID, not attacker ID)."
+        "success_condition": "Attacker receives 2xx (or 302 with data in body) containing victim's private data — API key, email, password, file contents — that belongs to a different user."
     },
     {
         "id": "BAC-04",
-        "name": "HTTP Method Override",
-        "severity": "MEDIUM",
-        "description": "The server respects X-HTTP-Method-Override or _method parameter, allowing an attacker to send a destructive verb (DELETE, PUT) disguised as a safe one (GET, POST).",
+        "name": "HTTP Method Override / Header-Based URL Bypass",
+        "severity": "HIGH",
+        "description": "Two sub-patterns: (A) The back-end framework respects X-Original-URL or X-Rewrite-URL headers, allowing bypass of front-end path-based access controls. (B) The server respects X-HTTP-Method-Override, allowing dangerous verbs (DELETE) disguised as safe ones (GET/POST).",
+        "real_world_example": "Real-world example: front-end blocks GET /admin. Sending GET / with header X-Original-URL: /admin makes the back-end process /admin while the front-end sees /. Add ?username=carlos to query string and X-Original-URL: /admin/delete to delete the user.",
         "indicators": [
-            "Server accepts X-HTTP-Method-Override or X-Method-Override headers",
-            "POST endpoints accept _method URL parameter",
-            "API framework docs mention method tunnelling support"
+            "Front-end returns 403 for /admin but back-end may still process it",
+            "Application uses a proxy/WAF in front of an app server (common in Java/Ruby/Python frameworks)",
+            "Swagger spec lists DELETE endpoints that return 403 when called directly",
+            "X-Original-URL or X-Rewrite-URL accepted (test by setting to /invalid and checking for 404 vs 403)"
         ],
-        "technique": [
-            "1. Identify a resource endpoint that responds to DELETE or PUT",
-            "2. Send a POST request with header X-HTTP-Method-Override: DELETE",
-            "3. Alternatively add query param: ?_method=DELETE",
-            "4. Check whether the resource was deleted or modified"
+        "technique_url_bypass": [
+            "1. Send GET / with header X-Original-URL: /invalid — if 404 returned, header is processed",
+            "2. If confirmed, send GET / with X-Original-URL: /admin to reach admin panel",
+            "3. For actions requiring path params: add to query string e.g. ?username=carlos",
+            "4. Set X-Original-URL: /admin/delete to perform the action"
         ],
-        "variations": [
-            "_method=PUT in body",
-            "X-HTTP-Method: DELETE",
-            "X-Tunneled-Method: DELETE"
+        "technique_method_override": [
+            "1. Add header X-HTTP-Method-Override: DELETE to a POST request",
+            "2. Or add query parameter ?_method=DELETE",
+            "3. Check whether the server performs the DELETE action"
         ],
-        "required_proof_markers": ["AUTH_BYPASS"],
-        "success_condition": "Server executes the overridden method and the response confirms the action (204, deleted resource, modified state)."
+        "required_proof_markers": ["AUTH_BYPASS", "PRIVILEGED_ACCESS"],
+        "success_condition": "Admin panel is accessible or privileged action is performed despite front-end blocking; user deletion or config change is reflected in the application state."
     },
     {
         "id": "BAC-05",
-        "name": "Function-Level Access Control (Horizontal Privilege Escalation)",
+        "name": "Function-Level Access Control Failure on Multi-Step Process",
         "severity": "HIGH",
-        "description": "A user can invoke functions or endpoints that are only meant for users with the same role but different accounts — accessing another account's data or performing actions on their behalf.",
+        "description": "A multi-step privileged operation (e.g., promote user to admin) has an access control check on the FIRST step but NOT on the CONFIRMATION step. Any authenticated user who can replay the confirmation request can complete the privileged action.",
+        "real_world_example": "Real-world example: admin promotes a user — GET /admin/roles?action=upgrade&username=carlos → confirmation POST /admin/roles with confirmed=true. An unprivileged user who captures the confirmation POST can replay it with their own session cookie to promote themselves.",
         "indicators": [
-            "Bulk user management endpoints: /api/admin/users",
-            "Account settings reachable by other users via predictable path",
-            "User IDs exposed in responses that belong to other accounts"
+            "Admin panel has a two-step action: 'Promote user' → confirmation page → confirmed",
+            "Confirmation step is a POST request with a predictable body (confirmed=true, action=upgrade)",
+            "Admin session cookie is the ONLY difference between admin and user confirmation requests"
         ],
         "technique": [
-            "1. Map all endpoints exposed to authenticated users",
-            "2. For each endpoint that takes a user/account identifier, substitute another user's ID",
-            "3. Test modification endpoints: change email, password reset, profile update",
-            "4. Look for bulk-data endpoints that return multiple users' data"
+            "1. Log in as admin; perform the multi-step action and capture ALL requests",
+            "2. Identify the confirmation request (POST with confirmed=true or similar)",
+            "3. Send the confirmation request again with the UNPRIVILEGED user's session cookie",
+            "4. Change the username/target parameter if needed",
+            "5. If 200 or 302 returned, access control is missing on the confirmation step"
         ],
-        "required_proof_markers": ["OWNERSHIP_BYPASS", "SENSITIVE_FIELD_EXPOSED"],
-        "success_condition": "Actor can read or modify a different user's account data without authorization."
+        "required_proof_markers": ["AUTH_BYPASS", "PRIVILEGED_ACCESS"],
+        "success_condition": "Low-privilege user successfully performs an admin action (role promotion, user deletion) by replaying the confirmation request with their own session."
     },
     {
         "id": "BAC-06",
         "name": "Forced Browsing / Missing Function-Level Access Control",
         "severity": "HIGH",
-        "description": "Pages or API routes for privileged functions exist but are not linked to in the UI for low-privilege users. The server does not enforce authorization on these routes.",
+        "description": "Pages or API routes for privileged functions exist but are not linked in the UI for low-privilege users. The server does not enforce authorization, so any user who discovers the URL can access it. NOTE: standard user account pages (/my-account, /profile, /settings) are NOT this pattern — they require login but are expected to exist.",
         "indicators": [
-            "JavaScript reveals conditional UI for admin users (feature flags, role checks)",
-            "Guessable paths: /api/admin/*, /api/internal/*, /api/v2/debug/*",
-            "Directory listing exposed",
-            "Swagger/OpenAPI spec reveals endpoints not shown in UI"
+            "JavaScript reveals conditional UI for admin users (feature flags, isAdmin checks with hidden URLs)",
+            "Guessable paths respond to low-priv users: /admin/users, /internal/config, /api/admin/*",
+            "Directory listing exposed via /static/ or /uploads/",
+            "Swagger/OpenAPI spec reveals endpoints not shown in UI",
+            "robots.txt Disallow entries for non-public paths"
         ],
         "technique": [
-            "1. Extract all paths from JS bundles, Swagger spec, robots.txt",
-            "2. Attempt access with a low-privilege session to each discovered path",
-            "3. Record status codes and response bodies for unexpected 2xx responses"
+            "1. Extract all paths from JS bundles (grep for /admin, /internal, /manage, /staff)",
+            "2. Check robots.txt, sitemap.xml for disallowed paths",
+            "3. Access each discovered path with a low-privilege session",
+            "4. A [probed] endpoint that returns 302→login when anon but 200 when logged in is BAC-06 only if it is an admin/privileged area",
+            "5. Check: if path contains /admin, /manage, /staff, /internal, /console, /panel → BAC-06 candidate"
         ],
         "required_proof_markers": ["PRIVILEGED_ACCESS"],
-        "success_condition": "Low-privilege actor reaches a function-level admin endpoint and receives a useful response (200 with data or 200 with admin UI fragment)."
+        "success_condition": "Low-privilege actor reaches a privileged endpoint (admin/management area) and receives useful response (200 with admin content, user list, configuration)."
+    },
+    {
+        "id": "BAC-07",
+        "name": "Email Domain Access Control Bypass (Inconsistent Security Controls)",
+        "severity": "HIGH",
+        "description": "The application grants elevated privileges based on the email domain (e.g., only @company.com employees get admin access). The vulnerability is that users can change their email AFTER registration without re-validation, allowing them to register with a legitimate email then switch to an arbitrary @company.com address.",
+        "real_world_example": "Real-world example: admin access requires @dontwannacry.com email. Register with your legitimate email, confirm, then change email to anything@dontwannacry.com via account settings. Access /admin immediately — the domain check passes.",
+        "indicators": [
+            "Error message when accessing /admin says 'Only @company.com employees can access this'",
+            "Registration requires email confirmation but email CHANGE does not",
+            "Account settings page allows email modification without re-confirming the new address",
+            "Access control based on email domain suffix rather than group membership"
+        ],
+        "technique": [
+            "1. Attempt /admin access to confirm the required email domain from the error message",
+            "2. Register with a legitimate email and confirm account",
+            "3. Navigate to account settings; change email to arbitrary@<required-domain>.com",
+            "4. No email confirmation required for the domain change",
+            "5. Access /admin — domain check passes on the stored email"
+        ],
+        "required_proof_markers": ["AUTH_BYPASS", "PRIVILEGED_ACCESS"],
+        "success_condition": "After updating email to @required-domain.com without confirmation, /admin returns 200 with admin content."
+    },
+    {
+        "id": "BAC-08",
+        "name": "Horizontal Privilege Escalation via Password Disclosure (IDOR + Credential Exposure)",
+        "severity": "CRITICAL",
+        "description": "The account management page renders the user's current password in a masked HTML input field (type=password). The password value is in the HTML source even though it appears hidden. Combined with IDOR (changing the id parameter), an attacker can read any user's password including the administrator's.",
+        "real_world_example": "Real-world example: GET /my-account?id=administrator — response HTML contains <input type=password value='ADMIN_PASSWORD'>. Read the value from source, log in as administrator.",
+        "indicators": [
+            "Account page contains a password input field pre-filled with the current password",
+            "URL contains id= parameter that can be changed to another username",
+            "Endpoint /my-account accepts arbitrary id values without ownership check"
+        ],
+        "technique": [
+            "1. Log in; access /my-account and inspect page source for password input field",
+            "2. Confirm it contains type=password with value= attribute pre-filled",
+            "3. Change the id parameter to 'administrator' or other target username",
+            "4. Read the password value from the HTML source of the response",
+            "5. Log out; log in as administrator with the disclosed password"
+        ],
+        "required_proof_markers": ["OWNERSHIP_BYPASS", "SENSITIVE_FIELD_EXPOSED"],
+        "success_condition": "Administrator password is visible in the HTML source when requesting /my-account?id=administrator. Attacker logs in as administrator successfully."
     }
 ]

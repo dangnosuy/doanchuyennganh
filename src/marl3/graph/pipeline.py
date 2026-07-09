@@ -9,6 +9,7 @@ This replaces marl2's Orchestrator._phase_bugs() loop.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from langgraph.graph import StateGraph, END, START
@@ -18,6 +19,18 @@ from .nodes.coordinate import run_coordinate
 from .nodes.report import run_report
 
 log = logging.getLogger("marl3.graph.pipeline")
+
+_REMEDIATION: dict[str, str] = {
+    "BAC-01": "Require authentication on all endpoints that return user data. Apply login_required middleware. Return only the authenticated user's own data unless the caller holds an admin role.",
+    "BAC-02": "Never store authorization state (role, is_admin) in client-visible unsigned cookies. Use server-side sessions or signed/encrypted tokens. Derive the user's role from the database on each request.",
+    "BAC-03": "Add an ownership check before returning any per-object resource: verify resource.user_id == session.user_id. Return 403 if the caller does not own the resource.",
+    "BAC-04": "Disable HTTP method override headers (X-HTTP-Method-Override). Enforce access control on every HTTP verb independently.",
+    "BAC-05": "Apply the same ownership check as BAC-03 to all resource access paths including sub-resources.",
+    "BAC-06": "Apply access-control middleware to all admin/privileged routes. Deny by default; allow only for authenticated admins.",
+    "BLF-01": "Validate all numeric inputs server-side: reject negative values, enforce min/max bounds, and verify the final total matches the server-computed value before committing the transaction.",
+    "BLF-05": "Mark coupons as used atomically within the same transaction as the order. Never reset the used flag on cancel without re-checking eligibility.",
+    "BLF-06": "Enforce quantity >= 1 server-side. Reject or clamp negative or zero quantities before any state mutation.",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +80,16 @@ async def run_bugs(state: dict) -> dict:
             max_verify_retries=getattr(cfg.debate, "max_verify_retries", 1),
         )
 
-        # Invoke per-bug sub-graph (runs to completion)
-        final_state = await bug_graph.ainvoke(bug_state)
+        wall_clock = getattr(cfg.debate, "per_bug_wall_clock_s", 600)
+        try:
+            final_state = await asyncio.wait_for(
+                bug_graph.ainvoke(bug_state),
+                timeout=float(wall_clock),
+            )
+        except asyncio.TimeoutError:
+            log.warning(f"[bugs] {dossier.id} exceeded wall-clock {wall_clock}s — marking NOT_EXPLOITED")
+            final_state = {**bug_state, "bug_status": "NOT_EXPLOITED",
+                           "error_message": f"wall-clock timeout ({wall_clock}s)"}
 
         # Build Finding from final sub-graph state
         finding = _build_finding(final_state, dossier)
@@ -98,10 +119,12 @@ async def run_bugs(state: dict) -> dict:
 
 
 def _build_finding(state: dict, dossier) -> "Finding":
+    import time
     from ..contracts.results import Finding
     from ..contracts.enums import Severity
 
     evidence = state.get("evidence")
+    workspace = state.get("workspace")
     verdicts = state.get("panel_verdicts", [])
     bug_status = state.get("bug_status", "NOT_EXPLOITED")
     thread = state.get("thread")
@@ -141,6 +164,23 @@ def _build_finding(state: dict, dossier) -> "Finding":
     if isinstance(poc_artifact, str):
         poc_artifact = None  # discard plain string paths
 
+    # Regenerate PoC now that proof_markers are set (ProofGate ran in verify phase).
+    # At runner.py time proof_markers were empty, so the original PoC fell back to
+    # evidence.exchanges[:6] and included navigation noise. Re-run the generator with
+    # populated markers so only attack-critical exchanges appear.
+    if evidence and workspace and getattr(evidence, "proof_markers", None):
+        try:
+            from ..execution.poc.generator import PocGenerator
+            from ..recon.body_store import BodyStore
+            _bs = BodyStore(workspace.bodies_dir)
+            _poc_path = workspace.poc_path(evidence.bug_id)
+            _recon = state.get("recon")
+            _target_url = getattr(_recon, "target_url", "") if _recon else ""
+            _gen = PocGenerator(_bs, workspace.root)
+            poc_artifact = _gen.generate(evidence=evidence, target_url=_target_url, poc_path=_poc_path)
+        except Exception as _e:
+            log.debug(f"PoC regen failed for {dossier.id}: {_e}")
+
     return Finding(
         bug_id=dossier.id,
         title=dossier.title,
@@ -158,8 +198,14 @@ def _build_finding(state: dict, dossier) -> "Finding":
         panel=verdicts,
         panel_decision=status,
         poc=poc_artifact,
-        remediation="",
+        remediation=_REMEDIATION.get(dossier.pattern_id, ""),
         discovered_by="marl3",
+        # ── Runtime metrics for benchmark ──
+        debate_rounds=state.get("debate_rounds", 0),
+        verify_retries=state.get("verify_retries", 0),
+        exec_retries=state.get("exec_retries", 0),
+        elapsed_s=round(time.monotonic() - state.get("started_at", time.monotonic()), 2),
+        failure_mode=_classify_failure(state) if status != "EXPLOITED" else "",
     )
 
 
@@ -175,6 +221,32 @@ def _summarise(state: dict) -> str:
     if error:
         return f"Not exploited — {error}"
     return f"Not exploited after {state.get('debate_rounds', 0)} debate rounds"
+
+
+def _classify_failure(state: dict) -> str:
+    """Classify why a bug was not exploited — for structured failure analysis."""
+    error = state.get("error_message", "")
+    bug_status = state.get("bug_status", "")
+    evidence = state.get("evidence")
+    exchanges = len(getattr(evidence, "exchanges", [])) if evidence else 0
+
+    if "wall-clock timeout" in error or "timeout" in error.lower():
+        return "TIMEOUT"
+    if bug_status == "SKIPPED_NO_EVIDENCE":
+        return "INSUFFICIENT_CONTEXT"
+    if state.get("debate_rounds", 0) == 0:
+        return "DEBATE_NEVER_STARTED"
+    if bug_status == "PROOF_QUALITY_FAIL":
+        if exchanges == 0:
+            return "EXEC_NO_EXCHANGES"
+        return "PROOF_QUALITY_FAIL"
+    if exchanges == 0:
+        return "EXEC_NO_EXCHANGES"
+    if "error" in error.lower() or bug_status == "ERROR":
+        return "RUNTIME_ERROR"
+    if state.get("debate_rounds", 0) >= state.get("max_debate_rounds", 3) * 2:
+        return "DEBATE_BUDGET_EXHAUSTED"
+    return "NOT_EXPLOITED"
 
 
 def _persist_finding(memory, finding) -> None:

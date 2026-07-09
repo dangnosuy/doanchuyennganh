@@ -1,0 +1,641 @@
+% ============================================================
+%  SECTION 3 — PROPOSED METHODOLOGY
+%  For use in IEEE/ACM paper (paste into Overleaf body)
+%  Required packages (add to preamble if not already present):
+%    \usepackage{amsmath,amssymb}
+%    \usepackage{booktabs}
+%    \usepackage{algorithm}
+%    \usepackage{algpseudocode}
+%    \usepackage{graphicx}
+%    \usepackage{listings}
+% ============================================================
+
+\section{Proposed Methodology}
+\label{sec:methodology}
+
+% ------------------------------------------------------------------
+\subsection{System Architecture Overview}
+\label{subsec:arch_overview}
+% ------------------------------------------------------------------
+
+The proposed framework is constructed upon three orthogonal tiers of
+responsibility, a design invariant that governs every architectural
+decision in the system.
+\textbf{Tier~1} comprises the deterministic code layer responsible for
+evidence collection (reconnaissance) and pipeline flow orchestration.
+\textbf{Tier~2} encompasses the large language model (LLM) agents that
+perform contextual reasoning and strategic planning within each bounded
+phase.
+\textbf{Tier~3} constitutes a second deterministic code layer---the
+\emph{Proof Gate}---that produces the final exploitation verdict by
+evaluating raw HTTP evidence, operating exclusively on structured data
+rather than probabilistic model output.
+
+This tripartite separation embodies the core epistemological principle
+of the architecture: the ground truth of a security vulnerability is
+established by the observed HTTP response corpus, not by the output of
+any language model.
+Formally, for an evidence set
+$\mathcal{E} = \{e_1, e_2, \ldots, e_n\}$
+where each $e_i \in \mathcal{H}$ denotes a recorded HTTP exchange, the
+final verdict
+$v \in \{\textsc{Exploited},\, \textsc{Failed},\, \textsc{InfoExposure}\}$
+is computed by a deterministic function
+$\Phi: \mathcal{H}^{n} \to \mathcal{V}$,
+with no LLM inference participating in the mapping from
+$\mathcal{E}$ to $v$.
+
+The orchestration backbone is implemented as a compiled
+\texttt{StateGraph} using LangGraph~\cite{langgraph2024}, wherein each
+processing phase is encoded as a pure node function and every
+control-flow transition is encoded as a deterministic conditional edge.
+No LLM is granted authority over graph routing; the transition function
+$\delta: S \times \Sigma \to S$
+is evaluated exclusively on enumerated state values in the
+\texttt{BugState} domain.
+
+\paragraph{State machine formalization.}
+The per-bug execution lifecycle is governed by a finite automaton
+$\mathcal{M} = (Q, \Sigma, \delta, q_0, F)$ where:
+\begin{itemize}
+  \item $Q = \{\textsc{Queued},\; \textsc{Debating},\;
+    \textsc{DebateApproved},\; \textsc{Executing},\;
+    \textsc{Verifying},\; \textsc{Exploited},\;
+    \textsc{NotExploited},\; \textsc{ProofQualityFail},\;
+    \textsc{InfoExposureOnly},\; \textsc{Skipped},\;
+    \textsc{Error}\}$
+  \item $\Sigma = \{\texttt{START\_DEBATE},\; \texttt{APPROVED},\;
+    \texttt{STOP},\; \texttt{INSUFFICIENT\_CONTEXT},\;
+    \texttt{START\_EXEC},\; \texttt{EXEC\_DONE},\;
+    \texttt{CONFIRMED},\; \texttt{PROOF\_FAIL},\;
+    \texttt{RETRY\_DEBATE},\; \texttt{GIVE\_UP}\}$
+  \item $\delta$ is the transition function defined by a declarative
+    \texttt{TRANSITIONS} table; every legal $(q, \sigma) \to q'$ triple
+    is explicitly enumerated, prohibiting any implicit state advancement
+  \item $q_0 = \textsc{Queued}$ and
+    $F = \{\textsc{Exploited},\; \textsc{NotExploited},\;
+    \textsc{InfoExposureOnly},\; \textsc{Skipped},\; \textsc{Error}\}$
+\end{itemize}
+
+\paragraph{Frozen strategy invariant.}
+Upon debate approval, four fields are frozen into an immutable
+\texttt{StrategyDocument}
+$\sigma = (\sigma_s,\, \sigma_g,\, \sigma_c,\, \sigma_q)$,
+comprising the strategic approach~$\sigma_s$, step-by-step execution
+guide~$\sigma_g$, success conditions~$\sigma_c$, and verification
+questions~$\sigma_q$, respectively.
+The execution agent receives $\sigma$ as read-only context and is
+architecturally prohibited from modifying it.
+Should the strategy prove deficient, the only corrective pathway is a
+new debate round producing a revised $\sigma'$ after adversarial review.
+
+% ------------------------------------------------------------------
+\subsection{Pipeline and Data Flow Specifications}
+\label{subsec:pipeline}
+% ------------------------------------------------------------------
+
+\subsubsection{Main Pipeline}
+
+The top-level pipeline is compiled as a linear sequence of five nodes
+executed unconditionally in order:
+\begin{equation}
+  \textsc{Start}
+  \;\to\; r
+  \;\to\; h
+  \;\to\; k
+  \;\to\; b
+  \;\to\; \rho
+  \;\to\; \textsc{End}
+  \label{eq:main_pipeline}
+\end{equation}
+where $r$ denotes the reconnaissance node, $h$ the hypothesis generation
+(Hunt) node, $k$ the coordination node, $b$ the per-bug execution loop,
+and $\rho$ the report generation node.
+Inter-node data flow is mediated by a shared
+\texttt{PipelineState} TypedDict
+$\mathcal{P} = (\mathcal{T},\, \mathcal{R},\, \mathcal{D},\, \mathcal{F})$
+comprising the target specification $\mathcal{T}$, the reconnaissance
+artifact $\mathcal{R}$, the ordered dossier list
+$\mathcal{D} = [d_1, d_2, \ldots, d_m]$, and the confirmed finding set
+$\mathcal{F}$.
+
+\subsubsection{Per-Bug Sub-graph with Feedback Cycle}
+
+For each dossier $d_i \in \mathcal{D}$, a dedicated sub-graph $G_i$ is
+compiled and invoked.
+The sub-graph admits a structured feedback cycle governed by the retry
+predicate $\psi$:
+\begin{align}
+  G_i:\quad
+  & \textsc{Debate}
+    \xrightarrow{\textsc{Approved}}
+    \textsc{Exec}
+    \xrightarrow{\textsc{ExecDone}}
+    \textsc{Verify}
+  \notag \\
+  & \textsc{Verify}
+    \;\xrightarrow{\;\psi(\mathcal{E}_i)\;\wedge\;\textsc{ProofFail}\;}
+    \textsc{Debate}
+  \label{eq:bug_subgraph}
+\end{align}
+The retry predicate $\psi$ is evaluated as follows:
+\begin{equation}
+  \psi(\mathcal{E}_i)
+  \;=\;
+  \bigl(c_i \geq 1 \;\vee\; p_i\bigr)
+  \;\wedge\;
+  \bigl(v_i \leq v_{\max}\bigr)
+  \;\wedge\;
+  \bigl(r_i < 2\,r_{\max}\bigr)
+  \label{eq:retry_predicate}
+\end{equation}
+where $c_i$ denotes the count of panel verifiers returning
+\texttt{confirmed=True}; $p_i$ is a Boolean indicating partial proof
+satisfaction (i.e., at least one \texttt{ProofMarker} with
+\texttt{satisfied=True} in $\mathcal{E}_i$); $v_i$ and $v_{\max}$ are
+the current and maximum verify-retry counts (default $v_{\max}=1$);
+and $r_i$ and $r_{\max}$ are the current debate round count and the
+configured maximum (default $r_{\max}=3$).
+A per-bug wall-clock guard is enforced via
+\texttt{asyncio.wait\_for} with a timeout of $\tau = 600$~s,
+ensuring that no individual dossier can monopolize pipeline resources
+regardless of LLM response latency.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{fig1_pipeline}
+  % If the figure is not yet compiled, substitute the above with:
+  % \fbox{\parbox{0.92\linewidth}{\centering\vspace{3.2cm}
+  %   [Architecture Diagram Placeholder]\vspace{3.2cm}}}
+  \caption{%
+    End-to-end architecture of the proposed multi-agent web penetration
+    testing framework.
+    \textbf{Left (main pipeline):} The target URL and credentials enter
+    the \textbf{Reconnaissance} node, which collects a
+    \texttt{ReconArtifact}~$\mathcal{R}$ through four-layer HTTP
+    crawling---passive link following, JavaScript endpoint extraction,
+    active path probing against $\sim$50 curated generic paths plus
+    dynamically inferred sibling IDOR candidates, and
+    authenticated-versus-unauthenticated differential recording.
+    The \textbf{Hunt} node invokes an LLM Hunter agent on $\mathcal{R}$,
+    which emits an ordered list of \texttt{BugDossier} hypotheses
+    $\mathcal{D} = [d_1,\ldots,d_m]$.
+    The \textbf{Coordinate} node ranks $\mathcal{D}$ by severity,
+    vulnerability category (BAC before BLF, simple before chain), and
+    inter-dossier dependencies.
+    The \textbf{Bugs} node iterates over $\mathcal{D}$, invoking the
+    per-bug sub-graph for each $d_i$.
+    The \textbf{Report} node synthesizes confirmed
+    \texttt{Finding}~objects into \texttt{report.md},
+    \texttt{findings.json}, and per-bug PoC scripts.
+    \textbf{Right (per-bug sub-graph):} For each~$d_i$, the
+    \textbf{Debate} phase runs an adversarial Red\,$\leftrightarrow$\,Blue
+    agent loop, producing an immutable \texttt{StrategyDocument}~$\sigma$
+    on \textsc{Approve}.
+    The \textbf{Execution} phase instantiates a tool-calling LLM loop
+    (up to 20~steps), recording every HTTP exchange via a
+    \texttt{RecordingHttpClient} into an \texttt{Evidence}
+    object~$\mathcal{E}_i$.
+    The \textbf{Verification} phase runs three parallel
+    \texttt{VerifierAgent} instances (advisory panel) followed by a
+    deterministic \texttt{ProofGate}~$\Phi$.
+    On \textsc{ProofQualityFail}, the gate's rejection rationale is fed
+    back to the Debate node for a targeted strategy revision, subject to
+    retry predicate~$\psi$ (Eq.~\ref{eq:retry_predicate}).
+    All routing decisions are computed by deterministic code; no language
+    model participates in control-flow decisions.
+  }
+  \label{fig:architecture}
+\end{figure}
+
+\subsubsection{Formal Data Definitions}
+
+The primary data structures transferred between pipeline phases are
+formally defined as follows.
+
+The \textbf{ReconArtifact}
+$\mathcal{R} = (E_{\mathrm{ep}},\, X_{\mathrm{http}},\, A_{\mathrm{prof}},\,
+\Delta_{\mathrm{auth}},\, G_{\mathrm{wf}})$
+encapsulates the discovered endpoint set~$E_{\mathrm{ep}}$, the observed
+HTTP exchange corpus~$X_{\mathrm{http}}$, the collected authentication
+profiles~$A_{\mathrm{prof}}$, the authentication-differential
+set~$\Delta_{\mathrm{auth}}$ (pairs of anonymous versus authenticated
+responses for each endpoint), and the inferred workflow
+graph~$G_{\mathrm{wf}}$.
+
+A \textbf{BugDossier}
+$d = (\mathit{id},\, \kappa,\, \omega,\, \eta,\, \alpha,\, \mathrm{conf})$
+specifies: the bug identifier; the vulnerability pattern code
+$\kappa \in \{\textsc{BAC-01}, \textsc{BAC-02}, \textsc{BAC-03},
+\textsc{BLF-01}, \textsc{BLF-05}, \textsc{BLF-06}, \ldots\}$;
+the target endpoint~$\omega$; the attack hypothesis~$\eta$ in natural
+language; the required actor configuration
+$\alpha = (\mathit{role}_{\mathrm{attacker}},\,
+\mathit{role}_{\mathrm{victim}},\,
+\mathit{role}_{\mathrm{admin}})$;
+and the confidence score $\mathrm{conf} \in [0,1]$.
+
+An \textbf{Evidence} object
+$\mathcal{E} = (X,\, \Pi,\, \Delta_s,\, C_{\mathrm{sess}})$
+aggregates the recorded exchange sequence $X = [x_1, \ldots, x_n]$; the
+proof-marker set $\Pi = \{\mu_1, \ldots, \mu_k\}$ where
+$\mu_j = (\mathit{key}_j,\, \mathit{sat}_j,\, \mathit{detail}_j,\,
+\mathit{seqs}_j)$;
+the state delta~$\Delta_s$ mapping field names to numeric changes; and the
+session-context map $C_{\mathrm{sess}}: \mathit{label} \mapsto \mathit{role}$.
+
+Each \textbf{HttpExchange}
+$x_i = (\mathrm{seq}_i,\, m_i,\, u_i,\, \hat{\omega}_i,\,
+H_i^{\mathrm{req}},\, b_i^{\mathrm{req}},\, s_i,\,
+H_i^{\mathrm{resp}},\, b_i^{\mathrm{resp}},\,
+a_i,\, K_i,\, N_i,\, T_i)$
+records the sequence number, HTTP method~$m_i$, URL~$u_i$, normalized
+endpoint template~$\hat{\omega}_i$, request and response header/body
+references, HTTP status code~$s_i$, actor label~$a_i$, JSON key set~$K_i$
+(top 50 keys extracted per response), numeric field map~$N_i$, and HTML
+title~$T_i$.
+Body content is stored in a content-addressed \texttt{BodyStore}
+(SHA-256-keyed binary files on disk); object references carry only a
+hash pointer and a 200-character preview, ensuring that no response body
+is truncated in transit between components.
+
+% ------------------------------------------------------------------
+\subsection{Core Components and Agent Execution}
+\label{subsec:components}
+% ------------------------------------------------------------------
+
+\subsubsection{Reconnaissance Module}
+
+The reconnaissance module operates as a four-layer evidence-collection
+pipeline, each layer targeting a distinct category of endpoint discovery
+not reachable by prior layers.
+
+\textbf{Layer~1 (Passive crawl)} follows HTML hyperlinks and form
+actions from within the authenticated session, capturing publicly linked
+endpoints.
+\textbf{Layer~2 (JavaScript extraction)} applies regular-expression
+matching to inline \verb|<script>| blocks, recovering \texttt{fetch()},
+\texttt{axios}, and \texttt{XMLHttpRequest} references not present in
+the HTML DOM and reconstructing path templates from string-concatenation
+patterns (e.g., \texttt{'/orders/' + id} $\to$ \texttt{/orders/\{id\}}).
+\textbf{Layer~3 (Active probing)} issues HEAD/GET requests to
+approximately 50 curated generic paths (administrative interfaces, REST
+API prefixes, common commerce endpoints) augmented by dynamically
+inferred IDOR candidate paths.
+For each discovered collection endpoint~$\omega_c$ matching the pattern
+\texttt{/api/v1/\{collection\}}, sibling resource probes
+$\omega_c^{(j)} = \omega_c \cup \{{\omega_c}/{j} : j \in [1, N_p]\}$
+are generated across 15 standardized REST collection names.
+\textbf{Layer~4 (Authentication differential)} re-issues every
+discovered request under both anonymous and authenticated sessions,
+recording \texttt{AuthDiff} pairs
+$(r_{\mathrm{anon}},\, r_{\mathrm{auth}})$ for each endpoint.
+Endpoints satisfying
+$\mathrm{status}(r_{\mathrm{anon}}) \in \{302, 403\}$
+and
+$\mathrm{status}(r_{\mathrm{auth}}) = 200$
+constitute strong Broken Access Control signals.
+
+A soft-404 filter prevents path inflation from applications that return
+HTTP~200 with a ``page not found'' body.
+For a probe response with body length~$\ell$, the probe is discarded if
+$|\ell - \ell_{404}| < 100$ bytes, where $\ell_{404}$ is the body length
+of a known-404 response.
+JSON responses are unconditionally exempt from this filter: compact JSON
+objects (e.g., 143 bytes) cannot be meaningfully compared to HTML error
+pages (e.g., 2,800 bytes) via a byte-length heuristic.
+An additional guard prevents requests to \texttt{/logout} (which would
+terminate the authenticated session) and correctly interprets 302
+redirects as ``endpoint exists, requires authentication'' rather than
+``endpoint not found.''
+
+Path normalization is applied via \texttt{\_family\_path}: numeric
+segments and UUID-pattern segments in a URL path are replaced with the
+canonical token \texttt{\{id\}}, enabling deduplication of structurally
+identical endpoints discovered via different concrete resource
+identifiers.
+
+\subsubsection{Vulnerability Candidate Generation}
+
+Candidate dossiers are produced through a two-stage pipeline.
+A deterministic pre-filter applies rule-based nomination: endpoints
+exhibiting non-empty authentication differentials are nominated as BAC
+candidates; endpoints accepting numeric fields (\texttt{amount},
+\texttt{quantity}, \texttt{price}) are nominated as BLF candidates;
+endpoints with \texttt{\{id\}} path parameters are nominated as IDOR
+(BAC-03) candidates.
+An LLM Hunter agent then consumes the full \texttt{ReconArtifact}
+alongside per-pattern signal digests provided by the
+\texttt{PlaybookProvider} singleton---a module-level cached loader of
+JSON vulnerability pattern cards and PortSwigger reference walkthroughs---
+and emits a ranked list of \texttt{BugDossier} objects.
+
+A post-processing reclassification pass enforces structural
+correctness of pattern codes: collection-level endpoints (e.g.,
+\texttt{/api/v1/users}) are promoted from BAC-03 to BAC-01;
+per-object endpoints on non-administrative paths (e.g.,
+\texttt{/api/v1/orders/\{id\}}) are demoted from BAC-01 to BAC-03.
+Final deduplication is performed by the composite key
+$(\hat{\omega},\, \kappa)$, where $\hat{\omega}$ denotes the normalized
+endpoint family.
+
+\subsubsection{Adversarial Debate Mechanism}
+
+The debate phase instantiates an adversarial planning protocol between
+two specialized agents: a \textbf{Red agent} (offensive strategist,
+temperature $T_R = 0.6$) and a \textbf{Blue agent} (skeptical reviewer,
+temperature $T_B = 0.3$).
+The protocol runs for at most $r_{\max}$ rounds, as detailed in
+Algorithm~\ref{alg:debate}.
+
+\begin{algorithm}[htbp]
+\caption{Adversarial Debate Protocol}
+\label{alg:debate}
+\begin{algorithmic}[1]
+\Require Dossier $d$, \texttt{ReconArtifact} $\mathcal{R}$,
+         memory context $\mathcal{M}_{\mathrm{ctx}}$,
+         $r_{\max} = 3$
+\Ensure Frozen strategy $\sigma$ or termination verdict
+\For{$r \gets 0$ \textbf{to} $r_{\max} - 1$}
+  \State $\sigma^{(r)} \gets \textsc{RedAgent.Argue}(d,\, \mathcal{R},\,
+         \mathcal{M}_{\mathrm{ctx}},\, r)$
+  \If{``\texttt{INSUFFICIENT\_EVIDENCE}'' $\in$ prefix$(\sigma^{(r)}, 500)$}
+    \State \Return \textsc{InsufficientContext}
+  \EndIf
+  \State $v^{(r)} \gets \textsc{BlueAgent.Review}(\sigma^{(r)},\, \mathcal{R},\, r)$
+  \If{$r = 0$ \textbf{and} $v^{(r)} = \textsc{Approve}$}
+    \State $v^{(r)} \gets \textsc{Revise}$ \Comment{Mandatory conservatism constraint}
+  \EndIf
+  \If{\textsc{FieldGrounding}$(\sigma^{(r)}, \mathcal{R})$ fails}
+    \State $v^{(r)} \gets \textsc{Revise}$ \Comment{Deterministic field-name objection}
+  \EndIf
+  \If{$v^{(r)} = \textsc{Approve}$}
+    \State Freeze $(\sigma_s, \sigma_g, \sigma_c, \sigma_q) \gets \textsc{Parse}(\sigma^{(r)})$
+    \State \Return \textsc{Approved}, $\sigma$
+  \ElsIf{$v^{(r)} \in \{\textsc{Stop}, \textsc{Unverifiable}\}$}
+    \State \Return \textsc{InsufficientContext}
+  \EndIf
+\EndFor
+\State \Return \textsc{MaxRoundsExceeded}
+\end{algorithmic}
+\end{algorithm}
+
+In round $r = 0$, the Red agent synthesizes an initial strategy by
+reasoning over the dossier~$d$, the pattern playbook card for~$\kappa$,
+the PortSwigger reference solution for~$\kappa$, the observed
+authentication cookies from~$\mathcal{R}$, and any applicable
+long-term memory techniques.
+In rounds $r \geq 1$, the Red agent operates in rebuttal mode,
+responding to exactly the objections raised by Blue in round $r-1$
+rather than regenerating the strategy from scratch.
+
+The mandatory conservatism constraint at line~8 ensures that at least
+one adversarial exchange occurs before execution proceeds.
+The deterministic field-grounding check at line~10 extracts the
+money/quantity field names claimed in $\sigma^{(r)}$ from
+backtick-delimited or quoted tokens and compares them against the known
+form fields observed in~$\mathcal{R}$; a mismatch triggers an automatic
+\textsc{Revise} override with a specific field-name objection,
+independent of the Blue agent's LLM verdict.
+
+\subsubsection{Execution Engine}
+
+The execution engine implements a bounded tool-calling agent loop.
+A \texttt{RecordingHttpClient} instance---a thin wrapper over
+\texttt{httpx.AsyncClient}---intercepts all HTTP traffic issued by the
+LLM agent, recording each request-response pair as a structured
+\texttt{HttpExchange}~$x_i$ with full body preservation in the
+\texttt{BodyStore}.
+The \texttt{follow\_redirects} flag is set to \texttt{False}, ensuring
+that 302 redirect responses are recorded as distinct evidence rather
+than silently absorbed into the subsequent 200 response.
+
+The agent is allocated a step budget of
+$N_{\max} \in \{12,\, 20\}$ steps, where $N_{\max} = 20$ applies to
+chained multi-step BLF patterns and $N_{\max} = 12$ applies to
+simpler BAC patterns.
+A sliding context window of depth $w = 8$ most-recent turns is
+maintained to prevent token exhaustion while preserving local
+action-response continuity; the system prompt and the first user turn
+are always retained outside the window.
+
+The execution prompt is augmented with four harvested context
+categories:
+(1)~\textbf{Endpoint schema}---form field names and data types inferred
+from HTML forms, JSON POST response bodies, GET response schemas, and
+cross-page forms;
+(2)~\textbf{Known values}---concrete resource identifiers, coupon codes,
+usernames, and product prices extracted from~$\mathcal{R}$, labeled
+per-endpoint to prevent cross-endpoint value injection;
+(3)~\textbf{Chain-steering directives}---for multi-step BLF patterns,
+the \texttt{exploit\_approach} of~$d$ is injected with an explicit
+step-ordering constraint;
+(4)~\textbf{Memory skills}---abstract cross-target techniques promoted
+from the long-term memory store.
+
+The \texttt{RecordingHttpClient} implements automatic encoding
+negotiation: if an HTTP POST/PUT/PATCH returns a status code in
+$\{400, 404, 415, 422\}$, the request body is automatically
+re-encoded---switching between \texttt{application/x-www-form-urlencoded}
+and \texttt{application/json}---and retried, shielding the execution
+agent from content-type negotiation failures.
+An anti-stall guard terminates the loop if $s \geq 7$ steps have elapsed
+with zero state-changing requests (POST/PUT/PATCH/DELETE returning 2xx),
+preventing unbounded GET-only exploration.
+
+When the LLM tool-calling loop produces no exploitation evidence,
+two deterministic fallback routines are invoked.
+\texttt{\_deterministic\_bac02\_attempt()} applies all viable
+cookie-tampering combinations identified in~$\mathcal{R}$, flipping
+\texttt{role}, \texttt{is\_admin}, and \texttt{isadmin} field values
+(\texttt{false}$\to$\texttt{true}, \texttt{0}$\to$\texttt{1}).
+\texttt{\_deterministic\_blf\_attempt()} constructs the maximal tampered
+POST body from the harvested endpoint schema, setting every money or
+quantity field to a negative value ($-100$ or $-1$, respectively).
+
+\subsubsection{Evidence-Driven Verification Subsystem}
+
+Verification is executed in two sequential stages: an advisory LLM
+panel followed by a deterministic proof gate.
+The complete procedure is summarized in
+Algorithm~\ref{alg:verification}.
+
+\begin{algorithm}[htbp]
+\caption{Two-Stage Verification}
+\label{alg:verification}
+\begin{algorithmic}[1]
+\Require Evidence $\mathcal{E}$, pattern $\kappa$,
+         frozen questions $\sigma_q$, panel size $n = 3$
+\Ensure Bug status $s^* \in \mathcal{V}$
+\State $[V_1, V_2, V_3] \gets \texttt{asyncio.gather}(
+       \textsc{Verify}(\mathcal{E}, \sigma_q, T{=}0.0),
+       \textsc{Verify}(\mathcal{E}, \sigma_q, T{=}0.1),
+       \textsc{Verify}(\mathcal{E}, \sigma_q, T{=}0.2))$
+       \Comment{Parallel dispatch}
+\State $c \gets |\{j : V_j.\mathit{confirmed} = \text{True}\}|$
+\State $Q^* \gets \{q_i : \textstyle\sum_j V_j.Q[i] > n/2\}$
+\State $\lambda_{\mathrm{llm}} \gets (|\sigma_q| \geq 2)
+       \wedge (|Q^*| \geq 2)$
+\State $\mathit{has2xx} \gets \exists\, x_i \in \mathcal{E} :
+       200 \leq s_i < 300$
+\If{$c = 0$ \textbf{and} \textbf{not} $\mathit{has2xx}$}
+  \State \Return \textsc{ProofQualityFail}
+  \Comment{Fast-fail: no usable evidence}
+\EndIf
+\State $v \gets \Phi(\mathcal{E},\, \kappa)$
+       \Comment{Deterministic ProofGate evaluation}
+\If{$v = \textsc{Exploited}$}
+  \State \Return \textsc{Exploited}
+\ElsIf{$\lambda_{\mathrm{llm}}$}
+  \State \Return \textsc{Exploited}
+  \Comment{OR path: panel passes when gate is inconclusive}
+\ElsIf{$v = \textsc{InfoExposureOnly}$}
+  \State \Return \textsc{InfoExposureOnly}
+\Else
+  \State \Return \textsc{ProofQualityFail}
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+Three \texttt{VerifierAgent} instances are dispatched in parallel via
+\texttt{asyncio.gather}.
+Each agent is assigned a distinct epistemic lens---\textit{technical}
+($T = 0.0$), \textit{impact} ($T = 0.1$), and \textit{skeptic}
+($T = 0.2$)---and is intentionally isolated from the debate transcript
+to prevent anchoring bias.
+Each agent independently reviews up to 20 HTTP exchanges with response
+bodies of up to 20,000 characters each and returns a
+\texttt{VerifierVerdict} tuple
+$(b_j,\, \gamma_j,\, \rho_j,\, M_j,\, Q_j)$
+comprising: confirmation Boolean~$b_j$, confidence
+$\gamma_j \in [0,1]$, rationale~$\rho_j$, cited proof-marker
+keys~$M_j$, and per-question Boolean answers~$Q_j$.
+The LLM question-pass predicate is:
+\begin{equation}
+  \lambda_{\mathrm{llm}}
+  = \bigl(|\sigma_q| \geq 2\bigr)
+  \;\wedge\;
+  \bigl(|Q^*| \geq 2\bigr),
+  \qquad
+  Q^* = \Bigl\{q_i : \textstyle\sum_j Q_j[i] > \tfrac{n}{2}\Bigr\}
+  \label{eq:llm_pass}
+\end{equation}
+
+The fast-fail condition at lines~7--8 of Algorithm~\ref{alg:verification}
+bypasses the \texttt{ProofGate} when zero panel confirmations coincide
+with the complete absence of HTTP 2xx-status exchanges in~$\mathcal{E}$,
+indicating that no server-side action was successfully completed.
+Otherwise, the deterministic \texttt{ProofGate}~$\Phi$ is evaluated
+regardless of the panel count.
+This design ensures that ProofGate serves as a safety net even when
+the panel is unanimously skeptical but physical HTTP evidence exists.
+
+\subsubsection{Proof Gate Specifications}
+
+The \texttt{ProofGate} class hierarchy implements pattern-specific
+exploitation criteria as deterministic membership functions over the
+evidence corpus~$\mathcal{E}$.
+Table~\ref{tab:proof_rules} summarizes the required
+\texttt{ProofKey} markers and acceptance conditions for each supported
+vulnerability pattern.
+
+\begin{table}[htbp]
+\centering
+\caption{ProofGate evaluation criteria per vulnerability pattern.
+All required markers must be simultaneously satisfied for an
+\textsc{Exploited} verdict; partial marker satisfaction yields
+\textsc{InfoExposureOnly}; no marker satisfaction yields
+\textsc{Failed}.}
+\label{tab:proof_rules}
+\begin{tabular}{p{1.6cm} p{3.0cm} p{3.8cm}}
+\toprule
+\textbf{Pattern} & \textbf{Required Markers} & \textbf{Acceptance Condition} \\
+\midrule
+BAC-01 & \textsc{PrivilegedAccess} &
+  Anonymous actor receives HTTP 200 with $\geq 2$ records
+  containing sensitive fields (email, balance, role, \ldots);
+  or LLM classifier confirms \texttt{exposes\_other\_users\_pii=True} \\[4pt]
+BAC-02 & \textsc{PrivilegedAccess}, \textsc{AuthBypass} &
+  Admin-titled page rendered for unprivileged actor;
+  order-independent detection of cookie difference on the same
+  endpoint (blocked $\to$ 200 after cookie tamper) \\[4pt]
+BAC-03 & \textsc{OwnershipBypass} &
+  Response contains owner field $\neq$ attacker user-ID;
+  or $\geq 2$ exchanges on the same endpoint template yield
+  distinct identity values (\texttt{\_HTML\_ID\_PATTERNS} fallback) \\[4pt]
+BLF-01 & \textsc{PriceManipulation}, \textsc{StateDelta} &
+  Negative/zero numeric value in money field accepted
+  (2xx/3xx without error-marker tokens in body) \\[4pt]
+BLF-05 & \textsc{PriceManipulation}, \textsc{StateDelta} &
+  Same coupon code accepted $\geq 2$ times with a consume event
+  (checkout/purchase/pay) occurring between the two uses;
+  or $\geq 2$ distinct codes stacked; or
+  grand-total $\leq 0$ in response \\[4pt]
+BLF-06 & \textsc{QuantityTamper}, \textsc{StateDelta} &
+  Negative quantity accepted with 2xx/3xx lacking error-marker tokens \\[4pt]
+BLF-03 & \textsc{StateSkip}, \textsc{StateDelta} &
+  $\geq 2$ distinct action endpoints (POST/PUT/PATCH/DELETE)
+  return 2xx with a non-empty state delta \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+An LLM-assisted classifier (\texttt{ClassifyResponses}) is invoked as a
+feature-extraction fallback when direct field-matching fails.
+The classifier receives up to three representative 2xx exchanges,
+selected by descending response body length and deduplicated by the
+pair $(u_i, a_i)$ (URL and actor label), bounded at
+$\ell_{\max} = 6{,}000$ characters.
+Per-pattern JSON schemata constrain the classifier output to structured
+fact objects (e.g., for BAC-03: \texttt{\{owner\_field\_name,
+owner\_field\_value, email\_in\_response\}}).
+Temperature is set to $T = 0.0$ on the initial attempt and escalated
+to $T = 0.4$ on retries (up to three total attempts).
+The extracted facts are evaluated by the same deterministic gate rules,
+ensuring that the LLM functions solely as a feature extractor rather
+than as a verdict authority.
+
+\subsubsection{Long-Term Memory Subsystem}
+
+A two-tier memory architecture is maintained in a local SQLite store to
+accumulate and generalize exploitation knowledge across penetration
+testing sessions.
+
+\textbf{Tier~1 (Episodic memory)} records each exploitation attempt as
+an \texttt{Episode} row keyed by a target fingerprint
+$\phi = \mathrm{hash}(\mathit{host} \;\|\; \mathit{title} \;\|\;
+\mathrm{sorted}(E_{\mathrm{ep}}))$.
+The payload~$p$, proof-marker set~$\Pi$, and outcome are persisted for
+every completed dossier execution.
+A write gate enforces that only episodes in which the
+\texttt{ProofGate} returned \textsc{Exploited} are written to the
+store; advisory LLM panel opinions do not trigger writes,
+preventing unverified hypotheses from polluting the memory corpus.
+
+\textbf{Tier~2 (Semantic memory)} promotes abstract techniques to a
+\texttt{rules} table when the accumulated episode evidence satisfies the
+promotion predicate:
+\begin{equation}
+  \mathit{promote}(\kappa, f)
+  = \bigl(|\mathcal{S}_{\kappa,f}| \geq \theta_s\bigr)
+  \;\wedge\;
+  \bigl(\bigl|\{\phi : (\kappa, f, \phi) \in \mathcal{S}_{\kappa,f}\}\bigr|
+  \geq \theta_t\bigr)
+  \label{eq:ltm_promote}
+\end{equation}
+where $\mathcal{S}_{\kappa,f}$ is the set of successful episodes for
+pattern~$\kappa$ and endpoint family~$f$, $\theta_s = 3$ is the minimum
+success count, and $\theta_t = 2$ is the minimum distinct-target count.
+
+Promotion is withheld until a technique has been independently confirmed
+on at least $\theta_t = 2$ distinct application fingerprints, preventing
+single-application-specific payloads from being treated as general
+techniques.
+Endpoint paths are normalized to a \emph{role label}
+(e.g., \texttt{/wallet/transfer} and \texttt{/account/send} both resolve
+to the \texttt{transfer} role) before promotion, enabling cross-target
+generalization across applications with structurally equivalent
+endpoints but different path names.
+Promoted rules are serialized as abstract, host-stripped descriptions
+and injected into subsequent execution prompts as supplementary
+\textit{Past Successful Techniques}.

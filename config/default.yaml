@@ -17,10 +17,12 @@ debate:
   max_exec_retries: 1
   max_verify_retries: 1   # 1 lần re-debate (verify→debate) — đủ self-correct, tránh nhân chi phí LLM
   per_bug_wall_clock_s: 600
+  skip: false             # ablation: true → bypass Red↔Blue, exec runs directly from dossier
 
 verifier:
   count: 3
   temperature: 0.0
+  skip_proofgate: false  # ablation: true → panel vote is final authority, ProofGate disabled
 
 execution:
   http_timeout_s: 30
@@ -31,6 +33,9 @@ recon:
   max_pages: 60
   max_depth: 4
   body_store_max_mb: 500
+
+hunt:
+  seeder_enabled: true    # ablation: false → deterministic seeds disabled, LLM hunter only
 
 workspace:
   base_dir: "./workspace"

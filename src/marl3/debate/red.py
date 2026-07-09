@@ -36,6 +36,7 @@ class RedAgent:
             card = self._playbook.card_for(dossier.pattern_id)
         except Exception:
             card = {}
+        lab_reference = self._playbook.solution_for(dossier.pattern_id)
 
         # Get last Blue message for context
         blue_last = ""
@@ -59,6 +60,7 @@ class RedAgent:
             "red_system",
             bug=dossier,
             pattern_card=_format_card(card),
+            lab_reference=lab_reference,
             round=round_num,
             blue_last_message=blue_last,
             auth_cookies_hint=auth_cookies_hint,

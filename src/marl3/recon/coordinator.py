@@ -114,12 +114,19 @@ JSON array only, no explanation:"""
 
     import re
     response = response.strip()
+    # Strip think/reasoning blocks and markdown fences before parsing
+    response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+    response = re.sub(r"^```[a-zA-Z]*\n?", "", response).rstrip("`").strip()
     m = re.search(r'\[.*\]', response, re.DOTALL)
     if not m:
         log.warning("Coordinator: no JSON array in response, keeping original order")
         return dossiers
 
-    ranked_list = json.loads(m.group(0))
+    try:
+        ranked_list = json.loads(m.group(0))
+    except json.JSONDecodeError as e:
+        log.warning(f"Coordinator LLM call failed (non-fatal): {e}")
+        return dossiers
     if not isinstance(ranked_list, list):
         return dossiers
 

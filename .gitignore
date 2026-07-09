@@ -1,5 +1,6 @@
 # Runtime output — workspace runs chứa HTTP evidence, session cookies, PoC
 workspace/
+/workspace/
 
 # Python
 __pycache__/
@@ -13,10 +14,28 @@ build/
 .eggs/
 *.egg
 
-# Virtual environments
+# Virtual environments & Caches
 .venv/
 venv/
 env/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Large/Unnecessary Artifacts
+*.zip
+*.pdf
+
+# EXPLICIT INCLUDES (Must track these)
+!benchmark_results/
+!config/
+!template_dacn/
+!run_benchmark.py
+!analyze_benchmark.py
+
+# Ignore heavy temporary workspaces inside benchmark results
+benchmark_results/**/workspace/
 
 # uv / pip artifacts
 uv.lock
@@ -41,11 +60,12 @@ config/local.yaml
 *.db
 *.sqlite3
 
-# Logs
-*.log
+# Logs (chỉ ignore log runtime, giữ lại benchmark log)
 run.log
+*.log
+!benchmark_run.log
 
 # Test artifacts
-.pytest_cache/
-.coverage
-htmlcov/
+Screenshot from 2026-06-26 23-04-21.png
+template_dacn/src/chapters/4_old.tex
+template_dacn/src/images/chapter4_old/

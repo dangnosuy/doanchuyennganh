@@ -45,6 +45,7 @@ class BugRun:
     frozen_strategy: str = ""
     frozen_execution_guide: str = ""
     frozen_success_condition: str = ""
+    frozen_verification_questions: list[str] = field(default_factory=list)
     thread: Optional[DebateThread] = field(default=None)
     evidence: Optional[Evidence] = field(default=None)
     poc: Optional[PocArtifact] = field(default=None)
@@ -76,7 +77,9 @@ class BugRun:
 
     @property
     def debate_budget_exhausted(self) -> bool:
-        return self.debate_rounds >= self.max_debate_rounds
+        # Allow 1 initial cycle + 1 retry cycle = max_debate_rounds * 2 total rounds.
+        # Consistent with _after_verify's retry guard which also uses max_debate_rounds * 2.
+        return self.debate_rounds >= self.max_debate_rounds * 2
 
     @property
     def is_terminal(self) -> bool:

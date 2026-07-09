@@ -40,6 +40,18 @@ class DebateManager:
                       bug_run.frozen_success_condition, bug_run.debate_rounds.
         """
         dossier = bug_run.dossier
+
+        # Ablation: skip debate entirely — exec runs directly from the dossier hypothesis.
+        if getattr(self._cfg.debate, "skip", False):
+            log.info(f"{dossier.id}: debate.skip=True — bypassing Red↔Blue, freezing dossier as strategy")
+            bug_run.thread = DebateThread(bug_id=dossier.id)
+            bug_run.frozen_strategy = dossier.hypothesis
+            bug_run.frozen_execution_guide = dossier.exploit_approach or dossier.hypothesis
+            bug_run.frozen_success_condition = dossier.hypothesis
+            bug_run.frozen_verification_questions = []
+            bug_run.debate_rounds = 0
+            return "APPROVED"
+
         thread = DebateThread(bug_id=dossier.id)
         bug_run.thread = thread
 
@@ -95,6 +107,7 @@ class DebateManager:
                 bug_run.frozen_strategy = _extract_section(red_msg.content, "STRATEGY")
                 bug_run.frozen_execution_guide = _extract_section(red_msg.content, "EXECUTION GUIDE")
                 bug_run.frozen_success_condition = _extract_section(red_msg.content, "SUCCESS CONDITION")
+                bug_run.frozen_verification_questions = _extract_verification_questions(red_msg.content)
                 # If sections weren't parseable, fall back to the WHOLE message so the exec
                 # agent never loses Red's concrete steps (Codex #1).
                 if not bug_run.frozen_strategy:
@@ -105,7 +118,10 @@ class DebateManager:
                 # a non-empty anchor (prevents empty success condition reaching exec_system.md)
                 if not bug_run.frozen_success_condition:
                     bug_run.frozen_success_condition = bug_run.dossier.hypothesis or red_msg.content
-                log.info(f"{dossier.id}: debate APPROVED (round {round_num + 1})")
+                log.info(
+                    f"{dossier.id}: debate APPROVED (round {round_num + 1}) "
+                    f"— {len(bug_run.frozen_verification_questions)} verification question(s) frozen"
+                )
                 return "APPROVED"
 
             elif verdict == DebateVerdict.STOP:
@@ -128,3 +144,19 @@ def _extract_section(text: str, section_name: str) -> str:
     if match:
         return match.group(1).strip()
     return ""
+
+
+def _extract_verification_questions(text: str) -> list[str]:
+    """Extract the 3 numbered yes/no questions from the VERIFICATION QUESTIONS section."""
+    import re
+    section = _extract_section(text, "VERIFICATION QUESTIONS")
+    if not section:
+        return []
+    questions = []
+    for line in section.splitlines():
+        line = line.strip()
+        # Match lines starting with 1. / 2. / 3. (numbered list)
+        m = re.match(r'^[1-9]\d*[\.\)]\s+(.+)', line)
+        if m:
+            questions.append(m.group(1).strip())
+    return questions[:3]

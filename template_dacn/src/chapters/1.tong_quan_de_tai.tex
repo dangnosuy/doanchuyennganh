@@ -1,0 +1,178 @@
+\chapter{Tổng quan đề tài}\label{Chapter1}
+
+% \section*{Tóm tắt chương}
+
+% Trong chương này, chúng tôi xin trình bày lý do chọn đề tài, các công trình nghiên cứu liên quan và những điểm mới của đề tài so với các nghiên cứu trước. Đồng thời, chúng tôi cũng đưa ra mục tiêu, đối tượng và phạm vi nghiên cứu, cũng như là phương pháp nghiên cứu. Cuối cùng chúng tôi đưa ra cấu trúc của khóa luận tốt nghiệp.
+
+%----------------------------------------------------------------------------------------
+%	SECTION 1
+%----------------------------------------------------------------------------------------
+
+\section{Lý do chọn đề tài}
+
+Trong hệ sinh thái Windows, PowerShell không chỉ là một công cụ quản trị mạnh mẽ mà còn trở thành mục tiêu khai thác ưa thích của tội phạm mạng. Với khả năng truy cập sâu vào API hệ thống và thực thi trực tiếp trên bộ nhớ, PowerShell cho phép thực hiện các cuộc tấn công fileless malware, giúp kẻ tấn công lẩn tránh các giải pháp bảo mật truyền thống dựa trên chữ ký tệp tin. Tuy nhiên, việc viết các mã tấn công phục vụ cho mục đích penetration testing hay adversary emulation đòi hỏi trình độ chuyên môn rất cao và tốn nhiều công sức. Trong khi đó, các mô hình generative AI đang phát triển mạnh mẽ nhưng chưa được khai thác hiệu quả trong lĩnh vực này. Việc nghiên cứu một phương pháp tự động hóa sinh mã PowerShell tấn công từ ngôn ngữ tự nhiên là vô cùng cấp thiết, giúp các chuyên gia bảo mật nâng cao năng lực phòng thủ chủ động.
+
+
+
+
+%----------------------------------------------------------------------------------------
+%	SECTION 2
+%----------------------------------------------------------------------------------------
+
+\section{Các nghiên cứu liên quan}
+
+Trong những năm gần đây, việc ứng dụng học máy và các mô hình ngôn ngữ lớn (LLMs) vào lĩnh vực an ninh mạng đã thu hút sự quan tâm đáng kể của cộng đồng nghiên cứu. Đối với PowerShell – một công cụ phổ biến trong môi trường Windows và thường bị lợi dụng trong các chiến dịch tấn công – phần lớn các công trình trước đây tập trung vào hướng phòng thủ, bao gồm phát hiện và deobfuscation mã độc, thay vì sinh mã tấn công từ mô tả ngôn ngữ tự nhiên.
+
+Ở hướng phòng thủ, Li et al. (2019) đề xuất phương pháp subtree-based deobfuscation kết hợp với cơ chế semantic-aware detection, nhằm cải thiện khả năng nhận diện lệnh PowerShell độc hại. Các nghiên cứu tiếp theo như PowerDP (2023) khai thác đặc trưng phân bố ký tự và mô hình phân loại đa nhãn để phát hiện nhiều kiểu obfuscation khác nhau, đồng thời tích hợp bộ deobfuscation tự động. Hendler et al. (2018) và Rubin et al. (2019) tập trung vào xây dựng các bộ phát hiện dựa trên học máy, tận dụng thông tin ngữ cảnh từ AMSI nhằm tăng cường khả năng giám sát hành vi thực thi. Bên cạnh đó, Mimura và Tajiri (2021) đề xuất phương pháp phát hiện tĩnh dựa trên word embeddings, trong khi Mezawa et al. (2022) tập trung vào chuẩn hóa quy trình đánh giá các bộ phát hiện ML cho PowerShell. Nhìn chung, các công trình này đóng góp đáng kể cho hướng phòng thủ, nhưng không giải quyết bài toán sinh mã tấn công từ mô tả ý định.
+
+Ở hướng tấn công, một số nghiên cứu gần đây đã khảo sát khả năng của các mô hình ngôn ngữ lớn như ChatGPT hoặc Bard trong việc sinh mã độc hoặc script tấn công. Gupta et al. (2023) trình bày các ví dụ định tính về việc sinh mã phishing, malware và một số đoạn PowerShell từ prompt tự nhiên. Tương tự, Charan et al. (2023) đánh giá khả năng sinh script độc hại tương ứng với các kỹ thuật phổ biến trong MITRE ATT\&CK. Tuy nhiên, các nghiên cứu này chủ yếu mang tính khảo sát, số lượng ví dụ hạn chế và thiếu bộ dữ liệu gán nhãn cũng như quy trình đánh giá hệ thống trên quy mô lớn.
+
+Một nhánh nghiên cứu khác tập trung vào sinh exploit và shellcode ở mức ngôn ngữ thấp. Liguori et al. (2022) xây dựng bộ dữ liệu và quy trình huấn luyện cho bài toán sinh shellcode Assembly từ mô tả ngôn ngữ tự nhiên. EVIL (2021) đề xuất kiến trúc sinh exploit dựa trên dịch máy thần kinh, kết hợp sinh shellcode và mã Python để mã hóa hoặc làm rối payload. DualSC mở rộng hướng này bằng cơ chế học hai chiều để vừa sinh vừa tóm tắt shellcode. ExploitGen tận dụng CodeBERT để sinh exploit ở mức Assembly và Python. Mặc dù các công trình này cho thấy tiềm năng của mô hình sinh mã trong bối cảnh tấn công, phạm vi chủ yếu giới hạn ở giai đoạn khai thác và không bao quát toàn bộ chuỗi tấn công.
+
+Đáng chú ý, Liguori et al. (WOOT 2024) là một trong số ít công trình đặt trực tiếp bài toán sinh PowerShell tấn công từ mô tả ngôn ngữ tự nhiên, hướng tới kịch bản red teaming và mô phỏng đối thủ. Công trình này xây dựng bộ dữ liệu được gán nhãn thủ công, áp dụng quy trình huấn luyện hai bước (domain-adaptive pretraining và fine-tuning) và đánh giá đầu ra dựa trên độ tương đồng chuỗi, phân tích tĩnh và kiểm tra hành vi thực thi. So với các khảo sát trước đó, nghiên cứu này cung cấp quy trình đánh giá hệ thống và ground truth rõ ràng cho bài toán intent-to-attack generation.
+
+Bảng \ref{tab:related_work} tóm tắt sự khác biệt giữa các hướng tiếp cận chính trong lĩnh vực này.
+
+\begin{sidewaystable}[ht]
+\centering
+\small
+\caption{So sánh các hướng nghiên cứu liên quan}
+\label{tab:related_work}
+
+\begin{tabularx}{\textwidth}{
+l
+l
+>{\raggedright\arraybackslash}X
+>{\raggedright\arraybackslash}X
+>{\raggedright\arraybackslash}X
+}
+\toprule
+\textbf{Nhóm nghiên cứu} &
+\textbf{Công trình tiêu biểu} &
+\textbf{Mục tiêu chính} &
+\textbf{Kỹ thuật cốt lõi} &
+\textbf{Hạn chế chính} \\
+\midrule
+
+Phòng thủ (Detection/Deobfuscation)
+& Li et al. (2019), PowerDP (2023), Hendler et al. (2018)
+& Phát hiện và khử rối PowerShell độc hại
+& Phân tích cú pháp, đặc trưng ký tự, ML classifier, AMSI context
+& Không hỗ trợ intent-to-command generation \\
+
+Khảo sát LLM sinh mã độc
+& Gupta et al. (2023), Charan et al. (2023)
+& Đánh giá khả năng sinh script tấn công bằng LLM thương mại
+& Prompt engineering, đánh giá định tính
+& Thiếu dataset chuẩn và đánh giá hệ thống \\
+
+Sinh exploit mức thấp
+& Liguori et al. (2022), EVIL, DualSC, ExploitGen
+& Sinh shellcode/exploit từ mô tả tự nhiên
+& NMT, Transformer, CodeBERT, dual learning
+& Tập trung vào exploitation; không bao quát PowerShell và kill chain rộng \\
+
+Sinh PowerShell từ NL intent
+& Liguori et al. (WOOT 2024)
+& Sinh PowerShell tấn công phục vụ red teaming
+& Domain-adaptive pretraining và fine-tuning; đánh giá tĩnh và động
+& Phụ thuộc fine-tuning; chưa tích hợp retrieval (RAG) \\
+
+\bottomrule
+\end{tabularx}
+
+\end{sidewaystable}
+
+
+
+
+
+Từ phân tích trên có thể thấy rằng, mặc dù đã có những tiến bộ đáng kể trong cả hai hướng phòng thủ và sinh exploit, bài toán sinh PowerShell tấn công từ mô tả ngôn ngữ tự nhiên vẫn còn nhiều không gian nghiên cứu. Đặc biệt, việc tích hợp cơ chế truy xuất tri thức (retrieval-augmented generation) nhằm cung cấp ngữ cảnh có căn cứ cho mô hình sinh có thể giúp giảm hiện tượng sinh lệnh không hợp lệ hoặc sai ngữ nghĩa, đồng thời cải thiện tính tái lập và khả năng mở rộng trong các kịch bản đánh giá chuẩn hóa.
+
+
+
+%----------------------------------------------------------------------------------------
+%	SECTION 3
+%----------------------------------------------------------------------------------------
+
+\section{Mục tiêu, đối tượng và phạm vi nghiên cứu}
+\subsection{Mục tiêu nghiên cứu}
+
+Mục tiêu tổng quát của đề tài là nghiên cứu và xây dựng một hệ thống tự động hóa việc sinh mã PowerShell tấn công từ mô tả ngôn ngữ tự nhiên, nhằm hỗ trợ các chuyên gia an ninh mạng trong các hoạt động kiểm thử an ninh mạng và giả lập đối thủ. Để đạt được mục tiêu này, đề tài tập trung giải quyết các nhiệm vụ cụ thể sau:
+\begin{itemize}
+\item Xây dựng bộ dữ liệu chuẩn hóa: Tạo lập hai bộ dữ liệu chuyên biệt cho miền bảo mật PowerShell, bao gồm bộ dữ liệu tiền huấn luyện từ mã nguồn mở và bộ dữ liệu tinh chỉnh chất lượng cao được gán nhãn theo các kỹ thuật tấn công thực tế.
+\item Tinh chỉnh mô hình sinh mã: Áp dụng chiến lược huấn luyện hai giai đoạn (Pre-training và Fine-tuning) trên các mô hình NMT tiên tiến (CodeT5+, CodeGPT, CodeGen) để chuyển đổi chính xác ý định tấn công từ tiếng Anh sang mã lệnh PowerShell.
+\item Giải quyết vấn đề cập nhật tri thức: Đề xuất và triển khai kiến trúc RACG nhằm khắc phục tính đóng của tri thức trong các mô hình NMT truyền thống, cho phép hệ thống cập nhật các kỹ thuật tấn công mới mà không cần huấn luyện lại toàn bộ mô hình.
+\item Đánh giá toàn diện: Thiết lập khung đánh giá đa chiều bao gồm đánh giá độ tương đồng văn bản, phân tích tĩnh, cú pháp và phân tích động (hành vi thực thi) để đảm bảo mã sinh ra không chỉ đúng cú pháp mà còn hoạt động hiệu quả trong môi trường thực tế.
+\end{itemize}
+
+\subsection{Đối tượng nghiên cứu}
+
+Đối tượng nghiên cứu của đề tài bao gồm ba thành phần chính. Đầu tiên là các mã lệnh PowerShell được sử dụng trong tấn công mạng (Offensive PowerShell), đặc biệt là các mã độc phi mã có khả năng thực thi trực tiếp trên bộ nhớ để lẩn tránh sự phát hiện của các giải pháp bảo mật truyền thống. Thứ hai là các kiến trúc mô hình NMT hỗ trợ sinh mã nguồn, bao gồm các mô hình Encoder-Decoder (như CodeT5+) và Decoder-only (như CodeGPT, CodeGen), được xem xét về khả năng học ngữ nghĩa và cú pháp của ngôn ngữ lập trình. Thứ ba là kỹ thuật Truy xuất tăng cường áp dụng cho mã nguồn, cụ thể là cơ chế truy xuất ngữ cảnh từ kho tri thức bên ngoài để hỗ trợ quá trình sinh mã tại thời điểm suy luận.
+
+\subsection{Phạm vi nghiên cứu}
+
+Phạm vi nghiên cứu của đề tài được giới hạn cụ thể về nền tảng, kỹ thuật và phương pháp đánh giá. Về nền tảng, nghiên cứu chỉ tập trung vào mã lệnh PowerShell hoạt động trên hệ điều hành Windows, môi trường mục tiêu phổ biến nhất của các cuộc tấn công mạng hiện nay. Về kỹ thuật tấn công, các kịch bản sinh mã được giới hạn trong khuôn khổ của khung tham chiếu MITRE ATT\&CK, bao phủ 12 trên tổng số 14 chiến thuật tiêu chuẩn của chuỗi tấn công mạng, đảm bảo tính đại diện cho các hành vi thực tế của tin tặc. Về phương pháp đánh giá, chất lượng mã sinh ra được kiểm chứng qua hai tầng: phân tích tĩnh sử dụng công cụ PSScriptAnalyzer để kiểm tra tính tuân thủ cú pháp, và phân tích động thực hiện trong môi trường sandbox cô lập để giám sát hành vi thực thi thông qua các sự kiện hệ thống được ghi nhận bởi Sysmon.
+
+%----------------------------------------------------------------------------------------
+%	SECTION 4
+%----------------------------------------------------------------------------------------
+
+\section{Phương pháp nghiên cứu}
+
+Để giải quyết bài toán phức tạp về tự động hóa sinh mã tấn công, đồ án áp dụng phương pháp nghiên cứu thực nghiệm dựa trên một quy trình khép kín và chặt chẽ, bao gồm ba giai đoạn liên kết hữu cơ là thu thập dữ liệu, huấn luyện mô hình và đánh giá đa chiều. Giai đoạn đầu tiên tập trung vào việc xây dựng nguồn nguyên liệu chất lượng cao cho các mô hình học máy, được triển khai theo hai nhánh song song nhằm phục vụ các mục đích huấn luyện khác nhau. Đối với việc học cú pháp và cấu trúc ngôn ngữ tổng quát, nghiên cứu tiến hành thu thập quy mô lớn mã nguồn PowerShell từ kho lưu trữ GitHub, áp dụng các kỹ thuật lọc nhiễu và chuẩn hóa để tạo ra tập dữ liệu tiền huấn luyện gồm khoảng 90.000 mẫu sạch. Song song đó, để mô hình nắm bắt được ngữ nghĩa của các hành vi tấn công, nhóm tác giả đã biên soạn và gán nhãn thủ công một tập dữ liệu tinh chỉnh chuyên biệt từ các nguồn bảo mật uy tín như Atomic Red Team và Stockpile, đảm bảo sự bao phủ rộng khắp trên 12 chiến thuật của khung MITRE ATT\&CK.
+
+Trên nền tảng dữ liệu đã xây dựng, giai đoạn thứ hai triển khai chiến lược huấn luyện hai bước áp dụng lên các kiến trúc NMT tiên tiến như CodeT5+, CodeGPT và CodeGen. Quá trình bắt đầu với bước tiền huấn luyện thích ứng miền để chuyển giao tri thức ngôn ngữ, sau đó đi sâu vào bước tinh chỉnh trên dữ liệu gán nhãn để chuyên biệt hóa khả năng sinh mã tấn công. Điểm đặc biệt trong phương pháp luận của đề tài là việc tích hợp kiến trúc RACG sử dụng mô hình nhúng Jina Code V2, cho phép hệ thống truy xuất ngữ cảnh động từ kho tri thức "Programming Solutions" bên ngoài tại thời điểm suy luận, qua đó khắc phục hạn chế về tri thức tĩnh của các phương pháp huấn luyện truyền thống. Cuối cùng, để khẳng định tính khả thi của mã sinh ra, nghiên cứu thiết lập hệ thống đánh giá ba lớp toàn diện, vượt qua các chỉ số tương đồng văn bản thông thường như BLEU hay METEOR. Trọng tâm của giai đoạn đánh giá nằm ở phân tích thực thi động trong môi trường sandbox cô lập, nơi các hành vi của mã sinh ra được giám sát chặt chẽ bởi công cụ Sysmon để xác minh khả năng tái hiện chính xác chuỗi tấn công thực tế so với mã gốc.
+
+%----------------------------------------------------------------------------------------
+%	SECTION 5
+%----------------------------------------------------------------------------------------
+
+\section{Những điểm mới của đề tài}
+
+Điểm đóng góp quan trọng nhất của đồ án là việc đề xuất và triển khai kiến trúc Code-RAG-Bench dựa trên kỹ thuật RACG, nhằm khắc phục hạn chế cốt tử về tính đóng của tri thức trong các mô hình sinh mã truyền thống. Khác với các phương pháp trước đây hoàn toàn phụ thuộc vào tri thức tĩnh được nén trong tham số mô hình sau quá trình tinh chỉnh, hệ thống đề xuất tích hợp mô hình nhúng Jina Code V2, cho phép truy xuất ngữ cảnh động từ kho dữ liệu bên ngoài ngay tại thời điểm suy luận. Cách tiếp cận này giải quyết triệt để vấn đề chi phí và thời gian khi phải huấn luyện lại mô hình mỗi khi xuất hiện các kỹ thuật tấn công hoặc thư viện mới.
+
+Điểm mới thứ hai là việc xây dựng và chuẩn hóa kho tri thức truy xuất (Corpus) chuyên biệt theo định dạng "Programming Solutions". Thay vì sử dụng dữ liệu thô, nhóm nghiên cứu đã cấu trúc lại dữ liệu thành các cặp bài toán - giải pháp, bao gồm tiêu đề kỹ thuật, mô tả ngữ cảnh phong phú và mã thực thi PowerShell hoàn chỉnh được ánh xạ theo khung MITRE ATT\&CK. Cấu trúc dữ liệu đặc thù này giúp tối ưu hóa độ tương đồng ngữ nghĩa giữa ý định tấn công bằng ngôn ngữ tự nhiên và mã lệnh thực thi, thu hẹp khoảng cách ngữ nghĩa (semantic gap) mà các bộ dữ liệu lập trình tổng quát thường gặp phải.
+
+Cuối cùng, đồ án thiết lập một tiêu chuẩn đánh giá mở rộng, bổ sung các chỉ số đo lường hiệu năng truy xuất thông tin (Information Retrieval metrics) như NDCG@10, Recall@10 và MRR vào quy trình kiểm thử. Kết quả thực nghiệm chứng minh hệ thống có khả năng định vị chính xác mã nguồn mục tiêu trong Top-10 kết quả trả về với tỷ lệ tuyệt đối, khẳng định tính khả thi của kiến trúc RACG trong việc duy trì tính thời sự và độ chính xác cho các hệ thống sinh mã tấn công tự động. 
+
+
+%----------------------------------------------------------------------------------------
+%	SECTION 6
+%----------------------------------------------------------------------------------------
+\section{Cấu trúc đồ án chuyên ngành}
+
+Nội dung của khóa luận được tổ chức thành năm chương với cấu trúc như sau:
+
+\begin{itemize}
+
+    \item \textbf{Chương~\ref{Chapter1}: \nameref{Chapter1}}
+    \newline
+    Chương này trình bày tổng quan về bài toán nghiên cứu, bao gồm lý do lựa chọn đề tài, các công trình nghiên cứu liên quan trong và ngoài nước, mục tiêu, đối tượng và phạm vi nghiên cứu, phương pháp nghiên cứu, cũng như những đóng góp và điểm mới của khóa luận. Chương này đóng vai trò định hướng toàn bộ nội dung và cách tiếp cận của nghiên cứu.
+
+    \item \textbf{Chương~\ref{Chapter2}: \nameref{Chapter2}}  
+    \newline
+    Trình bày các kiến thức nền tảng về Offensive PowerShell, mã độc phi mã và vai trò của chúng trong kiểm thử xâm nhập. Chương này cũng cung cấp cơ sở lý thuyết về NMT với các kiến trúc Transformer, cũng như tổng quan về kỹ thuật Truy xuất tăng cường được áp dụng trong bài toán.
+
+    \item \textbf{Chương~\ref{Chapter3}: \nameref{Chapter3}}  
+    \newline
+    Mô tả chi tiết quy trình thu thập và chuẩn hóa hai bộ dữ liệu chuyên biệt (tiền huấn luyện và tinh chỉnh) và thiết kế chiến lược huấn luyện hai giai đoạn cho các mô hình CodeT5+, CodeGPT, CodeGen. Chương này cũng trình bày kiến trúc hệ thống RACG, cách thức xây dựng kho tri thức truy xuất và cơ chế tích hợp ngữ cảnh động.
+
+    \item \textbf{Chương~\ref{Chapter4}: \nameref{Chapter4}}  
+    \newline
+    Báo cáo thiết lập môi trường thực nghiệm và kết quả đánh giá toàn diện trên ba tầng: độ tương đồng văn bản, phân tích tĩnh (cú pháp, cảnh báo) và phân tích thực thi động trong sandbox. Chương này cũng phân tích hiệu năng truy xuất của hệ thống RAG thông qua các chỉ số như NDCG, Recall và thảo luận về các trường hợp sinh mã cụ thể.
+
+    \item \textbf{Chương~\ref{Chapter5}: \nameref{Chapter5}}  
+    \newline
+    Tổng kết các kết quả đạt được, khẳng định tính ưu việt của phương pháp đề xuất so với các mô hình truyền thống trong việc cập nhật tri thức mới. Đồng thời, chương này chỉ ra các hạn chế còn tồn tại về dữ liệu hoặc tốc độ xử lý và đề xuất các hướng phát triển tương lai như cải thiện kỹ thuật làm mờ mã.
+
+\end{itemize}
+
+
+
+
+
+
+%----------------------------------------------------------------------------------------
+%	SECTION 2
+%----------------------------------------------------------------------------------------

@@ -36,11 +36,17 @@ class DebateConfig(BaseModel):
     max_exec_retries: int = 1
     max_verify_retries: int = 1
     per_bug_wall_clock_s: int = 600
+    skip: bool = False  # ablation flag: bypass Red↔Blue, exec runs directly from dossier
+
+
+class HuntConfig(BaseModel):
+    seeder_enabled: bool = True  # ablation flag: disable deterministic seeding
 
 
 class VerifierConfig(BaseModel):
     count: int = 3
     temperature: float = 0.0
+    skip_proofgate: bool = False  # ablation: true → panel majority vote is final, ProofGate disabled
 
     @classmethod
     def model_post_init(cls, __context):
@@ -88,6 +94,7 @@ class MemoryConfig(BaseModel):
 class AppConfig(BaseModel):
     llm: LlmConfig = Field(default_factory=LlmConfig)
     debate: DebateConfig = Field(default_factory=DebateConfig)
+    hunt: HuntConfig = Field(default_factory=HuntConfig)
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     recon: ReconConfig = Field(default_factory=ReconConfig)

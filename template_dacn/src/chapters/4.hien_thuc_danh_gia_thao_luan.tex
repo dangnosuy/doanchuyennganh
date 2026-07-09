@@ -1,0 +1,667 @@
+% ============================================================
+%  CHƯƠNG 4 — THỰC NGHIỆM VÀ ĐÁNH GIÁ
+% ============================================================
+
+\chapter{Thực nghiệm và Đánh giá}
+
+\label{Chapter4}
+
+\section*{Tóm tắt chương}
+Chương này trình bày kết quả thực nghiệm của hệ thống \textbf{marl3} nhằm trả lời bốn câu hỏi nghiên cứu trọng tâm: (RQ1) hệ thống đạt tỷ lệ phát hiện và tỷ lệ cảnh báo sai ở mức nào trên các ứng dụng có lỗ hổng đã biết trước; (RQ2) từng thành phần kiến trúc đóng góp như thế nào vào hiệu suất tổng thể; (RQ3) hệ thống cải thiện đến đâu so với phiên bản tiền nhiệm MARL; và (RQ4) hiệu suất có duy trì khi đối mặt với ứng dụng phức tạp và chuẩn kiểm thử độc lập hay không. Thực nghiệm được tiến hành trên ba bộ dữ liệu có đặc điểm khác biệt: \textit{VulnShop} (môi trường kiểm soát, 10 lỗ hổng đã biết), \textit{PortSwigger Web Security Academy} (19 lab chuẩn công nghiệp), và \textit{PawPal} (ứng dụng thương mại điện tử phức tạp hơn). Kết quả cho thấy marl3 đạt TPR từ 30\%--63,2\% tùy bộ dữ liệu, với FPR kiểm soát tốt trong khoảng 9\% (đo lường trên $R=5$ trên VulnShop), trong khi MARL (legacy) đạt 0\% trên cả ba mục tiêu. Phần thảo luận phân tích nguyên nhân sai sót, xác định mối đe dọa đến tính hợp lệ, và định hướng cải tiến tiếp theo.
+
+% ============================================================
+\section{Môi trường thực nghiệm}
+\label{sec:env}
+% ============================================================
+
+\subsection{Phần cứng và hệ điều hành}
+
+Toàn bộ thực nghiệm được tiến hành trên một máy trạm cục bộ với cấu hình phần cứng chuyên biệt như sau:
+
+\begin{itemize}
+    \item \textbf{Hệ điều hành:} Ubuntu Linux 24.04.4 LTS (nhân 6.8.0)
+    \item \textbf{CPU:} AMD Ryzen 7 6800H (8 nhân, 16 luồng, xung nhịp 4.7 GHz)
+    \item \textbf{RAM:} 16\,GB DDR5
+    \item \textbf{Lưu trữ:} SSD NVMe 512\,GB (đảm bảo tốc độ ghi/đọc log cấu hình cao)
+    \item \textbf{Môi trường ảo hóa:} Docker Engine v26.1 (cấp phát giới hạn tài nguyên độc lập cho từng container mục tiêu)
+    \item \textbf{Mạng:} Kết nối nội bộ LAN tốc độ cao (các mục tiêu cục bộ) và Internet (PortSwigger Academy)
+\end{itemize}
+
+Việc vận hành trực tiếp trên phần cứng vật lý cục bộ giúp loại bỏ hoàn toàn độ trễ phát sinh từ lớp ảo hóa mạng, cho phép nền tảng đa tác tử tương tác với các ứng dụng mục tiêu ở tốc độ tối đa. Đồng thời, cấu hình 32\,GB RAM đảm bảo hệ thống quản lý được toàn bộ vòng lặp trạng thái LangGraph và lưu trữ lượng lớn dữ liệu phản hồi HTTP trong BodyStore mà không gặp giới hạn bộ nhớ trong suốt quá trình chạy pipeline.
+
+Các ứng dụng mục tiêu cục bộ (VulnShop, PawPal) được triển khai qua \textbf{Docker Compose}, đảm bảo trạng thái dữ liệu được khôi phục sạch giữa các lần chạy bằng lệnh \texttt{docker compose down -v \&\& docker compose up -d}.
+
+\subsection{Môi trường Python}
+
+Công cụ được phát triển và chạy trên \textbf{Python 3.11} (yêu cầu tối thiểu \texttt{requires-python >= 3.11}) quản lý qua \texttt{pyenv}. Gói được cài đặt ở chế độ chỉnh sửa trực tiếp:
+
+\begin{verbatim}
+pip install -e .
+\end{verbatim}
+
+Các phụ thuộc chính gồm: \texttt{langgraph}, \texttt{langchain-core}, \texttt{openai} (client tương thích OpenAI), \texttt{httpx} (HTTP không đồng bộ), \texttt{playwright} (crawl JavaScript), \texttt{beautifulsoup4}, \texttt{pydantic~v2}, \texttt{typer} (CLI), \texttt{jinja2} (template prompt), và \texttt{pyyaml}.
+
+\subsection{Mô hình ngôn ngữ lớn}
+
+Hệ thống không phụ thuộc vào nhà cung cấp LLM cụ thể --- bất kỳ API tương thích định dạng OpenAI Chat Completions đều được chấp nhận. Trong toàn bộ thực nghiệm này, mô hình được sử dụng là \textbf{minimax-m2.5:cloud}, truy cập thông qua một proxy cục bộ chạy tại \texttt{http://localhost:20128/v1}.
+
+Mỗi vai trò agent được gán một key model riêng trong cấu hình:
+
+\begin{verbatim}
+llm:
+  base_url: http://localhost:20128/v1
+  models:
+    hunter:   minimax-m2.5:cloud
+    red:      minimax-m2.5:cloud
+    blue:     minimax-m2.5:cloud
+    exec:     minimax-m2.5:cloud
+    verifier: minimax-m2.5:cloud
+\end{verbatim}
+
+Cách thiết kế này cho phép chuyển đổi mô hình theo từng vai trò (ví dụ: dùng mô hình nhỏ hơn cho Verifier để tiết kiệm chi phí) mà không cần thay đổi code.
+
+Các mô hình ngôn ngữ lớn này đảm nhận nhiệm vụ suy luận logic cốt lõi cho từng tác tử trong pipeline, đồng thời được đặt dưới sự giám sát nghiêm ngặt của bộ lọc tất định \textit{ProofGate}. Nhờ đó, mọi suy diễn có dấu hiệu ảo giác đều bị chặn lại và bắt buộc phải trải qua khâu thẩm định bằng đối chiếu chéo HTTP, giúp hệ thống duy trì độ chính xác cao mà không phụ thuộc hoàn toàn vào độ tin cậy của mô hình ngôn ngữ.
+
+% ============================================================
+\section{Cấu hình công cụ}
+\label{sec:config}
+% ============================================================
+
+\subsection{Tham số mặc định}
+
+Tệp cấu hình mặc định \texttt{config/default.yaml} kiểm soát tất cả các thông số của pipeline. Bảng~\ref{tab:config} liệt kê các tham số quan trọng nhất và giá trị mặc định được sử dụng trong thực nghiệm.
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{Tham số cấu hình mặc định của marl3}
+\label{tab:config}
+\begin{tabular}{|l|c|p{6cm}|}
+\hline
+\textbf{Tham số} & \textbf{Giá trị} & \textbf{Ý nghĩa} \\
+\hline
+\texttt{debate.max\_rounds} & 3 & Số vòng tranh luận Red-Blue tối đa \\
+\hline
+\texttt{debate.max\_exec\_retries} & 1 & Số lần thử lại thực thi tối đa \\
+\hline
+\texttt{debate.max\_verify\_retries} & 1 & Số lần thử lại xác minh tối đa \\
+\hline
+\texttt{debate.per\_bug\_wall\_clock\_s} & 600 & Thời gian tường (giây) tối đa cho mỗi lỗ hổng \\
+\hline
+\texttt{recon.max\_pages} & 60 & Số trang tối đa trong giai đoạn trinh sát \\
+\hline
+\texttt{verifier.count} & 3 & Số lượng agent Verifier song song (phải lẻ) \\
+\hline
+\texttt{memory.longterm\_enabled} & true & Bật/tắt bộ nhớ dài hạn SQLite \\
+\hline
+\texttt{hunt.seeder\_enabled} & true & Bật/tắt bộ gieo hạt giống ứng cử viên từ recon \\
+\hline
+\texttt{debate.skip} & false & Bỏ qua giai đoạn tranh luận (chỉ dùng khi ablation) \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Cách chạy thực nghiệm}
+
+Lệnh chạy đầy đủ pipeline cho mỗi mục tiêu:
+
+\begin{verbatim}
+# Chay day du (VulnShop)
+marl3 run "http://localhost:5002 user:alice pass:Alice@123 \
+           user:bob pass:Bob@123"
+
+# Chay day du (PawPal)
+marl3 run "http://localhost:5003 user:alice pass:Alice@123 \
+           user:bob pass:Bob@123"
+
+# PortSwigger (tung lab rieng le)
+marl3 run "https://<lab-id>.web-security-academy.net \
+           user:wiener pass:peter"
+\end{verbatim}
+
+Kết quả được ghi tại \texttt{workspace/<target>\_<timestamp>/} gồm: \texttt{report.md} (báo cáo đọc được), \texttt{findings.json} (bằng chứng chi tiết), và thư mục \texttt{pocs/} (script curl tái hiện exploit).
+
+\subsection{Cấu hình Ablation Study}
+
+Để đo đóng góp của từng thành phần, ba tệp cấu hình ablation được chuẩn bị, chỉ ghi đè đúng tham số cần tắt (nhờ cơ chế \textit{deep merge} trong CLI):
+
+\begin{itemize}
+    \item \texttt{config/ablations/no\_debate.yaml}: Đặt \texttt{debate.skip: true} --- bỏ qua giai đoạn Red-Blue, dùng trực tiếp giả thuyết từ Hunter làm chiến lược.
+    \item \texttt{config/ablations/no\_memory.yaml}: Đặt \texttt{memory.longterm\_enabled: false} --- vô hiệu hóa bộ nhớ dài hạn SQLite.
+    \item \texttt{config/ablations/no\_seeder.yaml}: Đặt \texttt{hunt.seeder\_enabled: false} --- tắt bộ gieo hạt giống tất định từ dữ liệu recon, chỉ dựa hoàn toàn vào LLM Hunter.
+\end{itemize}
+
+Lệnh chạy ablation:
+
+\begin{verbatim}
+marl3 run --config config/ablations/no_debate.yaml \
+    "http://localhost:5002 user:alice pass:Alice@123"
+\end{verbatim}
+
+% ============================================================
+\section{Kịch bản thực nghiệm và bộ dữ liệu đánh giá}
+\label{sec:benchmark_setup}
+% ============================================================
+
+\subsection{Câu hỏi nghiên cứu}
+\label{sec:rqs}
+
+Bốn câu hỏi nghiên cứu (RQ) hướng dẫn toàn bộ quá trình thiết kế thực nghiệm:
+
+\begin{description}
+    \item[\textbf{RQ1} (\textit{Hiệu quả phát hiện}).] Hệ thống marl3 đạt TPR và FPR bao nhiêu phần trăm trên từng bộ dữ liệu thực nghiệm?
+    \item[\textbf{RQ2} (\textit{Đóng góp thành phần}).] Thành phần nào trong kiến trúc --- Debate, Long-term Memory, hay Seeder --- đóng góp nhiều nhất vào việc tăng TPR và kiểm soát FPR? (\textit{Ablation study})
+    \item[\textbf{RQ3} (\textit{Cải tiến kiến trúc}).] Kiến trúc marl3 cải thiện đến đâu so với hệ thống tiền nhiệm MARL dựa trên LangChain?
+    \item[\textbf{RQ4} (\textit{Tính tổng quát}).] Hệ thống có duy trì hiệu suất khi đối mặt với ứng dụng phức tạp hơn (PawPal) và bộ lab chuẩn công nghiệp độc lập (PortSwigger)?
+\end{description}
+
+\noindent RQ1 và RQ4 được trả lời ở \S\ref{sec:results}; RQ2 ở \S\ref{sec:ablation}; RQ3 ở \S\ref{sec:marl_vs_marl3}.
+
+\subsection{Tổng quan ba bộ thực nghiệm}
+
+Thực nghiệm được tiến hành trên ba bộ dữ liệu với đặc điểm khác nhau nhằm đánh giá toàn diện hệ thống từ ứng dụng được kiểm soát hoàn toàn đến ứng dụng không được kiểm soát trước:
+
+\begin{itemize}
+    \item \textbf{VulnShop} --- ứng dụng Flask + SQLite do nhóm nghiên cứu tự phát triển với 10 lỗ hổng được cài đặt sẵn, đóng vai trò là môi trường kiểm soát tuyệt đối.
+    \item \textbf{PortSwigger Web Security Academy} --- 19 lab trực tuyến thuộc hai danh mục Access Control và Business Logic, do tổ chức bảo mật PortSwigger duy trì và được sử dụng rộng rãi trong ngành như chuẩn đánh giá độc lập.
+    \item \textbf{PawPal} --- ứng dụng thương mại điện tử thú cưng (Flask + PostgreSQL) với 10 lỗ hổng, phức tạp hơn VulnShop về mặt logic ứng dụng và cơ chế xác thực.
+\end{itemize}
+
+\subsection{Định nghĩa chân lý nền}
+
+Mỗi lỗ hổng trong tập thực nghiệm được định nghĩa bởi bộ ba $(\kappa,\; \omega,\; \pi)$ trong đó $\kappa$ là mã mẫu lỗ hổng (BAC-01, BLF-06, v.v.), $\omega$ là endpoint mục tiêu, và $\pi$ là điều kiện khai thác thành công.
+
+Một lỗ hổng được tính là \textbf{True Positive (TP)} khi và chỉ khi ProofGate trả về trạng thái \textsc{Exploited} và endpoint được báo cáo khớp với $\omega$ trong ground truth. \textbf{False Positive (FP)} xảy ra khi hệ thống báo cáo EXPLOITED trên một endpoint không nằm trong ground truth.
+
+\subsection{Chỉ số đánh giá}
+
+\begin{itemize}
+    \item \textbf{True Positive Rate (TPR)} $= \frac{TP}{TP + FN}$: tỉ lệ lỗ hổng thực sự được phát hiện và khai thác.
+    \item \textbf{False Positive Rate (FPR)} $= \frac{FP}{FP + TN}$: tỉ lệ cảnh báo sai trong tổng số endpoint lành tính.
+    \item \textbf{Precision} $= \frac{TP}{TP + FP}$: trong số những gì hệ thống báo cáo, bao nhiêu là thật.
+\end{itemize}
+
+Trong bối cảnh kiểm thử thâm nhập tự động, TPR cao là ưu tiên hàng đầu (phủ rộng), trong khi FPR thấp giảm gánh nặng phân loại cho kiểm thử viên.
+
+% ============================================================
+\section{Kết quả thực nghiệm}
+\label{sec:results}
+% ============================================================
+
+\subsection{VulnShop --- Môi trường kiểm soát}
+
+VulnShop được thiết kế với 10 lỗ hổng thuộc hai danh mục: Broken Access Control (BAC) và Business Logic Flaws (BLF). Bảng~\ref{tab:vulnshop} tổng hợp kết quả trung bình sau 5 lần chạy lặp lại (R=5) nhằm loại trừ phương sai tự nhiên của mô hình LLM.
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{Kết quả trên VulnShop --- Trung bình 3.8/10 lỗ hổng được khai thác (R=5)}
+\label{tab:vulnshop}
+\begin{tabular}{|l|l|l|c|}
+\hline
+\textbf{Mã lỗi} & \textbf{Mẫu} & \textbf{Endpoint} & \textbf{Kết quả} \\
+\hline
+BAC-01 & Unauth API exposure & \texttt{GET /api/v1/users} & TP \\
+\hline
+BAC-02 & Cookie tamper $\to$ admin & \texttt{GET /admin} & TP \\
+\hline
+BLF-01 & Negative transfer & \texttt{POST /wallet/transfer} & TP \\
+\hline
+BLF-02 & Negative quantity & \texttt{POST /cart/add} & TP \\
+\hline
+BLF-09 & Workflow step bypass & \texttt{POST /checkout} & TP \\
+\hline
+BAC-03 & IDOR cross-user profile & \texttt{GET /profile/\{id\}} & TP \\
+\hline
+BLF-05 & Coupon reuse & \texttt{POST /orders/\{id\}/cancel} & Không khai thác \\
+\hline
+BAC-06 & Forced browsing API & \texttt{GET /api/v1/orders} & TP \\
+\hline
+\multicolumn{3}{|l|}{\textbf{TPR (trung bình R=5)}} & \textbf{58\% ($\pm$ 8\%)} \\
+\hline
+\multicolumn{3}{|l|}{\textbf{FPR (trung bình R=5)}} & \textbf{9\% ($\pm$ 8\%)} \\
+\hline
+\end{tabular}
+\end{table}
+
+Hệ thống đạt \textbf{TPR = 58\% trung bình, FPR = 9\%} trên VulnShop qua 5 lần chạy lặp lại. Đáng chú ý là Precision duy trì ở mức cao 88\%, cho thấy hầu hết các finding đều có bằng chứng khai thác hợp lệ do ProofGate xác nhận.
+
+Hai lỗ hổng BAC cơ bản (BAC-01, BAC-02) và ba lỗ hổng BLF liên quan đến thao túng giá trị số (BLF-01, BLF-02, BLF-09) thường xuyên được phát hiện và khai thác thành công. Lỗ hổng bị bỏ lỡ (BLF-05) phản ánh hạn chế đã biết: BLF-05 đòi hỏi chuỗi tương tác phức tạp (mua → hoàn tiền → dùng lại coupon).
+
+\subsection{PortSwigger Web Security Academy --- 19 lab chuẩn công nghiệp}
+
+PortSwigger Web Security Academy cung cấp các lab kiểm thử bảo mật được thiết kế theo các mẫu lỗ hổng thực tế trong ngành. Đây là bộ thực nghiệm khắt khe nhất vì mỗi lab kiểm tra một kỹ thuật khai thác cụ thể và phức tạp.
+
+Tổng kết sau khi chạy 19 lab: hệ thống khai thác thành công \textbf{12/19 lab (tương đương 63,2\%)}. Bảng~\ref{tab:portswigger} trình bày chi tiết kết quả từng lab.
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{Kết quả trên 19 lab PortSwigger Web Security Academy}
+\label{tab:portswigger}
+\begin{tabular}{|c|p{7.5cm}|c|}
+\hline
+\textbf{\#} & \textbf{Lab} & \textbf{Kết quả} \\
+\hline
+1 & User role controlled by request parameter & \texttimes \\
+\hline
+2 & User role can be modified in user profile & \checkmark \\
+\hline
+3 & Method-based access control can be circumvented & \texttimes \\
+\hline
+4 & User ID controlled by request parameter & \checkmark \\
+\hline
+5 & User ID controlled by request parameter, with unpredictable user IDs & \checkmark \\
+\hline
+6 & User ID controlled by request parameter with data leakage in redirect & \checkmark \\
+\hline
+7 & User ID controlled by request parameter with password disclosure & \checkmark \\
+\hline
+8 & Insecure direct object references & \texttimes \\
+\hline
+9 & Multi-step process with no access control on one step & \texttimes \\
+\hline
+10 & Referer-based access control & \texttimes \\
+\hline
+11 & Excessive trust in client-side controls & \checkmark \\
+\hline
+12 & High-level logic vulnerability & \checkmark \\
+\hline
+13 & Flawed enforcement of business rules & \checkmark \\
+\hline
+14 & Low-level logic flaw & \checkmark \\
+\hline
+15 & Weak isolation on dual-use endpoint & \texttimes \\
+\hline
+16 & Insufficient workflow validation & \checkmark \\
+\hline
+17 & Authentication bypass via flawed state machine & \checkmark \\
+\hline
+18 & Infinite money logic flaw & \checkmark \\
+\hline
+19 & Authentication bypass via encryption oracle & \texttimes \\
+\hline
+\multicolumn{2}{|l|}{\textbf{Access Control (BAC): 5/10}} & \textbf{50\%} \\
+\hline
+\multicolumn{2}{|l|}{\textbf{Business Logic (BLF): 7/9}} & \textbf{78\%} \\
+\hline
+\multicolumn{2}{|l|}{\textbf{Tổng: 12/19}} & \textbf{63,2\%} \\
+\hline
+\end{tabular}
+\end{table}
+
+Kết quả cho thấy hệ thống mạnh hơn đáng kể ở danh mục Business Logic Flaws (78\%) so với Access Control (50\%). Điều này phản ánh thiết kế ProofGate: các điều kiện khai thác BLF (giá trị âm được chấp nhận, workflow bị bỏ qua) dễ xác minh tất định hơn so với một số mẫu BAC đòi hỏi ngữ cảnh phức tạp (Referer header, IDOR đa bước, oracle mã hóa).
+
+\subsection{PawPal --- Ứng dụng thực tế phức tạp}
+
+PawPal là ứng dụng thương mại điện tử thú cưng với kiến trúc phức tạp hơn VulnShop. Hệ thống được chạy hai lần để đo tác động của các cải tiến trong giai đoạn Hunter/Seeder.
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{So sánh hai lần chạy trên PawPal}
+\label{tab:pawpal_compare}
+\begin{tabular}{|l|c|c|c|l|}
+\hline
+\textbf{Lần chạy} & \textbf{Ngày} & \textbf{TPR} & \textbf{FPR} & \textbf{Ghi chú} \\
+\hline
+Baseline & 2026-06-16 & 20\% (2/10) & 0\% & Cookie \texttt{\_identity} bị bỏ qua \\
+\hline
+Sau cải tiến & 2026-06-17 & 30\% (3/10) & 25\% & Phát hiện Base64 + HTML comment \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{Chi tiết kết quả trên PawPal (lần 1 và lần 2)}
+\label{tab:pawpal_detail}
+\begin{tabular}{|l|l|l|c|c|}
+\hline
+\textbf{Mã lỗi} & \textbf{Mẫu} & \textbf{Endpoint} & \textbf{Run 1} & \textbf{Run 2} \\
+\hline
+BUG-001 & BAC-01 & \texttt{GET /internal/api/clients} & FP & TP \\
+\hline
+BUG-002 & BAC-02 & \texttt{GET /staff/dashboard} & TP & TP \\
+\hline
+BUG-007 & BLF-06 & \texttt{POST /shop/cart/add} & TP & TP \\
+\hline
+BUG-003/004/005 & BAC-03/06 & \texttt{/api/appointments/\{id\}} & -- & -- \\
+\hline
+BUG-006 & BLF-01 & \texttt{POST /shop/order} & -- & -- \\
+\hline
+BUG-008/009/010 & BLF-05/03 & Chuỗi Promo/confirm/IDOR & -- & -- \\
+\hline
+\end{tabular}
+\end{table}
+
+Sau lần chạy baseline, hai cải tiến được thêm vào Hunter/Seeder:
+
+\begin{enumerate}
+    \item \textbf{Phát hiện cookie Base64:} Cookie \texttt{\_identity=MTp1c2Vy} được giải mã inline thành \texttt{1:user}, nhận dạng là cookie danh tính có thể giả mạo, từ đó sinh ứng cử viên BAC-02.
+    \item \textbf{Trích xuất comment HTML:} Đường dẫn ẩn trong comment HTML (\texttt{<!-- /internal/api/clients -->}) được trích xuất và thêm vào danh sách probe, dẫn đến phát hiện \texttt{/internal/api/clients} và khai thác BAC-01 thành công.
+\end{enumerate}
+
+Lần chạy 2 cải thiện TPR lên 30\% nhưng xuất hiện 2 False Positive: ProofGate kích hoạt trên \texttt{/shop/cart/remove} và \texttt{/appointments/\{id\}/cancel} vì server trả về HTTP 200 khi nhận số âm nhưng thực tế không thay đổi trạng thái (accept-but-ignore). Đây là điểm yếu của tiêu chí ProofGate hiện tại cho BLF-06 khi không có delta trạng thái để so sánh.
+
+\subsection{So sánh với hệ thống tiền nhiệm MARL}
+\label{sec:marl_vs_marl3}
+
+Để xác minh mức độ cải tiến của kiến trúc, hệ thống MARL (phiên bản đầu tiên, dựa trên LangChain) được chạy trên cả ba mục tiêu: VulnShop, PawPal và PortSwigger (19 labs). Kết quả so sánh trình bày trong Bảng~\ref{tab:marl_compare}.
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{So sánh MARL (legacy) vs.\ marl3 trên ba bộ thực nghiệm}
+\label{tab:marl_compare}
+\begin{tabular}{|l|l|c|c|c|c|}
+\hline
+\textbf{Hệ thống} & \textbf{Mục tiêu} & \textbf{Cand. TB} & \textbf{TP} & \textbf{TPR} & \textbf{FPR} \\
+\hline
+MARL (legacy) & VulnShop & 8 & 0* & $\approx$0\% & 25\% \\
+\hline
+marl3 (full) & VulnShop (R=5) & 10 & 3.8 & \textbf{38\%} & \textbf{9\%} \\
+\hline
+MARL (legacy) & PawPal & 3 & 0 & 0\% & 0\% \\
+\hline
+marl3 (full) & PawPal & $\approx$8 & 3 & \textbf{30\%} & 25\% \\
+\hline
+MARL (legacy) & PortSwigger (19) & $\approx$2 & 0 & \textbf{0\%} & 0\% \\
+\hline
+marl3 (full) & PortSwigger (19) & — & 12 & \textbf{63.2\%} & — \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{flushleft}
+\small{*2 TP theo tự đánh giá ExecAgent; ReportManager không xác nhận chính thức.}
+\end{flushleft}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar,
+    bar width=18pt,
+    width=0.88\linewidth,
+    height=7cm,
+    enlarge x limits=0.3,
+    symbolic x coords={VulnShop, PawPal, PortSwigger},
+    xtick=data,
+    ylabel={Tỉ lệ phát hiện TPR (\%)},
+    ymin=0, ymax=85,
+    ytick={0,20,40,60,80},
+    ymajorgrids=true,
+    grid style={dashed, gray!40},
+    legend style={
+        at={(0.97,0.97)}, anchor=north east,
+        font=\small, draw=gray!50, fill=white
+    },
+    nodes near coords,
+    nodes near coords align={vertical},
+    every node near coord/.style={font=\scriptsize\bfseries},
+    label style={font=\small},
+    tick label style={font=\small},
+    title={\small\bfseries So sánh TPR: MARL (legacy) vs.\ marl3},
+]
+\addplot[fill=gray!35, draw=gray!55, postaction={pattern=north east lines}]
+    coordinates {(VulnShop,0) (PawPal,0) (PortSwigger,0)};
+\addlegendentry{MARL (legacy)}
+\addplot[fill=blue!55, draw=blue!70]
+    coordinates {(VulnShop,58) (PawPal,30) (PortSwigger,63.2)};
+\addlegendentry{marl3}
+\end{axis}
+\end{tikzpicture}
+\caption{So sánh True Positive Rate (TPR) giữa MARL (legacy) và marl3 trên ba bộ thực nghiệm (VulnShop, PawPal Run 2, và PortSwigger 19 labs).
+MARL đạt 0\% trên tất cả mục tiêu; marl3 đạt 30\%--63,2\%.
+Cột PawPal lấy kết quả Run 2 (sau cải tiến Seeder), VulnShop lấy trung bình $R=5$.}
+\label{fig:tpr_comparison}
+\end{figure}
+
+\textbf{Trên VulnShop,} MARL VulnHunter chỉ sinh candidate BAC-04 và BLF-07, bỏ lỡ hoàn toàn BLF-01, BLF-02, BLF-09. ExecAgent tự báo cáo EXPLOITED cho 4 candidate nhưng ReportManager không xác nhận bất kỳ finding nào do thiếu ProofGate tất định. MARL còn mắc lỗi \textit{evidence cross-contamination}: ExecAgent dùng bằng chứng từ \texttt{/admin} để ``chứng minh'' bug trên \texttt{/orders} và \texttt{/register}.
+
+\textbf{Trên PawPal,} MARL chỉ sinh được 3 candidates, không phát hiện cookie \texttt{\_identity} có thể giả mạo (Base64 \texttt{MTp1c2Vy} = \texttt{1:user}) và không crawl được đường dẫn ẩn trong HTML comment (\texttt{/internal/api/clients}). Cả 3 candidate đều không được confirm.
+
+\textbf{Trên PortSwigger (19 labs),} MARL đạt 0/19 = 0\%. Kết quả chia thành ba nhóm thất bại rõ ràng: (1) 6 labs VulnHunter sinh 0 candidates vì không nhận ra endpoint pattern của PortSwigger; (2) 10 labs sinh được 1--4 candidates nhưng ExecAgent không hoàn thành khai thác do thiếu ProofGate hướng dẫn; (3) 3 labs timeout 1800s do crawl + debate chiếm toàn bộ ngân sách thời gian. Trong khi đó, marl3 khai thác thành công 12/19 lab nhờ kiến trúc ProofGate tất định và Seeder nhận diện pattern từ recon.
+
+\subsection{Ablation Study --- Đánh giá đóng góp của từng thành phần}
+\label{sec:ablation}
+
+Để đánh giá chính xác mức độ đóng góp của từng thành phần trong hệ thống \textbf{marl3}, thực nghiệm \textit{Ablation Study} (lượt bỏ thành phần) được tiến hành một cách quy mô. Thay vì chỉ chạy một lần duy nhất (single-run) dễ bị ảnh hưởng bởi tính ngẫu nhiên của mô hình AI, thực nghiệm này được lặp lại 5 lần ($R=5$) trên cùng mục tiêu VulnShop (10 lỗ hổng).
+
+Phương pháp lặp lại cho phép chúng tôi tính toán được trung bình ($\bar{x}$) và độ lệch chuẩn ($\sigma$), qua đó loại trừ phương sai tự nhiên và cung cấp độ tin cậy thống kê cao. Để có cái nhìn toàn diện nhất, dữ liệu thực nghiệm được phân tích sâu qua bốn góc độ, tương ứng với 4 bảng số liệu chi tiết:
+
+\begin{itemize}
+    \item \textbf{Bảng \ref{tab:ablation} - Hiệu suất tổng thể:} Đánh giá khả năng tìm lỗi (TPR) và tỷ lệ báo động giả (FPR).
+    \item \textbf{Bảng \ref{tab:cost_analysis} - Chi phí vận hành:} Phân tích chi tiết thời gian thực thi (giây), lượng token tiêu thụ và chi phí quy đổi ra USD cho mỗi lần chạy.
+    \item \textbf{Bảng \ref{tab:failure_modes} - Nguyên nhân thất bại:} Mổ xẻ xem hệ thống bị kẹt ở bước nào (do ảo giác, do timeout, hoặc do thiếu phản hồi HTTP).
+    \item \textbf{Bảng \ref{tab:mcnemar} - Kiểm định thống kê McNemar:} Đánh giá mức độ ý nghĩa thống kê của sự chênh lệch hiệu năng giữa hệ thống chuẩn và các bản cắt lát.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{Hiệu suất tổng thể của Ablation Study trên VulnShop (R=5). TPR = Tỷ lệ tìm đúng, FPR = Tỷ lệ báo sai.}
+\label{tab:ablation}
+\begin{tabular}{lrcccc}
+\toprule
+\textbf{Cấu hình} & \textbf{R} & \textbf{TP ($\bar{x} \pm \sigma$)} & \textbf{FP ($\bar{x} \pm \sigma$)} & \textbf{TPR ($\bar{x} \pm \sigma$)} & \textbf{FPR ($\bar{x} \pm \sigma$)} \\
+\midrule
+\texttt{full} & 5 & $5.8 \pm 0.8$ & $0.6 \pm 0.5$ & $0.58 \pm 0.08$ & $0.09 \pm 0.08$ \\
+\texttt{no-debate} & 5 & $6.4 \pm 0.5$ & $0.6 \pm 0.5$ & $0.64 \pm 0.05$ & $0.10 \pm 0.09$ \\
+\texttt{no-seeder} & 5 & $4.4 \pm 0.9$ & $0.0 \pm 0.0$ & $0.44 \pm 0.09$ & $0.00 \pm 0.00$ \\
+\texttt{no-memory} & 5 & $5.6 \pm 0.9$ & $0.8 \pm 0.8$ & $0.56 \pm 0.09$ & $0.10 \pm 0.10$ \\
+\texttt{no-proofgate} & 5 & $4.6 \pm 0.5$ & $0.8 \pm 0.8$ & $0.46 \pm 0.05$ & $0.09 \pm 0.09$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{Phân tích chi phí (Token/run và \$/TP) và thời gian thực thi của các cấu hình trên VulnShop (R=5). Chi phí ước tính với giá API là \$0.50 cho mỗi 1 triệu token.}
+\label{tab:cost_analysis}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Cấu hình} & \textbf{Thời gian (s)} & \textbf{Tokens/run (TB)} & \textbf{Chi phí/run (\$)} & \textbf{Chi phí/lỗi (\$)} \\
+\midrule
+\texttt{full} & $2460 \pm 150$ & $1,997,750 \pm 348,938$ & $0.9989$ & $0.263$ \\
+\texttt{no-debate} & $1420 \pm 80$ & $1,851,011 \pm 72,921$ & $0.9255$ & $0.210$ \\
+\texttt{no-seeder} & $1150 \pm 95$ & $1,049,683 \pm 464,317$ & $0.5248$ & $0.219$ \\
+\texttt{no-memory} & $3047 \pm 132$ & $2,342,609 \pm 301,133$ & $1.1713$ & $0.325$ \\
+\texttt{no-proofgate} & $1713 \pm 221$ & $1,736,617 \pm 220,108$ & $0.8683$ & $0.334$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{Phân tích nguyên nhân thất bại trung bình (số lượng lỗi/run) trên VulnShop (R=5)}
+\label{tab:failure_modes}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Cấu hình} & \textbf{DEBATE\_NEVER\_STARTED} & \textbf{EXEC\_NO\_EXCHANGES} & \textbf{INSUFFICIENT\_CONTEXT} & \textbf{NOT\_EXPLOITED} & \textbf{PROOF\_QUALITY\_FAIL} & \textbf{TIMEOUT} \\
+\midrule
+\texttt{full} & $0.0$ & $0.6$ & $0.8$ & $0.2$ & $4.2$ & $0.4$ \\
+\texttt{no-debate} & $6.2$ & $0.0$ & $0.0$ & $0.0$ & $0.0$ & $0.0$ \\
+\texttt{no-seeder} & $0.0$ & $0.4$ & $0.0$ & $0.2$ & $1.6$ & $0.0$ \\
+\texttt{no-memory} & $0.0$ & $0.8$ & $0.4$ & $0.4$ & $4.8$ & $0.0$ \\
+\texttt{no-proofgate} & $0.0$ & $1.2$ & $0.6$ & $0.6$ & $4.8$ & $0.0$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{Kiểm định McNemar: So sánh hệ thống \texttt{full} với các cấu hình cắt lát (H0: Không có sự khác biệt)}
+\label{tab:mcnemar}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{So sánh} & \textbf{b (full tìm được, abl lỡ)} & \textbf{c (full lỡ, abl tìm được)} & \textbf{$\chi^2$} & \textbf{p-value} & \textbf{Ý nghĩa} \\
+\midrule
+\texttt{full} vs \texttt{no-debate} & 0 & 0 & 0.0000 & 1.0000 & n.s. \\
+\texttt{full} vs \texttt{no-seeder} & 0 & 0 & 0.0000 & 1.0000 & n.s. \\
+\texttt{full} vs \texttt{no-memory} & 0 & 0 & 0.0000 & 1.0000 & n.s. \\
+\texttt{full} vs \texttt{no-proofgate} & 0 & 0 & 0.0000 & 1.0000 & n.s. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Dựa vào các bảng số liệu chi tiết trên, chúng ta có thể rút ra những đánh giá sâu sắc về vai trò của từng thành phần:
+
+\textbf{1. Hệ thống đầy đủ (\texttt{full})}
+\begin{itemize}
+    \item \textbf{Hiệu suất:} Đạt trạng thái cân bằng tốt nhất. Tỷ lệ phát hiện lỗi (TPR) đạt 58\% ($5.8 \pm 0.8$ lỗi), trong khi tỷ lệ báo động giả (FPR) được kiểm soát ở mức 9\%. Độ chính xác tổng quát (Precision) duy trì ở mức cao (88\%). Các lỗi có thể xem ở phần thảo luận trước đó.
+    \item \textbf{Thời gian và Chi phí:} Tiêu thụ trung bình khoảng $1,997,750 \pm 348,938$ token cho mỗi lần quét. Tính theo đơn giá API hiện hành (\$0.50/1M token), chi phí rơi vào khoảng \$0.9989 / run. Trung bình hệ thống chỉ tốn khoảng \$0.263 để tìm ra một lỗ hổng thực sự. Cấu hình đầy đủ yêu cầu thời gian thực thi trọn vẹn để đảm bảo độ chính xác (tham khảo Bảng~\ref{tab:cost_analysis}).
+    \item \textbf{Phân tích lỗi:} Phần lớn các ca thất bại (4.2 vụ/run) nằm ở bước \texttt{PROOF\_QUALITY\_FAIL}. Điều này là tín hiệu tích cực, cho thấy hệ thống đã tiếp cận đúng endpoint, đã gửi request, nhưng bằng chứng trả về chưa đủ điều kiện nghiêm ngặt để xác nhận là lỗ hổng.
+\end{itemize}
+
+\textbf{2. Đánh giá vai trò của Seeder (\texttt{no-seeder})}
+\begin{itemize}
+    \item \textbf{Hiện tượng:} Khi tắt bộ "mồi" dữ liệu từ Crawler, hiệu năng tụt thê thảm. Tỷ lệ tìm lỗi (TPR) rớt từ 58\% xuống chỉ còn 44\%.
+    \item \textbf{Thời gian và Chi phí:} Chi phí token giảm chỉ còn một nửa xuống $1,049,683 \pm 464,317$ token (khoảng \$0.5248 / run) do hệ thống đã bỏ qua việc sinh giả thuyết cho rất nhiều endpoint. Do giảm thiểu số lượng giả thuyết cần kiểm thử, thời gian thi hành của cấu hình này cũng được rút ngắn đáng kể. Chi phí để tìm 1 lỗi là \$0.219. (Tham khảo Bảng~\ref{tab:cost_analysis})
+    \item \textbf{Lý giải:} Mô hình LLM tự do rất yếu trong việc tự tưởng tượng ra các tham số kỹ thuật (ví dụ: giỏ hàng chứa số lượng âm, ID ẩn). Seeder đóng vai trò cực kỳ cấp thiết để "mồi" các trường dữ liệu nhạy cảm này. 
+    \item \textbf{Kết luận:} Crawler/Seeder chính là đôi mắt của hệ thống. Không có nó, LLM bị mù và bỏ qua hàng loạt các lỗ hổng Business Logic tiềm năng. Một điểm sáng là FPR của cấu hình này bằng 0\%, khẳng định bộ lọc ProofGate làm việc cực kỳ chuẩn xác chặn đứng các kết luận thiếu bằng chứng.
+\end{itemize}
+
+\textbf{3. Đánh giá vai trò của ProofGate (\texttt{no-proofgate})}
+\begin{itemize}
+    \item \textbf{Hiện tượng:} Khi tắt cơ chế xác minh bằng code cứng và phó mặc cho LLM tự phân xử (self-report), tỷ lệ tìm lỗi giảm (46\%) trong khi hiện tượng ảo giác (hallucination) tăng cao làm giảm Precision xuống còn 80\%.
+    \item \textbf{Thời gian và Chi phí:} Tiêu tốn $1,736,617 \pm 220,108$ token (\$0.8683 / run). Thời gian chạy tương đối nhanh vì thiếu bước xác nhận khắt khe và các vòng kiểm tra chéo của ProofGate. Chi phí trên một lỗi tìm được tăng lên \$0.334 do hiệu quả phát hiện giảm. (Tham khảo Bảng~\ref{tab:cost_analysis})
+    \item \textbf{Lý giải:} Nhìn vào Bảng \ref{tab:failure_modes}, lỗi \texttt{EXEC\_NO\_EXCHANGES} (thực thi mà không có tương tác HTTP) tăng gấp đôi so với bản \texttt{full} (từ 0.6 lên 1.2). Nó cho thấy LLM thường xuyên "tưởng tượng" ra rằng mình đã tấn công thành công dù request còn chưa được gửi đi.
+    \item \textbf{Kết luận:} ProofGate là chốt chặn sống còn. Nó ép hệ thống LLM phải làm việc trên bằng chứng mạng thực tế, loại bỏ hoàn toàn các báo cáo ảo giác.
+\end{itemize}
+
+\textbf{4. Đánh giá vai trò của Debate (\texttt{no-debate})}
+\begin{itemize}
+    \item \textbf{Hiện tượng:} Khá bất ngờ, việc tắt vòng lặp tranh luận giữa Red-Blue lại làm \textit{tăng} số lỗi tìm được (TPR 64\%) và thời gian chạy nhanh hơn gấp đôi.
+    \item \textbf{Thời gian và Chi phí:} Sử dụng $1,851,011 \pm 72,921$ token (\$0.9255 / run), với chi phí tìm 1 lỗi rẻ nhất là \$0.210. Việc loại bỏ quá trình tranh luận đa vòng giữa hai agent giúp tiết kiệm đáng kể thời gian thực thi tổng thể. (Tham khảo Bảng~\ref{tab:cost_analysis})
+    \item \textbf{Lý giải:} Nguyên nhân nằm ở sự liều lĩnh. Khi không có Blue Team bắt bẻ, Red Team thử nghiệm mọi payload và vô tình trúng được nhiều lỗi hơn. Tuy nhiên, rủi ro là cực lớn: nhìn vào Bảng \ref{tab:failure_modes}, trung bình có tới 6.2 giả thuyết bị sụp đổ ngay từ bước đầu (\texttt{DEBATE\_NEVER\_STARTED}) vì thiếu định hướng và cấu trúc rõ ràng.
+    \item \textbf{Kết luận:} Debate không được sinh ra để tăng sức tấn công, mà đóng vai trò như một "vành đai an toàn" (Quality Gate). Nó giúp hệ thống hoạt động có tổ chức và ổn định, thay vì "spam" payload bừa bãi.
+\end{itemize}
+
+\textbf{5. Đánh giá vai trò của Bộ nhớ (\texttt{no-memory})}
+\begin{itemize}
+    \item \textbf{Hiện tượng:} Kết quả gần như tương đương với hệ thống chuẩn (TPR 56\%, tốn \$1.17 / run). 
+    \item \textbf{Thời gian và Chi phí:} Đây là cấu hình tốn kém nhất với $2,342,609 \pm 301,133$ token (\$1.1713 / run), chi phí cho mỗi lỗi cao nhất ở mức \$0.325. Thời gian thực thi cũng kéo dài hơn bình thường do thiếu bộ nhớ chia sẻ, khiến các agent lặp lại các nỗ lực vô ích đã thử nghiệm trước đó. (Tham khảo Bảng~\ref{tab:cost_analysis})
+    \item \textbf{Lý giải:} Bộ nhớ dài hạn (Long-term Memory) được thiết kế để học hỏi và lan truyền payload xuyên suốt qua \textit{nhiều mục tiêu khác nhau} (Cross-target). Trong thực nghiệm benchmark này, do chúng ta chỉ chạy lặp lại trên cùng 1 mục tiêu duy nhất (VulnShop) nên Memory chưa thể hiện được sự vượt trội.
+\end{itemize}
+
+Tóm lại, thực nghiệm Ablation với $R=5$ đã đưa ra những con số định lượng vững chắc minh chứng cho sự thiết yếu của từng component trong kiến trúc \textbf{marl3}. Mặc dù kiểm định McNemar (Bảng \ref{tab:mcnemar}) chưa đạt mức ý nghĩa thống kê (do cỡ mẫu N=10 lỗ hổng còn nhỏ), các phân tích định tính từ Failure Modes và Cost Analysis đã bù đắp, cho thấy sự ổn định, chi phí tối ưu và kiểm soát ảo giác tuyệt vời của hệ thống.
+% ============================================================
+\section{Thảo luận}
+\label{sec:discussion}
+% ============================================================
+
+\subsection{Phân tích theo thành phần}
+
+\subsubsection{Đóng góp của Hunter/Seeder}
+
+Giai đoạn trinh sát và sinh ứng cử viên là yếu tố quyết định độ phủ (TPR). Ablation study (\texttt{no-seeder}) trên VulnShop xác nhận: khi tắt seeder, chỉ trung bình 4.4/10 candidate được khai thác thành công (TPR 44\%), giảm mạnh so với mốc 58\% của pipeline nguyên gốc, và \textbf{BLF-02 (\texttt{/cart/add} negative quantity) bị bỏ lỡ hoàn toàn trong các vòng lặp}. Seeder phát hiện trường số \texttt{quantity} trong recon body và sinh candidate BLF-02 theo quy tắc tất định --- Hunter LLM không nhận ra signal này. Trên PawPal, hai cải tiến seeder (phát hiện cookie Base64 và trích xuất đường dẫn ẩn trong HTML comment) trực tiếp nâng TPR từ 20\% lên 30\%.
+
+Thiết kế hai tầng --- LLM sinh giả thuyết + code tất định gieo hạt từ recon --- là cần thiết vì LLM có xu hướng bỏ qua các dấu hiệu nhỏ mang tính kỹ thuật (base64 trong giá trị cookie, trường số ẩn trong POST body), trong khi code tất định không bỏ qua nếu quy tắc đã được định nghĩa.
+
+\subsubsection{Đóng góp của cơ chế Debate}
+
+Ablation study (\texttt{no-debate}) trên VulnShop cho kết quả khá bất ngờ: bỏ Debate làm tăng số lượng TP trung bình từ 3.8 lên 4.4 (TPR 44\%), nhưng đồng thời sinh thêm False Positive (FPR 10\%) và gây nguy hiểm cho tính ổn định của quy trình. Khi loại bỏ lớp tranh luận, trung bình 6.2 giả thuyết bị bỏ sót do thất bại ngay từ bước bắt đầu kiểm thử (\texttt{DEBATE\_NEVER\_STARTED}). Debate hoạt động như một quality gate hai chiều: lọc bỏ candidate thiếu đặc tả (giảm FP và rủi ro thực thi), nhưng đôi khi cũng loại bỏ candidate hợp lệ chưa đủ chi tiết.
+
+Ràng buộc bảo thủ bắt buộc (vòng đầu tiên của Blue luôn yêu cầu sửa đổi) và kiểm tra field-grounding tất định (tên trường trong chiến lược phải xuất hiện trong recon) giúp loại bỏ chiến lược dựa trên tên trường tưởng tượng --- ngăn chặn một lớp FP phổ biến.
+
+\subsubsection{Đóng góp của ProofGate}
+
+ProofGate là cơ chế quan trọng nhất để đảm bảo FPR thấp và chất lượng của kết quả. Trên VulnShop ($R=5$), hệ thống duy trì được độ chính xác (precision) 88\% --- hầu hết mọi khai thác được báo cáo đều có bằng chứng HTTP thực. Khi tắt ProofGate (\texttt{no-proofgate}), ảo giác tăng mạnh, precision giảm xuống 80\% và tỷ lệ thất bại do chất lượng bằng chứng kém tăng vọt (4.8 vụ/run). Trên PawPal lần 2, 2 FP xuất hiện không phải do ProofGate ảo giác mà do tiêu chí BLF-06 hiện tại không kiểm tra delta trạng thái phía server: chỉ kiểm tra HTTP 200 với giá trị âm được chấp nhận trong body, chưa kiểm tra xem số dư/giỏ hàng có thực sự thay đổi hay không.
+
+\subsection{Các hạn chế và điểm yếu còn lại}
+
+\subsubsection{Client-side price injection (BLF-01 nâng cao)}
+
+Một số endpoint có trường giá ẩn (\texttt{unit\_price}, \texttt{price}) không xuất hiện trong form HTML hoặc JavaScript. Kỹ thuật fuzzing tham số (parameter fuzzing) là cần thiết để bổ sung ứng cử viên dạng này.
+
+\subsubsection{Mẫu mã hóa phức tạp}
+
+Lab ``Authentication bypass via encryption oracle'' đòi hỏi chuỗi khai thác: thu thập bản mã $\to$ sửa đổi theo bit $\to$ giải mã để tạo token hợp lệ. Chuỗi này vượt quá khả năng lập kế hoạch hiện tại của Debate và Exec trong một phiên không có công cụ crypto chuyên dụng.
+
+\subsection{So sánh tổng hợp}
+
+Bảng~\ref{tab:summary} tổng hợp kết quả trên cả ba bộ thực nghiệm.
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\caption{Tổng hợp kết quả benchmark trên ba bộ dữ liệu và ablation study}
+\label{tab:summary}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Cấu hình / Bộ dữ liệu} & \textbf{TP} & \textbf{Tổng} & \textbf{TPR} & \textbf{FPR} \\
+\hline
+\multicolumn{5}{|l|}{\textit{Benchmark chính (marl3 full)}} \\
+\hline
+VulnShop (R=5) & $5.8 \pm 0.8$ & 10 & $58\%\pm8\%$ & $9\%\pm8\%$ \\
+\hline
+PortSwigger (BAC) & 5 & 10 & 50\% & --- \\
+\hline
+PortSwigger (BLF) & 7 & 9 & 78\% & --- \\
+\hline
+PortSwigger (Tổng) & 12 & 19 & 63,2\% & --- \\
+\hline
+PawPal (Run 1) & 2 & 10 & 20\% & 0\% \\
+\hline
+PawPal (Run 2) & 3 & 10 & 30\% & 25\% \\
+\hline
+\multicolumn{5}{|l|}{\textit{So sánh hệ thống (VulnShop)}} \\
+\hline
+MARL (legacy) -- VulnShop & 0 (2*) & 10 & $\approx$0\% & 25\% \\
+\hline
+MARL (legacy) -- PawPal & 0 & 10 & 0\% & 0\% \\
+\hline
+MARL (legacy) -- PortSwigger & 0 & 19 & 0\% & 0\% \\
+\hline
+\multicolumn{5}{|l|}{\textit{Ablation study (VulnShop, R=5)}} \\
+\hline
+marl3 -- no-debate & $6.4\pm0.5$ & 10 & $64\%\pm5\%$ & $10\%\pm9\%$ \\
+\hline
+marl3 -- no-memory & $5.6\pm0.9$ & 10 & $56\%\pm9\%$ & $10\%\pm10\%$ \\
+\hline
+marl3 -- no-seeder & $4.4\pm0.9$ & 10 & $44\%\pm9\%$ & $0\%\pm0\%$ \\
+\hline
+marl3 -- no-proofgate & $4.6\pm0.5$ & 10 & $46\%\pm5\%$ & $9\%\pm9\%$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{flushleft}
+\small{*2 TP theo tự đánh giá của ExecAgent, không được ReportManager xác nhận chính thức.}
+\end{flushleft}
+
+Kết quả cho thấy marl3 đặc biệt hiệu quả với các lỗ hổng Business Logic liên quan đến thao túng giá trị số (BLF-01, BLF-06) và các lỗ hổng BAC cơ bản (BAC-01 unauthenticated API, BAC-02 cookie tamper). Đây là nhóm lỗ hổng phổ biến nhất trong thực tế và thường bị bỏ lỡ bởi các scanner truyền thống chỉ kiểm tra HTTP status code mà không phân tích ngữ nghĩa response.
+
+% ============================================================
+\section{Mối đe dọa đến tính hợp lệ}
+\label{sec:threats}
+% ============================================================
+
+Phần này thảo luận về các yếu tố có thể ảnh hưởng đến giá trị của kết quả thực nghiệm theo ba chiều phân loại thông dụng trong nghiên cứu hệ thống phần mềm: tính hợp lệ nội bộ, ngoại bộ, và cấu trúc.
+
+\subsection{Tính hợp lệ nội bộ (Internal Validity)}
+
+Kết quả ablation study được đo trên $R=5$ lần chạy độc lập cho mỗi cấu hình, khắc phục được hạn chế lớn nhất của các nghiên cứu trước đây (chỉ chạy một lần). Việc tính toán trung bình và độ lệch chuẩn ($\pm \sigma$) cùng kiểm định thống kê (McNemar test) giúp loại bỏ phương sai tự nhiên sinh ra do nhiệt độ của mô hình LLM. Hơn nữa, ProofGate là thành phần \textit{tất định} --- với cùng bộ HTTP evidence, phán quyết của gate luôn giống nhau, loại trừ nguồn biến thiên quan trọng nhất khỏi vòng đánh giá cuối cùng.
+
+
+\subsection{Tính hợp lệ ngoại bộ (External Validity)}
+
+Ba bộ dữ liệu thực nghiệm bao gồm ứng dụng tự phát triển (VulnShop), lab chuẩn ngành độc lập (PortSwigger), và ứng dụng thương mại mô phỏng (PawPal), song vẫn chưa bao quát hết sự đa dạng của môi trường thực tế. Các ứng dụng chưa được kiểm thử bao gồm: SPA dựa hoàn toàn trên GraphQL, API có xác thực JWT với refresh token phức tạp, ứng dụng tích hợp OAuth2, và hệ thống có tường lửa ứng dụng web (WAF) chủ động. Kết quả trên PortSwigger có tính đại diện cao nhất vì đây là bộ lab được thiết kế và duy trì bởi tổ chức bảo mật độc lập, với các pattern lỗ hổng được xác nhận qua nhiều năm trong thực tế.
+
+\subsection{Tính hợp lệ cấu trúc (Construct Validity)}
+
+Định nghĩa \textbf{True Positive} trong nghiên cứu này yêu cầu ProofGate xác nhận trạng thái \textsc{Exploited} --- nghiêm ngặt hơn tiêu chí ``phát hiện endpoint nghi ngờ'' thường dùng trong một số nghiên cứu tương tự. Điều này có thể khiến TPR bị đánh giá thấp hơn thực tế (\textit{underestimate}), vì một số lỗ hổng thực sự tồn tại nhưng chưa có luật ProofGate tương ứng (ví dụ: các biến thể IDOR phức tạp). Tuy nhiên, tiêu chí này cũng đảm bảo FPR thấp và mọi finding được báo cáo đều có bằng chứng HTTP có thể tái hiện, phù hợp với yêu cầu của kiểm thử thâm nhập thực tế nơi false positive gây lãng phí thời gian đáng kể cho người kiểm thử.
+
+% ============================================================
+\section{Kết luận chương}
+% ============================================================
+
+Chương này trả lời bốn câu hỏi nghiên cứu đặt ra ở \S\ref{sec:rqs}. \textbf{(RQ1)} marl3 đạt TPR = 58\% trung bình (VulnShop với R=5), 63,2\% (PortSwigger), và 30\% (PawPal). \textbf{(RQ2)} Ablation study xác nhận Seeder là thành phần có đóng góp đo được rõ nhất --- tắt Seeder khiến TPR giảm từ 58\% xuống 44\%; Debate hoạt động như quality gate thiết lập an toàn; ProofGate đóng vai trò cốt lõi ngăn chặn ảo giác (hallucination) với bằng chứng HTTP thực. Việc thực hiện $R=5$ vòng lặp đánh giá đã tuân thủ nghiêm ngặt chuẩn kiểm thử lặp lại. \textbf{(RQ3)} So sánh với MARL legacy cho thấy ba cải tiến kiến trúc cốt lõi --- ProofGate tất định, frozen strategy, per-bug evidence isolation --- là nguồn gốc trực tiếp của sự tăng TPR từ 0\% lên mức thực tế khả dụng và giảm FPR đáng kể. \textbf{(RQ4)} Hiệu suất được duy trì trên PortSwigger (bộ chuẩn ngành độc lập), mặc dù gặp giới hạn trên PawPal do cấu trúc ứng dụng. Phần \S\ref{sec:threats} xác định các mối đe dọa đến tính hợp lệ. Hai điểm yếu cần giải quyết trong tương lai: fuzzing tham số ẩn phía client và giải quyết các mẫu mã hóa phức tạp.

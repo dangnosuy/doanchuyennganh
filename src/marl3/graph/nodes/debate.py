@@ -55,15 +55,32 @@ async def run_debate(state: dict) -> dict:
         "frozen_strategy": bug_run.frozen_strategy,
         "frozen_execution_guide": bug_run.frozen_execution_guide,
         "frozen_success_condition": bug_run.frozen_success_condition,
+        "frozen_verification_questions": bug_run.frozen_verification_questions,
     }
 
     if outcome == "APPROVED":
         updates["bug_status"] = "DEBATE_APPROVED"
+        # Persist approved strategy so exec can retrieve it on retry and memory carries context
+        if memory is not None:
+            try:
+                memory.update_strategy(dossier.id, bug_run.frozen_strategy or "")
+            except Exception as _e:
+                log.debug(f"memory.update_strategy skipped: {_e}")
     elif outcome == "INSUFFICIENT_CONTEXT":
         updates["bug_status"] = "SKIPPED_NO_EVIDENCE"
+        if memory is not None:
+            try:
+                memory.record_attempt(dossier.id, "SKIPPED_NO_EVIDENCE")
+            except Exception:
+                pass
     else:
         # STOP or MAX_ROUNDS
         updates["bug_status"] = "NOT_EXPLOITED"
+        if memory is not None:
+            try:
+                memory.record_attempt(dossier.id, f"DEBATE_{outcome}")
+            except Exception:
+                pass
 
     return updates
 

@@ -1,0 +1,16 @@
+\chapter*{TÓM TẮT ĐỒ ÁN}
+\addcontentsline{toc}{section}{{\bf TÓM TẮT KHOÁ LUẬN}\rm}
+
+Trong bối cảnh an ninh mạng hiện đại, PowerShell đã trở thành một "vũ khí kép": vừa là công cụ quản trị hệ thống đắc lực, vừa là môi trường lý tưởng để tin tặc thực hiện các cuộc tấn công không tệp tin nguy hiểm. Tuy nhiên, việc tạo ra các mã tấn công PowerShell đòi hỏi chuyên môn sâu và nỗ lực lớn, tạo ra rào cản cho các hoạt động diễn tập an ninh. Sự trỗi dậy của Trí tuệ nhân tạo (AI), đặc biệt là các mô hình Dịch máy Neuron, mở ra hướng đi mới cho việc tự động hóa quy trình này, nhưng hiện vẫn đối mặt với thách thức lớn về sự khan hiếm dữ liệu chuyên biệt và tính đóng của tri thức mô hình.
+
+Đồ án này tập trung nghiên cứu phương pháp sinh mã PowerShell tấn công từ mô tả ngôn ngữ tự nhiên sử dụng các mô hình NMT tiên tiến (CodeT5+, CodeGPT, CodeGen) kết hợp với kiến trúc Truy xuất tăng cường mã nguồn. Nghiên cứu đã xây dựng thành công hai bộ dữ liệu mới: bộ dữ liệu tiền huấn luyện từ GitHub (~90.000 mẫu) và bộ dữ liệu tinh chỉnh chuyên sâu từ khung MITRE ATTCK (~1.127 mẫu). Bên cạnh đó, đồ án đề xuất kiến trúc RACG với Code-RAG-Bench để khắc phục hạn chế về cập nhật tri thức của các phương pháp Fine-tuning truyền thống. Kết quả thực nghiệm được đánh giá toàn diện qua ba tầng: độ tương đồng văn bản, phân tích tĩnh và phân tích thực thi động trong môi trường sandbox.
+
+\bigbreak\noindent
+Đồ án được cấu trúc thành 5 chương: 
+\begin{itemize}
+    \item \textbf{Chương 1:} Giới thiệu tổng quan, tính cấp thiết và mục tiêu đề tài.
+    \item \textbf{Chương 2:} Trình bày cơ sở lý thuyết về Offensive PowerShell, NMT và kiến trúc RAG.
+    \item \textbf{Chương 3:} Mô tả chi tiết phương pháp thu thập dữ liệu, huấn luyện mô hình và thiết kế hệ thống RACG.
+    \item \textbf{Chương 4:} Báo cáo và thảo luận chi tiết các kết quả thực nghiệm đạt được trên các phương diện phân tích tĩnh và động.
+    \item \textbf{Chương 5:} Tổng kết kết quả đạt được, chỉ ra hạn chế và đề xuất các hướng phát triển tương lai.
+\end{itemize}

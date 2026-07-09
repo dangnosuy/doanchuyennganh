@@ -1,0 +1,89 @@
+{
+  "workspace": "benchmark_results/no-seeder/run_4/workspace/localhost_20260703_080356",
+  "total_findings": 6,
+  "exploited": 4,
+  "tp": 4,
+  "fp": 0,
+  "fn": 6,
+  "precision": 1.0,
+  "recall_tpr": 0.4,
+  "fpr": 0.0,
+  "total_tokens": 1646733,
+  "total_llm_calls": 175,
+  "elapsed_s": 1377.56,
+  "tp_patterns": [
+    "BAC-01",
+    "BLF-01",
+    "BLF-02",
+    "BAC-03"
+  ],
+  "fp_patterns": [],
+  "failure_modes": {
+    "NOT_EXPLOITED": 1,
+    "PROOF_QUALITY_FAIL": 1
+  },
+  "per_bug_metrics": [
+    {
+      "bug_id": "BUG-001",
+      "pattern_id": "BAC-01",
+      "status": "EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 97.81,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-003",
+      "pattern_id": "BLF-01",
+      "status": "EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 175.87,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-005",
+      "pattern_id": "BLF-02",
+      "status": "EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 229.64,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-006",
+      "pattern_id": "BAC-03",
+      "status": "EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 208.72,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-002",
+      "pattern_id": "BAC-02",
+      "status": "INFO_EXPOSURE_ONLY",
+      "debate_rounds": 4,
+      "verify_retries": 2,
+      "exec_retries": 0,
+      "elapsed_s": 430.4,
+      "failure_mode": "NOT_EXPLOITED"
+    },
+    {
+      "bug_id": "BUG-004",
+      "pattern_id": "BAC-03",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 2,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 152.34,
+      "failure_mode": "PROOF_QUALITY_FAIL"
+    }
+  ],
+  "run_index": 4,
+  "status": "OK"
+}

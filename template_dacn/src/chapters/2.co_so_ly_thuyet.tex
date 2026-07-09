@@ -1,0 +1,89 @@
+\chapter{Cơ sở lý thuyết}\label{Chapter2}
+
+% \section*{Tóm tắt chương}
+
+% Trong chương này, chúng tôi xin trình bày lý do chọn đề tài, các công trình nghiên cứu liên quan và những điểm mới của đề tài so với các nghiên cứu trước. Đồng thời, chúng tôi cũng đưa ra mục tiêu, đối tượng và phạm vi nghiên cứu, cũng như là phương pháp nghiên cứu. Cuối cùng chúng tôi đưa ra cấu trúc của khóa luận tốt nghiệp.
+
+%----------------------------------------------------------------------------------------
+%	SECTION 1
+%----------------------------------------------------------------------------------------
+
+
+\section{Tổng quan về mã độc}
+
+Mã độc là các phần mềm được thiết kế với mục đích gây hại cho hệ thống máy tính hoặc làm gián đoạn hoạt động bình thường của người dùng. Mã độc có thể xâm nhập vào hệ thống thông qua nhiều hình thức khác nhau như tệp đính kèm email, phần mềm giả mạo, trang web độc hại hoặc lỗ hổng bảo mật chưa được vá.
+
+
+%----------------------------------------------------------------------------------------
+%	SECTION 2
+%----------------------------------------------------------------------------------------
+
+\section{Mô hình NMT (Neural Machine Translation)}
+
+Neural Machine Translation là công nghệ sử dụng các mạng nơ-ron sâu để dịch văn bản từ ngôn ngữ này sang ngôn ngữ khác. Trong bối cảnh của nghiên cứu này, bài toán sinh mã được mô hình hóa như một tác vụ dịch thuật: "ngôn ngữ nguồn" là mô tả ý định bằng tiếng Anh, và "ngôn ngữ đích" là mã lệnh PowerShell. 
+
+Kiến trúc và Cơ chế học Các mô hình NMT hiện đại thường dựa trên kiến trúc Transformer, cho phép mô hình học được mối liên hệ phức tạp giữa ngôn ngữ tự nhiên và mã lập trình. Để đạt được khả năng sinh mã tấn công hiệu quả, quy trình huấn luyện được chia thành hai giai đoạn chiến lược: 
+
+\subsection{Giai đoạn Tiền huấn luyện - Học kiến thức tổng quát:}
+Mô hình được huấn luyện trên một lượng dữ liệu khổng lồ chưa gán nhãn, thường được thu thập từ các kho mã nguồn mở như GitHub. 
+
+Mục tiêu là giúp mô hình học cú pháp, từ vựng và cấu trúc logic của ngôn ngữ lập trình (PowerShell) thông qua các cơ chế như Mô hình hóa ngôn ngữ nhân quả (Causal Language Modeling - CLM) – dự đoán từ tiếp theo trong chuỗi, hoặc Mô hình hóa ngôn ngữ che khuất (Masked Language Modeling - MLM) – điền vào chỗ trống các từ bị che khuất. Giai đoạn này trang bị cho mô hình "năng lực ngôn ngữ" nền tảng. 
+\subsection{ Giai đoạn Tinh chỉnh (Fine-tuning) - Học kỹ năng chuyên sâu:}
+Sau khi đã có kiến thức nền, mô hình tiếp tục được huấn luyện trên một tập dữ liệu nhỏ hơn nhưng chất lượng cao và có gán nhãn. Tập dữ liệu này chứa các cặp mẫu "Mô tả tiếng Anh - Mã tấn công PowerShell". 
+
+Giai đoạn này giúp mô hình chuyên biệt hóa, học cách chuyển đổi chính xác từ ý định tấn công sang mã lệnh thực thi, hiểu được các thuật ngữ chuyên ngành bảo mật và các kỹ thuật tấn công cụ thể. 
+
+Sự kết hợp giữa NMT và quy trình huấn luyện hai bước này cho phép tạo ra các công cụ AI có khả năng tự động hóa việc viết mã tấn công phức tạp mà trước đây chỉ con người mới làm được. 
+
+%----------------------------------------------------------------------------------------
+%	SECTION 3
+%----------------------------------------------------------------------------------------
+
+
+
+%----------------------------------------------------------------------------------------
+%	SECTION 4
+%----------------------------------------------------------------------------------------
+
+
+
+%----------------------------------------------------------------------------------------
+%	SECTION 5
+%----------------------------------------------------------------------------------------
+
+
+
+
+
+\section{RACG (Retrieval and Code Generation)}
+
+Retrieval-Augmented Code Generation (RACG) là một kiến trúc hệ thống tiên tiến nhằm tối ưu hóa khả năng của các mô hình ngôn ngữ lớn (LLM) trong việc xử lý mã nguồn bằng cách tích hợp tri thức động từ các kho lưu trữ bên ngoài. Thay vì chỉ dựa vào tri thức được lưu trữ trong trọng số của mô hình, RACG triển khai một pipeline gồm hai giai đoạn chính: truy xuất (Retrieval) và sinh mã (Generation). Giai đoạn đầu tiên thực hiện nhiệm vụ sàng lọc và trích xuất các thành phần liên quan như đoạn mã, tài liệu kỹ thuật hoặc cấu trúc đồ thị phụ thuộc từ repository dựa trên truy vấn hoặc ngữ cảnh mã hiện tại. Quá trình này giúp vượt qua giới hạn về context window của mô hình, đồng thời giảm thiểu hiện tượng hallucination bằng cách cung cấp các bằng chứng thực thể từ môi trường phát triển thực tế.
+
+
+
+
+%----------------------------------------------------------------------------------------
+%	SECTION 6
+%----------------------------------------------------------------------------------------
+
+\section{MITRE ATT\&CK Framework}
+
+MITRE ATT\&CK (Adversarial Tactics, Techniques, and Common Knowledge) là một khung tri thức chuẩn hóa được xây dựng và duy trì bởi tổ chức MITRE, nhằm mô tả có hệ thống các hành vi tấn công mạng trong thực tế. Framework này phân loại hành vi của kẻ tấn công theo các chiến thuật (tactics) và kỹ thuật (techniques), bao phủ toàn bộ vòng đời của một cuộc xâm nhập, từ giai đoạn truy cập ban đầu, thực thi mã, leo thang đặc quyền cho đến duy trì sự hiện diện trong hệ thống mục tiêu.
+
+\
+
+%----------------------------------------------------------------------------------------
+%	SECTION 7
+%----------------------------------------------------------------------------------------
+
+\section{Các nghiên cứu liên quan}
+
+Large Language Model là các mô hình học sâu được huấn luyện trên tập dữ liệu văn bản quy mô lớn, có khả năng hiểu và sinh ngôn ngữ tự nhiên với mức độ ngữ cảnh hóa cao. Trong những năm gần đây, LLM đã cho thấy tiềm năng đáng kể trong lĩnh vực an ninh mạng, đặc biệt trong việc hỗ trợ phân tích và diễn giải các thông tin kỹ thuật phức tạp theo cách dễ hiểu hơn cho con người.
+
+
+
+
+%----------------------------------------------------------------------------------------
+
+
+

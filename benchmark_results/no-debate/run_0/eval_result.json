@@ -1,0 +1,138 @@
+{
+  "workspace": "benchmark_results/no-debate/run_0/workspace/localhost_20260703_031402",
+  "total_findings": 11,
+  "exploited": 4,
+  "tp": 4,
+  "fp": 0,
+  "fn": 6,
+  "precision": 1.0,
+  "recall_tpr": 0.4,
+  "fpr": 0.0,
+  "total_tokens": 1732683,
+  "total_llm_calls": 225,
+  "elapsed_s": 1388.53,
+  "tp_patterns": [
+    "BAC-01",
+    "BAC-02",
+    "BLF-01",
+    "BAC-06"
+  ],
+  "fp_patterns": [],
+  "failure_modes": {
+    "DEBATE_NEVER_STARTED": 7
+  },
+  "per_bug_metrics": [
+    {
+      "bug_id": "BUG-001",
+      "pattern_id": "BAC-01",
+      "status": "EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 83.93,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-002",
+      "pattern_id": "BAC-02",
+      "status": "EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 158.69,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-003",
+      "pattern_id": "BLF-01",
+      "status": "EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 82.66,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-008",
+      "pattern_id": "BAC-06",
+      "status": "EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 39.19,
+      "failure_mode": ""
+    },
+    {
+      "bug_id": "BUG-004",
+      "pattern_id": "BAC-03",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 162.32,
+      "failure_mode": "DEBATE_NEVER_STARTED"
+    },
+    {
+      "bug_id": "BUG-005",
+      "pattern_id": "BAC-04",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 44.03,
+      "failure_mode": "DEBATE_NEVER_STARTED"
+    },
+    {
+      "bug_id": "BUG-006",
+      "pattern_id": "BLF-03",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 129.61,
+      "failure_mode": "DEBATE_NEVER_STARTED"
+    },
+    {
+      "bug_id": "BUG-007",
+      "pattern_id": "BAC-06",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 68.98,
+      "failure_mode": "DEBATE_NEVER_STARTED"
+    },
+    {
+      "bug_id": "BUG-009",
+      "pattern_id": "BLF-03",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 151.56,
+      "failure_mode": "DEBATE_NEVER_STARTED"
+    },
+    {
+      "bug_id": "BUG-010",
+      "pattern_id": "BLF-01",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 2,
+      "exec_retries": 0,
+      "elapsed_s": 226.89,
+      "failure_mode": "DEBATE_NEVER_STARTED"
+    },
+    {
+      "bug_id": "BUG-011",
+      "pattern_id": "BLF-05",
+      "status": "NOT_EXPLOITED",
+      "debate_rounds": 0,
+      "verify_retries": 1,
+      "exec_retries": 0,
+      "elapsed_s": 130.26,
+      "failure_mode": "DEBATE_NEVER_STARTED"
+    }
+  ],
+  "run_index": 0,
+  "status": "OK"
+}

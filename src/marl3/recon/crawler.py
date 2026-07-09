@@ -12,10 +12,10 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urljoin, urldefrag, urlparse
+from urllib.parse import urljoin, urldefrag, urlparse, parse_qs
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 
 from ..config import AppConfig
 from ..contracts.body import BodyRef
@@ -37,28 +37,106 @@ _USERNAME_NAMES = {"username", "user", "email", "login", "name", "userid", "user
 
 # Paths to probe after passive crawl (soft-404 filtered).
 # Ordered by BAC/BLF relevance: admin areas → user resources → commerce → auth-gated.
+# NOTE: Only GENERIC paths belong here. Target-specific paths (e.g. /api/v1/users/1/promote)
+# are derived dynamically in _infer_sibling_paths() from actually-discovered endpoints.
 _PROBE_PATHS = [
     # Admin / privileged areas (BAC-01)
     "/admin", "/admin/", "/admin/dashboard", "/administrator", "/manage",
     "/management", "/staff", "/superadmin", "/backend", "/cp", "/panel",
+    "/control", "/moderator", "/sysadmin", "/internal",
     # User account pages (BAC-02/03 candidates)
     "/dashboard", "/profile", "/account", "/settings", "/my-account",
-    "/user/profile", "/account/settings", "/me",
+    "/user/profile", "/account/settings", "/me", "/user", "/home",
     # Commerce / BLF flows
     "/cart", "/checkout", "/order", "/orders", "/basket",
     "/payment", "/pay", "/invoice", "/invoices",
-    # API endpoints often missed by HTML crawl
-    "/api", "/api/v1", "/api/v1/users", "/api/user",
-    # REST resource collections (common API patterns)
-    "/api/v1/products", "/api/v1/me", "/api/v1/profile",
-    "/api/v1/orders", "/api/v1/items", "/api/v1/accounts",
-    # IDOR resource instances — probe ID 1 and 2 (real IDs start here on fresh DBs)
-    "/api/v1/orders/1", "/api/v1/orders/2",
-    "/api/v1/profile/1", "/api/v1/profile/2",
-    "/api/v1/users/1", "/api/v1/users/1/promote",
+    "/wallet", "/billing", "/subscribe", "/plans",
+    # API prefix discovery (actual collections are inferred dynamically below)
+    "/api", "/api/v1", "/api/v2", "/api/v1/users", "/api/user",
     # Auth-related (NEVER probe logout — it clears the active session)
     "/register", "/signup",
+    # Sequential file/transcript IDOR candidates
+    "/download/1", "/download/2", "/download/1.txt", "/download/2.txt",
+    "/files/1", "/files/2", "/transcript/1", "/transcript/2",
+    "/logs/1", "/logs/2", "/documents/1", "/documents/2",
+    "/attachments/1", "/attachments/2",
 ]
+
+# REST resource names to try under discovered API prefixes (inferred, not hardcoded).
+_REST_COLLECTIONS = (
+    "users", "products", "orders", "items", "accounts", "profiles",
+    "customers", "transactions", "invoices", "payments", "roles",
+    "categories", "carts", "wallets", "subscriptions",
+    # Common service/booking app resources (broader coverage)
+    "clients", "appointments", "pets", "bookings", "reservations",
+    "employees", "staff", "listings", "services", "reports",
+)
+
+
+def _infer_sibling_paths(known_endpoints: set[str]) -> list[str]:
+    """Dynamically infer API paths to probe based on actually-discovered endpoints.
+
+    Strategy:
+      1. Detect API prefixes from crawled endpoints (e.g. /api/v1/ from /api/v1/users).
+      2. Generate collection paths: /prefix/resource for each REST_COLLECTIONS name.
+      3. Generate IDOR instance paths: /prefix/resource/1 and /prefix/resource/2
+         for any collection endpoint already discovered (confirms {id} support).
+    This replaces hardcoded /api/v1/orders/1, /api/v1/profile/1 etc.
+    """
+    # 1. Detect API prefixes from already-known endpoints
+    prefixes: set[str] = set()
+    for ep in known_endpoints:
+        parts = ep.strip("/").split("/")
+        for i, part in enumerate(parts):
+            if part in ("api", "v1", "v2", "v3", "rest", "graphql"):
+                prefix = "/" + "/".join(parts[:i + 1])
+                prefixes.add(prefix)
+                # Also include api/vN as a unit
+                if i + 1 < len(parts) and re.fullmatch(r"v\d+", parts[i + 1]):
+                    prefixes.add("/" + "/".join(parts[:i + 2]))
+
+    # If no API prefix found from crawl, try common defaults
+    if not prefixes:
+        prefixes = {"/api", "/api/v1"}
+
+    inferred: list[str] = []
+
+    # 2. Collection paths under each prefix
+    for prefix in sorted(prefixes):
+        for col in _REST_COLLECTIONS:
+            inferred.append(f"{prefix}/{col}")
+        # Also try /prefix/me and /prefix/profile (common whoami endpoints)
+        inferred.append(f"{prefix}/me")
+        inferred.append(f"{prefix}/profile")
+
+    # 3. IDOR instance probes: for any collection already discovered, try /{id}
+    for ep in known_endpoints:
+        clean = ep.rstrip("/")
+        parts = clean.split("/")
+        # Only add instance probes for collection-looking endpoints (no {id} already)
+        if len(parts) >= 2 and not re.fullmatch(r"\d+", parts[-1]):
+            last = parts[-1].lower()
+            if last in _REST_COLLECTIONS or last.endswith("s"):
+                for probe_id in (1, 2):
+                    inferred.append(f"{clean}/{probe_id}")
+
+    # 4. Sequential-file IDOR probes: for any /download, /files, /transcript, /logs
+    # style endpoint discovered, probe /endpoint/1 and /endpoint/2
+    _FILE_COLLECTIONS = ("download", "downloads", "files", "file", "transcript",
+                         "transcripts", "logs", "log", "documents", "attachments", "attachment")
+    for ep in known_endpoints:
+        parts = ep.strip("/").split("/")
+        for i, part in enumerate(parts):
+            if part.lower() in _FILE_COLLECTIONS:
+                base_path = "/" + "/".join(parts[:i+1])
+                for n in (1, 2, 3):
+                    for ext in ("", ".txt", ".pdf", ".json"):
+                        candidate = f"{base_path}/{n}{ext}"
+                        if candidate not in known_endpoints:
+                            inferred.append(candidate)
+                break
+
+    return inferred
 
 
 class GuidedCrawler:
@@ -261,7 +339,36 @@ class GuidedCrawler:
             pass
 
         probed: list[HttpExchange] = []
-        for path in _PROBE_PATHS:
+
+        # Fetch robots.txt — PortSwigger and many real apps disclose admin/hidden paths
+        # here via Disallow: directives. These are exactly the endpoints we want to probe.
+        robots_paths: list[str] = []
+        try:
+            r = await client.get(base + "/robots.txt")
+            if r.status_code in range(200, 300):
+                for line in r.text.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("disallow:"):
+                        path = line.split(":", 1)[1].strip()
+                        # Only include concrete paths (not wildcards like /*)
+                        if path and "*" not in path and path.startswith("/"):
+                            robots_paths.append(path.rstrip("/") or "/")
+                if robots_paths:
+                    log.info(f"robots.txt revealed {len(robots_paths)} path(s): {robots_paths}")
+        except Exception:
+            pass
+
+        # Combine static generic paths with dynamically inferred REST paths
+        all_paths = robots_paths + list(_PROBE_PATHS) + _infer_sibling_paths(already_known)
+        # Deduplicate while preserving order
+        seen_paths: set[str] = set()
+        unique_paths: list[str] = []
+        for p in all_paths:
+            if p not in seen_paths:
+                seen_paths.add(p)
+                unique_paths.append(p)
+
+        for path in unique_paths:
             if _is_logout(base + path):  # never probe logout — it clears the session
                 continue
             endpoint = _url_to_endpoint(base + path)
@@ -279,8 +386,11 @@ class GuidedCrawler:
             # (~207B) and would be wrongly discarded. So record 3xx directly and skip the
             # length/title heuristics, which only make sense for 2xx bodies.
             is_redirect = status in (301, 302, 303, 307, 308)
-            if not is_redirect:
-                # Skip clear 4xx/5xx responses
+            # 401/403 means the endpoint EXISTS and is access-gated — a primary BAC-02/06
+            # signal. Record it exactly like a 3xx redirect (skip soft-404 heuristics).
+            is_gated = status in (401, 403)
+            if not is_redirect and not is_gated:
+                # Skip clear 4xx/5xx responses (404, 405, 500, …)
                 if status >= 400:
                     continue
                 # Soft-404 filter: same content-length as baseline → likely 404 page.
@@ -304,7 +414,8 @@ class GuidedCrawler:
             exc.label = "probed"  # mark for _extract_endpoints
             probed.append(exc)
             loc = resp.headers.get("location", "") if is_redirect else ""
-            log.info(f"Probe found: {status} {path}{f' → {loc}' if loc else ''} (actor={actor})")
+            gated_note = " [gated]" if is_gated else ""
+            log.info(f"Probe found: {status} {path}{f' → {loc}' if loc else ''}{gated_note} (actor={actor})")
 
         return probed
 
@@ -569,7 +680,9 @@ class GuidedCrawler:
         # really authenticated (an auth marker, not bounced back to the login form). This
         # prevents false positives where a site sets a session cookie for anonymous guests.
         verified = False
-        for vp in ("/profile", "/account", "/dashboard", "/my-account", "/orders", "/me"):
+        for vp in ("/profile", "/account", "/dashboard", "/my-account", "/orders", "/me",
+                   "/home", "/user", "/settings", "/main", "/overview", "/my-page",
+                   "/user/profile", "/account/settings"):
             try:
                 vr = await client.get(base + vp)
             except Exception:
@@ -658,6 +771,12 @@ def _extract_links(html: str, page_url: str) -> list[str]:
     out: list[str] = []
     for a in soup.find_all("a", href=True):
         out.append(urljoin(page_url, a["href"]))
+    # Extract paths from HTML comments — developers often leave API hints here
+    # e.g. <!-- TODO: /internal/api/clients -- disable in prod -->
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        for path in re.findall(r'(/[a-zA-Z0-9_\-][a-zA-Z0-9_\-/]*)', str(comment)):
+            if len(path) > 2 and not path.startswith("//"):
+                out.append(urljoin(page_url, path))
     return out
 
 
@@ -701,7 +820,10 @@ def _find_password_form(html: str, page_url: str) -> Optional[dict]:
             itype = (inp.get("type") or "text").lower()
             if itype == "hidden":
                 hidden[name] = inp.get("value", "")
-            elif username_field is None and (itype in ("text", "email") or name.lower() in _USERNAME_NAMES):
+            elif username_field is None and (
+                itype in ("text", "email", "username", "tel", "search")
+                or name.lower() in _USERNAME_NAMES
+            ):
                 username_field = name
         return {
             "action": f.get("action", ""),
@@ -852,8 +974,27 @@ def _extract_endpoints(exchanges: list[HttpExchange]) -> list[Endpoint]:
         disc = "probed" if label == "probed" else ("form" if label == "form" else "crawled")
         if key not in seen:
             params: list[str] = []
+            this_path = ex.endpoint.rstrip("/")
             for form in ex.forms:
+                # Skip forms whose action targets a different endpoint — those fields belong
+                # to the action target, not to this exchange's endpoint. They are handled by
+                # the cross-page enrichment pass below.
+                action = form.get("action", "") or ""
+                if action:
+                    try:
+                        action_path = urlparse(urljoin(ex.url, action)).path.rstrip("/")
+                    except Exception:
+                        action_path = ""
+                    if action_path and action_path != this_path:
+                        continue
                 params.extend(fld["name"] for fld in form.get("fields", []))
+            # Extract query parameter names from the URL (e.g. /my-account?id=wiener → 'id').
+            # These are IDOR/BAC signals — a query param on a user-resource page is a direct
+            # object reference the attacker controls.
+            qstr = urlparse(ex.url).query
+            if qstr:
+                params.extend(qp for qp in parse_qs(qstr, keep_blank_values=True).keys()
+                              if qp not in params)
             seen[key] = Endpoint(
                 url=ex.url,
                 method=ex.method,
@@ -870,12 +1011,53 @@ def _extract_endpoints(exchanges: list[HttpExchange]) -> list[Endpoint]:
             # Upgrade discovery if we found it via crawl (more authoritative than probed)
             if disc == "crawled" and seen[key].discovery != "crawled":
                 seen[key].discovery = "crawled"
-            # Accumulate params from later exchanges
+            # Accumulate params from later exchanges (same cross-page guard as above)
             ep = seen[key]
+            this_path = ex.endpoint.rstrip("/")
             for form in ex.forms:
+                action = form.get("action", "") or ""
+                if action:
+                    try:
+                        action_path = urlparse(urljoin(ex.url, action)).path.rstrip("/")
+                    except Exception:
+                        action_path = ""
+                    if action_path and action_path != this_path:
+                        continue
                 for fld in form.get("fields", []):
                     if fld["name"] not in ep.parameters:
                         ep.parameters.append(fld["name"])
+            # Also accumulate query param names from this exchange's URL
+            qstr = urlparse(ex.url).query
+            if qstr:
+                for qp in parse_qs(qstr, keep_blank_values=True).keys():
+                    if qp not in ep.parameters:
+                        ep.parameters.append(qp)
+
+    # Cross-page form enrichment: a form on GET /product with action="/cart" describes
+    # what POST /cart expects — even when the POST /cart response itself has no form.
+    # This is the primary mechanism for discovering POST endpoint parameters without
+    # actively probing, since the HTML form definition IS the request contract.
+    for ex in exchanges:
+        for form in ex.forms:
+            action = form.get("action", "") or ""
+            if not action:
+                continue
+            method = form.get("method", "get").upper()
+            if method not in ("POST", "PUT", "PATCH"):
+                continue
+            try:
+                action_path = urlparse(urljoin(ex.url, action)).path.rstrip("/")
+            except Exception:
+                continue
+            key = f"{method}:{action_path}"
+            if key not in seen:
+                continue
+            ep = seen[key]
+            for fld in form.get("fields", []):
+                name = fld.get("name", "")
+                if name and name not in ep.parameters:
+                    ep.parameters.append(name)
+
     return list(seen.values())
 
 

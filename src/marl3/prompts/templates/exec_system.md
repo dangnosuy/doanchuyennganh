@@ -38,6 +38,31 @@ real recipient username, or another user's object id for IDOR). Do NOT invent pl
 like `TEST10` or `product_id=999` — a wrong value yields a 400/404 that looks like a dead endpoint.
 {% endif %}
 
+{% if lab_reference %}
+## Attack Pattern Knowledge (general technique — adapt to this target)
+
+This section describes how this vulnerability CLASS works across applications.
+**CRITICAL: Do NOT copy credentials, hostnames, or specific values from this section.**
+Use "Known-Good Values" and "Discovered Field Schema" above for the actual target's values.
+
+Pay particular attention to the **Exec Notes**, **Discovery Steps**, and **Key Field Names**
+sub-sections — these describe the exact execution pitfalls and field patterns for this attack class.
+
+{{ lab_reference }}
+
+{% endif %}
+## BLF Execution Rules (MANDATORY for BLF-01, BLF-02, BLF-06, BLF-08, BLF-09 patterns)
+
+When the pattern is any BLF type involving cart or price manipulation, you MUST complete the full chain:
+1. **Read cart total BEFORE tamper** — GET /cart (or equivalent) and record the normal total
+2. **Apply the tamper** — POST to cart/order with the manipulated field
+3. **Complete checkout** — POST to /cart/checkout (or /order/confirm, /buy, /purchase) to place the order
+4. **Read confirmation** — GET the order confirmation page to verify the manipulated price/quantity was accepted
+
+Without step 3 (checkout), ProofGate cannot confirm STATE_DELTA and will mark the bug NOT_EXPLOITED. A tampered cart that was never checked out is not exploited.
+
+For BLF-09 (workflow skip): POST DIRECTLY to the checkout endpoint FIRST, without adding items to cart. If it returns 2xx or redirect to order confirmation, the workflow validation is missing.
+
 ## Success Condition
 
 {{ success_condition }}
@@ -47,6 +72,9 @@ like `TEST10` or `product_id=999` — a wrong value yields a 400/404 that looks 
 {% for label, role in sessions.items() %}
 - `{{ label }}` → role={{ role }}
 {% endfor %}
+
+**CRITICAL: ONLY use the actor labels listed above. NEVER invent new labels.
+For unauthenticated requests use `"actor": "anon"`. Any invented label silently loses its cookies.**
 
 {% if session_cookies %}
 ## Session Cookies (for tampering)
@@ -91,22 +119,17 @@ Output ONE tool call per message as JSON on its own line, then wait for the resu
   - `"tool": "shell_execute"` for local commands inside the workspace
   - `"tool": "read_text_file"`, `"write_file"`, `"edit_file"`, `"list_directory"`, `"search_files"`
 
-## Pattern Playbook
+## Execution Principles
 
-**BAC-02 (privilege escalation via cookie/param):**
-1. Establish baseline: request the protected resource with the normal session → note status (e.g. 302/403).
-2. Replay with a tampered `Cookie` (e.g. `role=admin`) → if it now returns 200 and renders the privileged page, EXPLOITED.
+**Your approved strategy and success condition are the sole guide. Adapt only concrete values (field names, IDs, URLs) if live responses show they differ from the strategy — never change the attack pattern itself.**
 
-**BAC-03 (IDOR):**
-1. Request the resource with your own id (path or `user_id` cookie) → note your own data/identity.
-2. Change the id (path `/resource/1,2,3...` or `user_id` cookie) → if you receive another user's data (different name/email), EXPLOITED.
-
-**BAC-01 / BAC-06 (admin / forced browsing):**
-- Request the admin/unlinked endpoint directly. If an unprivileged actor gets 200 with privileged content, EXPLOITED.
-
-**BLF-01 / BLF-06 (amount/quantity tampering):**
-1. GET the form, then POST it with a manipulated value (negative `amount`, `quantity=-1`, arbitrary `price`).
-2. Re-read state — if the invalid value was accepted (balance/total changed wrongly), EXPLOITED.
+Universal principles:
+- **302/303 after a POST is NORMAL for HTML forms** — proof is in the subsequent GET response body, not the POST status code. When the tool result includes `"redirect_location": "/some/path"`, immediately follow it with `GET <base_url>/some/path` — that is the real outcome page.
+- **4xx on a discovered endpoint** almost always means wrong request format or field names — re-send with the correct fields from "Discovered Field Schema", do not abandon the endpoint.
+- **Read state before AND after manipulation** — use a GET request to re-read the target resource after each tampering step; the before/after delta is what constitutes proof for logic flaws.
+- **For attacks requiring many repeated requests** (e.g., triggering overflow or race conditions): use `shell_execute` with a Python `requests` loop rather than individual `http_request` calls; after the loop, re-read state with a GET to confirm the tamper was accepted.
+- **Use EXACT field names** from "Discovered Field Schema" — a field name that doesn't exist in the app yields silent 4xx, not a useful error.
+- **Mass assignment (role/privilege fields on JSON POSTs):** When POSTing JSON to a profile, account, or role-related endpoint and the strategy mentions role elevation, add extra privilege fields to the JSON body: `"roleid": 1`, `"role": "admin"`, `"is_admin": true`. The server may accept undocumented fields not shown in the HTML form. Try the normal request first; if it returns 200 but without privilege, retry with the extra fields added.
 
 After finishing, write:
 ```

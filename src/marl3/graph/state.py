@@ -9,6 +9,7 @@ update merging correctly. All fields have defaults so partial updates work.
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 from typing_extensions import TypedDict
 
@@ -62,6 +63,8 @@ class BugRunState(TypedDict, total=False):
     finding: Optional[Any]
     poc_path: Optional[str]
     error_message: str
+    # Timing (benchmark instrumentation)
+    started_at: float
 
 
 def make_pipeline_state(
@@ -125,4 +128,5 @@ def make_bug_state(
         finding=None,
         poc_path=None,
         error_message="",
+        started_at=time.monotonic(),
     )

@@ -1,0 +1,6 @@
+debate:
+  skip: true
+  max_rounds: 3
+  max_exec_retries: 1
+  max_verify_retries: 1
+  per_bug_wall_clock_s: 600

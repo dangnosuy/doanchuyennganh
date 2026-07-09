@@ -7,14 +7,12 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
-from rich.text import Text
 from rich.theme import Theme
 
 # ── Rich console (stderr, no markup leak into file) ──────────────────────────
@@ -38,27 +36,18 @@ _configured = False
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
-def setup(run_dir: str | Path | None, level: str = "INFO") -> Path | None:
-    """Configure marl3 logger: rich stderr + plain file (file optional if run_dir is None)."""
+def setup(run_dir: str | Path | None = None, level: str = "INFO") -> Path | None:
+    """Configure marl3 logger: rich stderr + optional file handler.
+
+    Call this early (before workspace is known) for console-only setup.
+    Then call attach_run_log(workspace.root) once the workspace is created
+    to wire up the per-run file log.
+    """
     global _configured
     if _configured:
-        return Path(run_dir) / "run.log" if run_dir else None
+        return None
 
-    _log.setLevel(getattr(logging, level.upper(), logging.INFO))
-
-    if run_dir is not None:
-        log_path = Path(run_dir) / "run.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        file_fmt = logging.Formatter(
-            "%(asctime)s [%(levelname)-8s] %(name)s — %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setFormatter(file_fmt)
-        fh.setLevel(logging.DEBUG)
-        _log.addHandler(fh)
-    else:
-        log_path = None
+    _log.setLevel(logging.DEBUG)  # capture everything; handlers filter by level
 
     _log.propagate = False
 
@@ -67,6 +56,35 @@ def setup(run_dir: str | Path | None, level: str = "INFO") -> Path | None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
     _configured = True
+
+    if run_dir is not None:
+        return attach_run_log(run_dir)
+    return None
+
+
+def attach_run_log(run_dir: str | Path, level: str = "DEBUG") -> Path:
+    """Attach a file handler for this run's workspace. Safe to call multiple times
+    (re-calling with the same path is a no-op; different path adds a new handler).
+
+    Returns the path to the log file.
+    """
+    log_path = Path(run_dir) / "run.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Check if this exact path already has a handler
+    for h in _log.handlers:
+        if isinstance(h, logging.FileHandler) and Path(h.baseFilename) == log_path.resolve():
+            return log_path
+
+    file_fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)-8s] %(name)s — %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(file_fmt)
+    fh.setLevel(getattr(logging, level.upper(), logging.DEBUG))
+    _log.addHandler(fh)
+    _log.info(f"run.log attached → {log_path}")
     return log_path
 
 

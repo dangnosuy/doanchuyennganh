@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -30,9 +29,19 @@ Rules:
 """
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base (override wins on scalar conflicts)."""
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
 def _load_cfg(config: Optional[str]):
     from .config import AppConfig
-    from pathlib import Path
     import yaml
 
     defaults = Path(__file__).parent.parent.parent / "config" / "default.yaml"
@@ -41,7 +50,7 @@ def _load_cfg(config: Optional[str]):
         raw = yaml.safe_load(defaults.read_text()) or {}
     if config:
         extra = yaml.safe_load(Path(config).read_text()) or {}
-        raw.update(extra)
+        raw = _deep_merge(raw, extra)
     return AppConfig(**raw)
 
 
@@ -178,14 +187,17 @@ def memory(
 
 
 async def _run_pipeline(prompt: str, config: Optional[str], base_dir: Optional[str], show_graph: bool):
+    import json
+    import time
     from .graph.pipeline import get_pipeline
     from .graph.state import make_pipeline_state
     from .workspace import RunWorkspace
     from .llm.client import LLMClient
-    from .logging_setup import setup as _setup_logging
+    from .llm.usage import UsageLedger
+    from .logging_setup import setup as _setup_logging, attach_run_log
 
     cfg = _load_cfg(config)
-    _setup_logging(Path(base_dir) / "marl3.log" if base_dir else None)
+    _setup_logging()  # console-only setup (file handler added below after workspace is known)
 
     if show_graph:
         pipeline = get_pipeline()
@@ -194,11 +206,16 @@ async def _run_pipeline(prompt: str, config: Optional[str], base_dir: Optional[s
 
     target_url, credentials = await _smart_parse_prompt(prompt, cfg)
     workspace = RunWorkspace.create(base_dir=base_dir or "workspace", target_url=target_url)
-    llm = LLMClient(cfg.llm)
+    ledger = UsageLedger(output_path=workspace.usage_json)
+    llm = LLMClient(cfg.llm, ledger=ledger)
+
+    # Wire up the per-run file log now that we know the workspace directory.
+    log_path = attach_run_log(workspace.root)
 
     typer.echo(f"[marl3] target: {target_url}")
     typer.echo(f"[marl3] workspace: {workspace.root}")
-    typer.echo(f"[marl3] pipeline: recon → hunt → bugs (LangGraph) → report")
+    typer.echo(f"[marl3] log: {log_path}")
+    typer.echo("[marl3] pipeline: recon → hunt → bugs (LangGraph) → report")
 
     pipeline = get_pipeline()
     initial_state = make_pipeline_state(
@@ -209,26 +226,65 @@ async def _run_pipeline(prompt: str, config: Optional[str], base_dir: Optional[s
         llm=llm,
     )
 
+    run_start = time.monotonic()
     final_state = await pipeline.ainvoke(initial_state)
+    run_elapsed = round(time.monotonic() - run_start, 2)
 
     findings = final_state.get("findings", [])
     exploited = [f for f in findings if getattr(f, "status", "") == "EXPLOITED"]
+
+    # ── Write run_metadata.json for benchmark reproducibility ────────────────
+    usage_summary = ledger.summary()
+    metadata = {
+        "target_url": target_url,
+        "config_file": config or "config/default.yaml",
+        "model": {
+            "crawler": cfg.llm.models.crawler if hasattr(cfg.llm, "models") else "",
+            "hunter": cfg.llm.models.hunter if hasattr(cfg.llm, "models") else "",
+            "red": cfg.llm.models.red if hasattr(cfg.llm, "models") else "",
+            "blue": cfg.llm.models.blue if hasattr(cfg.llm, "models") else "",
+            "exec": cfg.llm.models.exec if hasattr(cfg.llm, "models") else "",
+            "verifier": cfg.llm.models.verifier if hasattr(cfg.llm, "models") else "",
+        },
+        "temperature": getattr(cfg.verifier, "temperature", 0.0),
+        "debate": {
+            "max_rounds": cfg.debate.max_rounds,
+            "skip": getattr(cfg.debate, "skip", False),
+            "per_bug_wall_clock_s": getattr(cfg.debate, "per_bug_wall_clock_s", 600),
+        },
+        "seeder_enabled": getattr(cfg.hunt, "seeder_enabled", True) if hasattr(cfg, "hunt") else True,
+        "memory_enabled": getattr(cfg.memory, "longterm_enabled", True) if hasattr(cfg, "memory") else True,
+        "total_tokens": usage_summary["total_tokens"],
+        "total_llm_calls": usage_summary["calls"],
+        "tokens_by_role": usage_summary["by_role"],
+        "elapsed_s": run_elapsed,
+        "findings_total": len(findings),
+        "findings_exploited": len(exploited),
+        "command": f"marl3 run \"{prompt}\"" + (f" --config {config}" if config else ""),
+    }
+    meta_path = workspace.root / "run_metadata.json"
+    meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+
     typer.echo(f"\n[marl3] done — {len(exploited)}/{len(findings)} bugs exploited")
     typer.echo(f"[marl3] report: {workspace.root}/report.md")
+    typer.echo(f"[marl3] metadata: {meta_path}")
 
 
 async def _run_crawl(prompt: str, config: Optional[str], base_dir: Optional[str]):
     from .workspace import RunWorkspace
     from .llm.client import LLMClient
+    from .llm.usage import UsageLedger
     from .graph.nodes.recon import run_recon
-    from .logging_setup import setup as _setup_logging
+    from .logging_setup import setup as _setup_logging, attach_run_log
 
     cfg = _load_cfg(config)
-    _setup_logging(Path(base_dir) / "marl3.log" if base_dir else None)
+    _setup_logging()
 
     target_url, credentials = await _smart_parse_prompt(prompt, cfg)
     workspace = RunWorkspace.create(base_dir=base_dir or "workspace", target_url=target_url)
-    llm = LLMClient(cfg.llm)
+    ledger = UsageLedger(output_path=workspace.usage_json)
+    llm = LLMClient(cfg.llm, ledger=ledger)
+    attach_run_log(workspace.root)
 
     typer.echo(f"[marl3] crawling {target_url}")
     state = {

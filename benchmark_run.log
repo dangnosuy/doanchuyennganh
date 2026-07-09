@@ -1,0 +1,63 @@
+=== marl3 Benchmark ===
+Target: vulnshop (http://localhost:5002)
+Repeats: 5
+Configs: ['full', 'no-debate', 'no-seeder', 'no-memory', 'no-proofgate']
+Output: benchmark_results
+
+── Config: full ──
+  [full] run 0/5 — SKIP (TP=3 FP=2)
+  [full] run 1/5 — SKIP (TP=3 FP=1)
+  [full] run 2/5 — SKIP (TP=4 FP=0)
+  [full] run 3/5 — SKIP (TP=5 FP=1)
+  [full] run 4/5 — SKIP (TP=3 FP=0)
+  [full] aggregate: 0 runs completed
+
+── Config: no-debate ──
+  [no-debate] run 0/5 — SKIP (TP=4 FP=0)
+  [no-debate] run 1/5 — SKIP (TP=4 FP=2)
+  [no-debate] run 2/5 — SKIP (TP=4 FP=0)
+  [no-debate] run 3/5 — SKIP (TP=4 FP=2)
+  [no-debate] run 4/5 — SKIP (TP=4 FP=1)
+  [no-debate] aggregate: 0 runs completed
+
+── Config: no-seeder ──
+  [no-seeder] run 0/5 — SKIP (TP=2 FP=0)
+  [no-seeder] run 1/5 — SKIP (TP=2 FP=0)
+  [no-seeder] run 2/5 — SKIP (TP=2 FP=0)
+  [no-seeder] run 3/5 — SKIP (TP=2 FP=0)
+  [no-seeder] run 4/5 — SKIP (TP=4 FP=0)
+  [no-seeder] aggregate: 0 runs completed
+
+── Config: no-memory ──
+  [no-memory] run 0/5 — SKIP (TP=3 FP=2)
+  [no-memory] run 1/5 — SKIP (TP=3 FP=2)
+  [no-memory] run 2/5 — resetting VulnShop + memory...
+  [no-memory] run 2/5 — starting...
+  [no-memory] run 2 — TP=3 FP=1 TPR=0.30 FPR=0.12 tokens=2519973 time=3188s
+  [no-memory] run 3/5 — resetting VulnShop + memory...
+  [no-memory] run 3/5 — starting...
+  [no-memory] run 3 — TP=4 FP=1 TPR=0.40 FPR=0.14 tokens=2238127 time=3028s
+  [no-memory] run 4/5 — resetting VulnShop + memory...
+  [no-memory] run 4/5 — starting...
+  [no-memory] run 4 — TP=2 FP=1 TPR=0.20 FPR=0.11 tokens=2656656 time=2926s
+  [no-memory] aggregate: TP=3.0±1.0 FP=1.0±0.0 TPR=0.30±0.10
+
+── Config: no-proofgate ──
+  [no-proofgate] run 0/5 — resetting VulnShop + memory...
+  [no-proofgate] run 0/5 — starting...
+  [no-proofgate] run 0 — TP=2 FP=1 TPR=0.20 FPR=0.11 tokens=1741178 time=1908s
+  [no-proofgate] run 1/5 — resetting VulnShop + memory...
+  [no-proofgate] run 1/5 — starting...
+  [no-proofgate] run 1 — TP=2 FP=3 TPR=0.20 FPR=0.27 tokens=2028005 time=1797s
+  [no-proofgate] run 2/5 — resetting VulnShop + memory...
+  [no-proofgate] run 2/5 — starting...
+  [no-proofgate] run 2 — TP=2 FP=0 TPR=0.20 FPR=0.00 tokens=1413307 time=1333s
+  [no-proofgate] run 3/5 — resetting VulnShop + memory...
+  [no-proofgate] run 3/5 — starting...
+  [no-proofgate] run 3 — TP=3 FP=1 TPR=0.30 FPR=0.12 tokens=1705809 time=1747s
+  [no-proofgate] run 4/5 — resetting VulnShop + memory...
+  [no-proofgate] run 4/5 — starting...
+  [no-proofgate] run 4 — TP=2 FP=1 TPR=0.20 FPR=0.11 tokens=1794786 time=1779s
+  [no-proofgate] aggregate: TP=2.2±0.4 FP=1.2±1.1 TPR=0.22±0.04
+
+=== Benchmark complete. Results in benchmark_results/ ===

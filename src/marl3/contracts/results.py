@@ -69,6 +69,7 @@ class VerifierVerdict(BaseModel):
     rationale: str = Field(description="Full reasoning — never truncated")
     cited_markers: list[str] = Field(default_factory=list)
     refutation_points: list[str] = Field(default_factory=list, description="Specific reasons why evidence does not confirm the vulnerability")
+    question_answers: list[bool] = Field(default_factory=list, description="Yes/no answers to verification questions from Red, in order")
 
 
 class PocArtifact(BaseModel):
@@ -101,3 +102,10 @@ class Finding(BaseModel):
     poc: Optional[PocArtifact] = None
     remediation: str = ""
     discovered_by: str = "marl3"
+
+    # ── Runtime metrics (benchmark instrumentation) ──────────────────────────
+    debate_rounds: int = Field(default=0, description="Total debate rounds for this bug")
+    verify_retries: int = Field(default=0, description="Number of verify→re-debate cycles")
+    exec_retries: int = Field(default=0, description="Number of exec retries")
+    elapsed_s: float = Field(default=0.0, description="Wall-clock seconds spent on this bug")
+    failure_mode: str = Field(default="", description="Classified failure reason if not exploited")
